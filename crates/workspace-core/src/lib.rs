@@ -56,8 +56,6 @@ pub struct Project {
     pub selected_branch: String,
     /// Exact pinned commit, absent until branch materialization succeeds.
     pub pinned_commit: Option<String>,
-    /// Whether `main` was absent and the provider default was used.
-    pub default_branch_fallback: bool,
     /// Provider web address.
     pub web_url: String,
 }

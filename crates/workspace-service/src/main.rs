@@ -17,6 +17,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, serve};
+use b10x_substrate_sdk::{AccessToken, Client as SubstrateClient, SdkError as SubstrateError};
 use base64::Engine as _;
 use clap::Parser;
 use connectors_client::HostedClient;
@@ -44,6 +45,8 @@ const CONNECTORS_AUDIENCE: &str = "urn:b10x:connectors";
 const CONNECTORS_SCOPE: &str = "connectors.catalog.read connectors.invoke";
 const AGENT_PLATFORM_AUDIENCE: &str = "urn:b10x:agent-platform";
 const AGENT_PLATFORM_SCOPE: &str = "agents.read agents.manage tasks.read tasks.submit";
+const SUBSTRATE_AUDIENCE: &str = "urn:b10x:substrate";
+const SUBSTRATE_SCOPE: &str = "observe workspaces";
 const PROJECT_CONTEXT_FILES: &[&str] = &[
     "AGENTS.md",
     "README.md",
@@ -80,6 +83,12 @@ struct Args {
     aep_realm: Option<String>,
     #[arg(long, env = "WORKSPACE_AEP_WORKSPACE")]
     aep_workspace: Option<String>,
+    #[arg(long, env = "WORKSPACE_SUBSTRATE_ORIGIN")]
+    substrate_origin: Option<String>,
+    #[arg(long, env = "WORKSPACE_SUBSTRATE_CA_BUNDLE")]
+    substrate_ca_bundle: Option<String>,
+    #[arg(long, env = "WORKSPACE_SUBSTRATE_SERVER_IDENTITY")]
+    substrate_server_identity: Option<String>,
     #[arg(
         long,
         env = "WORKSPACE_DATABASE_URL",
@@ -95,6 +104,7 @@ struct AppState {
     agent_platform: Option<AgentPlatformClient>,
     project_agent_model: Option<String>,
     aep: Option<AepConfiguration>,
+    substrate: Option<SubstrateConfiguration>,
     store: Store,
 }
 
@@ -103,6 +113,13 @@ struct AepConfiguration {
     transport: AepTransport,
     realm: String,
     workspace: String,
+}
+
+#[derive(Clone)]
+struct SubstrateConfiguration {
+    origin: String,
+    ca_bundle: String,
+    server_identity: String,
 }
 
 #[tokio::main]
@@ -146,6 +163,28 @@ async fn main() -> Result<()> {
         }),
         _ => None,
     };
+    let substrate_values = [
+        args.substrate_origin.is_some(),
+        args.substrate_ca_bundle.is_some(),
+        args.substrate_server_identity.is_some(),
+    ];
+    if substrate_values.iter().any(|configured| *configured)
+        && !substrate_values.iter().all(|configured| *configured)
+    {
+        bail!("Substrate origin, CA bundle and server identity must be configured together");
+    }
+    let substrate = match (
+        args.substrate_origin,
+        args.substrate_ca_bundle,
+        args.substrate_server_identity,
+    ) {
+        (Some(origin), Some(ca_bundle), Some(server_identity)) => Some(SubstrateConfiguration {
+            origin,
+            ca_bundle,
+            server_identity,
+        }),
+        _ => None,
+    };
     let store =
         Store::connect_lazy(&args.database_url).context("invalid database configuration")?;
     let listener = tokio::net::TcpListener::bind(args.listen)
@@ -159,6 +198,7 @@ async fn main() -> Result<()> {
             agent_platform,
             project_agent_model: args.project_agent_model,
             aep,
+            substrate,
             store,
         }),
     )
@@ -252,6 +292,9 @@ async fn open_project(
         Ok(authority) => authority,
         Err(response) => return response,
     };
+    if let Err(response) = substrate_client(&state, &authority).await {
+        return response;
+    }
     let candidate = match discover_projects(&state, &authority).await {
         Ok(projects) => projects.into_iter().find(|project| {
             project.forge_instance_ref == input.forge_instance_ref
@@ -262,14 +305,8 @@ async fn open_project(
     let Some(candidate) = candidate else {
         return problem(StatusCode::FORBIDDEN, "project_access_refused");
     };
-    let default_branch_fallback = candidate.default_branch.as_deref() != Some("main");
-    let selected_branch = if default_branch_fallback {
-        candidate
-            .default_branch
-            .clone()
-            .unwrap_or_else(|| "main".to_owned())
-    } else {
-        "main".to_owned()
+    let Some(selected_branch) = candidate.default_branch.clone() else {
+        return problem(StatusCode::CONFLICT, "project_default_branch_unavailable");
     };
     let project = Project {
         id: project_id(
@@ -284,7 +321,6 @@ async fn open_project(
         default_branch: candidate.default_branch,
         selected_branch,
         pinned_commit: None,
-        default_branch_fallback,
         web_url: candidate.web_url,
     };
     let opened = match state.store.open_project(&authority, &project).await {
@@ -297,16 +333,9 @@ async fn open_project(
     };
     let selected = visible_branches
         .iter()
-        .find(|branch| branch.name == "main")
-        .or_else(|| {
-            opened
-                .default_branch
-                .as_deref()
-                .and_then(|name| visible_branches.iter().find(|branch| branch.name == name))
-        })
-        .or_else(|| visible_branches.first());
+        .find(|branch| branch.name == opened.selected_branch);
     let Some(selected) = selected else {
-        return problem(StatusCode::CONFLICT, "project_has_no_visible_branch");
+        return problem(StatusCode::CONFLICT, "project_default_branch_unavailable");
     };
     match state
         .store
@@ -365,6 +394,9 @@ async fn repository_tree(
         Ok(project) => project,
         Err(response) => return response,
     };
+    if let Err(response) = substrate_client(&state, &authority).await {
+        return response;
+    }
     match exact_repository_tree(&state, &authority, &project).await {
         Ok(entries) => confidential(Json(entries).into_response()),
         Err(response) => response,
@@ -397,6 +429,9 @@ async fn select_branch(
     let Some(branch) = branch else {
         return problem(StatusCode::NOT_FOUND, "branch_not_found");
     };
+    if let Err(response) = substrate_client(&state, &authority).await {
+        return response;
+    }
     match state
         .store
         .select_branch(&authority, &project, &branch.name, &branch.commit)
@@ -773,6 +808,41 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Authority
         .await
         .map_err(|_| problem(StatusCode::UNAUTHORIZED, "authentication_refused"))?;
     authority(state, authorization, session).await
+}
+
+async fn substrate_client(
+    state: &AppState,
+    authority: &Authority,
+) -> Result<Option<SubstrateClient>, Response> {
+    let Some(configuration) = state.substrate.as_ref() else {
+        return Ok(None);
+    };
+    let identity = state.identity.clone();
+    let authorization = authority.session_authorization.clone();
+    SubstrateClient::builder()
+        .https_endpoint(&configuration.origin)
+        .trust_roots(&configuration.ca_bundle)
+        .server_identity(&configuration.server_identity)
+        .token_provider(move |_| {
+            let identity = identity.clone();
+            let authorization = authorization.clone();
+            async move {
+                let access = identity
+                    .issue_access_token(&authorization, SUBSTRATE_AUDIENCE, SUBSTRATE_SCOPE)
+                    .await
+                    .map_err(|_| SubstrateError::TokenUnavailable)?;
+                AccessToken::new(
+                    access
+                        .credential
+                        .expose_at_authorization_boundary()
+                        .to_owned(),
+                )
+            }
+        })
+        .connect()
+        .await
+        .map(Some)
+        .map_err(|_| problem(StatusCode::SERVICE_UNAVAILABLE, "substrate_unavailable"))
 }
 
 async fn authority(

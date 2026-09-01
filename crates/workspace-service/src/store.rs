@@ -14,8 +14,8 @@ use workspace_core::{
 use crate::Authority;
 
 const SCHEMA: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS workspace_projects (project_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, forge_instance_ref TEXT NOT NULL, provider_project_ref TEXT NOT NULL, path_with_namespace TEXT NOT NULL, name TEXT NOT NULL, default_branch TEXT, selected_branch TEXT NOT NULL, pinned_commit TEXT, default_branch_fallback BIGINT NOT NULL, web_url TEXT NOT NULL, created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL, UNIQUE (tenant_id, forge_instance_ref, provider_project_ref))",
-    "CREATE TABLE IF NOT EXISTS workspace_project_associations (tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, subject TEXT NOT NULL, last_validated_at_ms BIGINT NOT NULL, PRIMARY KEY (tenant_id, project_id, subject))",
+    "CREATE TABLE IF NOT EXISTS workspace_projects (project_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, forge_instance_ref TEXT NOT NULL, provider_project_ref TEXT NOT NULL, path_with_namespace TEXT NOT NULL, name TEXT NOT NULL, default_branch TEXT, web_url TEXT NOT NULL, created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL, UNIQUE (tenant_id, forge_instance_ref, provider_project_ref))",
+    "CREATE TABLE IF NOT EXISTS workspace_project_associations (tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, subject TEXT NOT NULL, selected_branch TEXT NOT NULL, pinned_commit TEXT, last_validated_at_ms BIGINT NOT NULL, PRIMARY KEY (tenant_id, project_id, subject))",
     "CREATE TABLE IF NOT EXISTS workspace_threads (thread_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, owner_subject TEXT NOT NULL, branch TEXT NOT NULL, pinned_commit TEXT NOT NULL, title TEXT NOT NULL, created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS workspace_threads_owner ON workspace_threads (tenant_id, project_id, owner_subject, created_at_ms)",
     "CREATE TABLE IF NOT EXISTS workspace_messages (thread_id TEXT NOT NULL, sequence BIGINT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, branch TEXT NOT NULL, commit_ref TEXT NOT NULL, created_at_ms BIGINT NOT NULL, PRIMARY KEY (thread_id, sequence))",
@@ -118,7 +118,7 @@ impl Store {
         self.ensure_schema().await?;
         let now = now_ms()?;
         let mut transaction = self.pool.begin().await.map_err(StoreError::Database)?;
-        sqlx::query("INSERT INTO workspace_projects (project_id, tenant_id, forge_instance_ref, provider_project_ref, path_with_namespace, name, default_branch, selected_branch, pinned_commit, default_branch_fallback, web_url, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (tenant_id, forge_instance_ref, provider_project_ref) DO UPDATE SET path_with_namespace = excluded.path_with_namespace, name = excluded.name, default_branch = excluded.default_branch, web_url = excluded.web_url, updated_at_ms = excluded.updated_at_ms")
+        sqlx::query("INSERT INTO workspace_projects (project_id, tenant_id, forge_instance_ref, provider_project_ref, path_with_namespace, name, default_branch, web_url, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (tenant_id, forge_instance_ref, provider_project_ref) DO UPDATE SET path_with_namespace = excluded.path_with_namespace, name = excluded.name, default_branch = excluded.default_branch, web_url = excluded.web_url, updated_at_ms = excluded.updated_at_ms")
             .bind(&project.id)
             .bind(&authority.tenant_id)
             .bind(&project.forge_instance_ref)
@@ -126,19 +126,18 @@ impl Store {
             .bind(&project.path_with_namespace)
             .bind(&project.name)
             .bind(&project.default_branch)
-            .bind(&project.selected_branch)
-            .bind(&project.pinned_commit)
-            .bind(i64::from(project.default_branch_fallback))
             .bind(&project.web_url)
             .bind(as_i64(now)?)
             .bind(as_i64(now)?)
             .execute(&mut *transaction)
             .await
             .map_err(StoreError::Database)?;
-        sqlx::query("INSERT INTO workspace_project_associations (tenant_id, project_id, subject, last_validated_at_ms) VALUES (?, ?, ?, ?) ON CONFLICT (tenant_id, project_id, subject) DO UPDATE SET last_validated_at_ms = excluded.last_validated_at_ms")
+        sqlx::query("INSERT INTO workspace_project_associations (tenant_id, project_id, subject, selected_branch, pinned_commit, last_validated_at_ms) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (tenant_id, project_id, subject) DO UPDATE SET last_validated_at_ms = excluded.last_validated_at_ms")
             .bind(&authority.tenant_id)
             .bind(&project.id)
             .bind(&authority.subject)
+            .bind(&project.selected_branch)
+            .bind(&project.pinned_commit)
             .bind(as_i64(now)?)
             .execute(&mut *transaction)
             .await
@@ -154,7 +153,7 @@ impl Store {
         project_id: &str,
     ) -> Result<Project, StoreError> {
         self.ensure_schema().await?;
-        let row = sqlx::query("SELECT p.project_id, p.forge_instance_ref, p.provider_project_ref, p.path_with_namespace, p.name, p.default_branch, p.selected_branch, p.pinned_commit, p.default_branch_fallback, p.web_url FROM workspace_projects p INNER JOIN workspace_project_associations a ON a.tenant_id = p.tenant_id AND a.project_id = p.project_id WHERE p.tenant_id = ? AND p.project_id = ? AND a.subject = ?")
+        let row = sqlx::query("SELECT p.project_id, p.forge_instance_ref, p.provider_project_ref, p.path_with_namespace, p.name, p.default_branch, a.selected_branch, a.pinned_commit, p.web_url FROM workspace_projects p INNER JOIN workspace_project_associations a ON a.tenant_id = p.tenant_id AND a.project_id = p.project_id WHERE p.tenant_id = ? AND p.project_id = ? AND a.subject = ?")
             .bind(&authority.tenant_id)
             .bind(project_id)
             .bind(&authority.subject)
@@ -198,12 +197,12 @@ impl Store {
         self.ensure_schema().await?;
         let now = now_ms()?;
         let mut transaction = self.pool.begin().await.map_err(StoreError::Database)?;
-        let result = sqlx::query("UPDATE workspace_projects SET selected_branch = ?, pinned_commit = ?, updated_at_ms = ? WHERE tenant_id = ? AND project_id = ?")
+        let result = sqlx::query("UPDATE workspace_project_associations SET selected_branch = ?, pinned_commit = ? WHERE tenant_id = ? AND project_id = ? AND subject = ?")
             .bind(branch)
             .bind(commit)
-            .bind(as_i64(now)?)
             .bind(&authority.tenant_id)
             .bind(&project.id)
+            .bind(&authority.subject)
             .execute(&mut *transaction)
             .await
             .map_err(StoreError::Database)?;
@@ -562,10 +561,6 @@ fn project_from_row(row: &AnyRow) -> Result<Project, StoreError> {
         pinned_commit: row
             .try_get("pinned_commit")
             .map_err(|_| StoreError::Corrupt)?,
-        default_branch_fallback: row
-            .try_get::<i64, _>("default_branch_fallback")
-            .map_err(|_| StoreError::Corrupt)?
-            != 0,
         web_url: row.try_get("web_url").map_err(|_| StoreError::Corrupt)?,
     })
 }
@@ -687,10 +682,9 @@ mod tests {
             project_ref: "42".to_owned(),
             path_with_namespace: "group/project".to_owned(),
             name: "project".to_owned(),
-            default_branch: Some("main".to_owned()),
-            selected_branch: "main".to_owned(),
+            default_branch: Some("trunk".to_owned()),
+            selected_branch: "trunk".to_owned(),
             pinned_commit: None,
-            default_branch_fallback: false,
             web_url: "https://gitlab.example.test/group/project".to_owned(),
         }
     }
@@ -715,6 +709,14 @@ mod tests {
 
         let second_open = store.open_project(&second, &project()).await.unwrap();
         assert_eq!(second_open.id, opened.id);
+        let first_selected = store
+            .select_branch(&first, &opened, "feature", &"f".repeat(40))
+            .await
+            .unwrap();
+        assert_eq!(first_selected.selected_branch, "feature");
+        let second_still_default = store.project(&second, "project-one").await.unwrap();
+        assert_eq!(second_still_default.selected_branch, "trunk");
+        assert!(second_still_default.pinned_commit.is_none());
         assert_eq!(
             store
                 .project_id_for("tenant-one", "connection:gitlab:one", "42")
@@ -732,7 +734,7 @@ mod tests {
         let other = authority("person:other");
         let opened = store.open_project(&owner, &project()).await.unwrap();
         let pinned = store
-            .select_branch(&owner, &opened, "main", &"a".repeat(40))
+            .select_branch(&owner, &opened, "trunk", &"a".repeat(40))
             .await
             .unwrap();
         let thread = store
@@ -740,7 +742,7 @@ mod tests {
                 &owner,
                 &pinned.id,
                 &CreateThread {
-                    branch: "main".to_owned(),
+                    branch: "trunk".to_owned(),
                     pinned_commit: "a".repeat(40),
                     title: "Understand the service".to_owned(),
                 },
@@ -748,7 +750,7 @@ mod tests {
             .await
             .unwrap();
         let refreshed = store
-            .select_branch(&owner, &pinned, "main", &"b".repeat(40))
+            .select_branch(&owner, &pinned, "trunk", &"b".repeat(40))
             .await
             .unwrap();
         assert_eq!(
@@ -772,7 +774,7 @@ mod tests {
         store.open_project(&actor, &project()).await.unwrap();
         let input = StartWorkflow {
             definition_id: "review.code/v1".to_owned(),
-            branch: "main".to_owned(),
+            branch: "trunk".to_owned(),
             commit: "c".repeat(40),
             idempotency_key: "request-one".to_owned(),
         };

@@ -24,6 +24,13 @@ cargo run --locked -p workspace-service -- \
 Use a local Identity session as the HTTP bearer. Hosted deployment supplies PostgreSQL through
 `WORKSPACE_DATABASE_URL`; neither the URL nor credentials belong in source control.
 
+Hosted deployments may configure the released Substrate remote client with
+`WORKSPACE_SUBSTRATE_ORIGIN`, `WORKSPACE_SUBSTRATE_CA_BUNDLE`, and
+`WORKSPACE_SUBSTRATE_SERVER_IDENTITY`. The three values are atomic: Workspace refuses partial
+configuration, uses only HTTPS with the explicit trust roots and DNS identity, and obtains a fresh
+Identity access credential for audience `urn:b10x:substrate` on each SDK request. Opening,
+browsing, or changing a project snapshot then also proves that authenticated Substrate seam.
+
 ## First contract
 
 - discover all GitLab projects visible through the subject's current Connections;
@@ -41,7 +48,7 @@ Use a local Identity session as the HTTP bearer. Hosted deployment supplies Post
 
 Full source materialization and workflow execution remain delegated to Substrate and Workflow.
 The Connector tree/file projection is the governed browse and chat-context bridge while
-Substrate's existing Git source remains explicitly unserved; it is not presented as a materialized
-workspace. Reverse-engineering publishers associate central artifacts by using the canonical
+the released Substrate `0.5.0` Git source remains explicitly unserved; the HTTPS integration does
+not present Connector-projected files as a materialized workspace. Reverse-engineering publishers associate central artifacts by using the canonical
 project id as the AEP locator space and record the exact commit as AEP source provenance.
 Governed repository workspaces for agents and workflows
