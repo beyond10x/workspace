@@ -204,7 +204,32 @@ async fn open_project(
         default_branch_fallback,
         web_url: candidate.web_url,
     };
-    match state.store.open_project(&authority, &project).await {
+    let opened = match state.store.open_project(&authority, &project).await {
+        Ok(project) => project,
+        Err(error) => return store_problem(&error),
+    };
+    let visible_branches = match discover_branches(&state, &authority, &opened).await {
+        Ok(branches) => branches,
+        Err(response) => return response,
+    };
+    let selected = visible_branches
+        .iter()
+        .find(|branch| branch.name == "main")
+        .or_else(|| {
+            opened
+                .default_branch
+                .as_deref()
+                .and_then(|name| visible_branches.iter().find(|branch| branch.name == name))
+        })
+        .or_else(|| visible_branches.first());
+    let Some(selected) = selected else {
+        return problem(StatusCode::CONFLICT, "project_has_no_visible_branch");
+    };
+    match state
+        .store
+        .select_branch(&authority, &opened, &selected.name, &selected.commit)
+        .await
+    {
         Ok(project) => confidential(Json(project).into_response()),
         Err(error) => store_problem(&error),
     }
