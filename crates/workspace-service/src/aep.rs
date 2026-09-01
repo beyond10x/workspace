@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Duration};
 
 use aep_client::wire::{Method, Request, Response};
 use aep_client::{
@@ -35,6 +35,8 @@ impl AepTransport {
         }
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(10))
             .build()
             .map_err(|_| configuration())?;
         Ok(Self { origin, http })
