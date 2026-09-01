@@ -1,0 +1,6 @@
+/target/
+*.sqlite
+*.pem
+*.key
+*.token
+.env
