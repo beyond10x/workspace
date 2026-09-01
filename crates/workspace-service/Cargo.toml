@@ -1,0 +1,38 @@
+[package]
+name = "workspace-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+workspace-core.workspace = true
+identity-client.workspace = true
+connectors-client.workspace = true
+agent-platform-client.workspace = true
+agent-platform-core.workspace = true
+aep-client.workspace = true
+aep-contract.workspace = true
+b10x-substrate-sdk.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+clap.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true
