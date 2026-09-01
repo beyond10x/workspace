@@ -3,6 +3,29 @@
 version = 4
 
 [[package]]
+name = "agent-platform-client"
+version = "0.3.1"
+source = "git+ssh://git@github.com/beyond10x/agent-platform.git?rev=c6fa2e846fd0cbc0af310c0ba827b12aeb5d7e9d#c6fa2e846fd0cbc0af310c0ba827b12aeb5d7e9d"
+dependencies = [
+ "agent-platform-core",
+ "reqwest 0.13.4",
+ "serde",
+ "thiserror",
+ "url",
+]
+
+[[package]]
+name = "agent-platform-core"
+version = "0.3.1"
+source = "git+ssh://git@github.com/beyond10x/agent-platform.git?rev=c6fa2e846fd0cbc0af310c0ba827b12aeb5d7e9d#c6fa2e846fd0cbc0af310c0ba827b12aeb5d7e9d"
+dependencies = [
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -322,7 +345,7 @@ dependencies = [
 [[package]]
 name = "connector-state"
 version = "0.4.0"
-source = "git+ssh://git@github.com/beyond10x/connectors.git?rev=dbf4957ee937aec9b64ac69c22b13d37f38e1725#dbf4957ee937aec9b64ac69c22b13d37f38e1725"
+source = "git+ssh://git@github.com/beyond10x/connectors.git?rev=b4f6d655f9e3d7a906d2ba45d4160f2dc03a734b#b4f6d655f9e3d7a906d2ba45d4160f2dc03a734b"
 dependencies = [
  "thiserror",
 ]
@@ -330,7 +353,7 @@ dependencies = [
 [[package]]
 name = "connectors-client"
 version = "0.4.0"
-source = "git+ssh://git@github.com/beyond10x/connectors.git?rev=dbf4957ee937aec9b64ac69c22b13d37f38e1725#dbf4957ee937aec9b64ac69c22b13d37f38e1725"
+source = "git+ssh://git@github.com/beyond10x/connectors.git?rev=b4f6d655f9e3d7a906d2ba45d4160f2dc03a734b#b4f6d655f9e3d7a906d2ba45d4160f2dc03a734b"
 dependencies = [
  "protocol",
  "reqwest 0.12.28",
@@ -460,11 +483,11 @@ dependencies = [
 [[package]]
 name = "domain"
 version = "0.4.0"
-source = "git+ssh://git@github.com/beyond10x/connectors.git?rev=dbf4957ee937aec9b64ac69c22b13d37f38e1725#dbf4957ee937aec9b64ac69c22b13d37f38e1725"
+source = "git+ssh://git@github.com/beyond10x/connectors.git?rev=b4f6d655f9e3d7a906d2ba45d4160f2dc03a734b#b4f6d655f9e3d7a906d2ba45d4160f2dc03a734b"
 dependencies = [
  "async-trait",
  "connector-state",
- "schemars",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "sha2",
@@ -618,6 +641,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53c0fa8157de1303bfffdaa1cc2a673bfffb60102f76b0ef4441659124373fed"
 
 [[package]]
+name = "futures-macro"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9fb9654ba8355388abeb8dcb4fc62f511300867002afc858860463bdd9fe0c44"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
 name = "futures-sink"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -637,6 +671,7 @@ checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
  "futures-core",
  "futures-io",
+ "futures-macro",
  "futures-sink",
  "futures-task",
  "memchr",
@@ -1369,10 +1404,10 @@ dependencies = [
 [[package]]
 name = "protocol"
 version = "0.4.0"
-source = "git+ssh://git@github.com/beyond10x/connectors.git?rev=dbf4957ee937aec9b64ac69c22b13d37f38e1725#dbf4957ee937aec9b64ac69c22b13d37f38e1725"
+source = "git+ssh://git@github.com/beyond10x/connectors.git?rev=b4f6d655f9e3d7a906d2ba45d4160f2dc03a734b#b4f6d655f9e3d7a906d2ba45d4160f2dc03a734b"
 dependencies = [
  "domain",
- "schemars",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "thiserror",
@@ -1598,6 +1633,7 @@ dependencies = [
  "base64",
  "bytes",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -1617,12 +1653,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
 ]
 
@@ -1796,15 +1834,39 @@ dependencies = [
 
 [[package]]
 name = "schemars"
+version = "0.8.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615"
+dependencies = [
+ "dyn-clone",
+ "schemars_derive 0.8.22",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "schemars"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
 dependencies = [
  "dyn-clone",
  "ref-cast",
- "schemars_derive",
+ "schemars_derive 1.2.2",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "schemars_derive"
+version = "0.8.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e265784ad618884abaea0600a9adf15393368d840e0222d101a072f3f7534d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals 0.29.1",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1815,7 +1877,7 @@ checksum = "d98c67716b46af2f0b8cf752abc930f6f9aecfbf671ecfb531db8a31dbe4e2ba"
 dependencies = [
  "proc-macro2",
  "quote",
- "serde_derive_internals",
+ "serde_derive_internals 0.30.0",
  "syn 3.0.4",
 ]
 
@@ -1882,6 +1944,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.4",
+]
+
+[[package]]
+name = "serde_derive_internals"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18d26a20a969b9e3fdf2fc2d9f21eda6c40e2de84c9408bb5d3b05d499aae711"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2390,6 +2463,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-util"
+version = "0.7.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2644,6 +2730,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-streams"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "web-sys"
 version = "0.3.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2882,8 +2981,11 @@ dependencies = [
 name = "workspace-service"
 version = "0.1.0"
 dependencies = [
+ "agent-platform-client",
+ "agent-platform-core",
  "anyhow",
  "axum",
+ "base64",
  "clap",
  "connectors-client",
  "getrandom 0.3.4",

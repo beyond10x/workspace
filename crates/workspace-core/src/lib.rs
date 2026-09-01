@@ -84,6 +84,25 @@ pub struct SelectBranch {
     pub branch: String,
 }
 
+/// Kind of one entry in an exact repository snapshot.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryEntryKind {
+    Blob,
+    Tree,
+}
+
+/// One read-only repository tree entry at the project's pinned commit.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryEntry {
+    pub object_id: String,
+    pub name: String,
+    pub path: String,
+    pub kind: RepositoryEntryKind,
+    pub mode: String,
+}
+
 /// One personal, branch-bound conversation thread.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

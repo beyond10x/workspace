@@ -7,7 +7,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use url::Url;
 use workspace_core::{
     Branch, CreateMessage, CreateThread, Message, OpenProject, Project, RepositoryCandidate,
-    SelectBranch, StartWorkflow, Thread, WorkflowDefinition, WorkflowRun,
+    RepositoryEntry, SelectBranch, StartWorkflow, Thread, WorkflowDefinition, WorkflowRun,
 };
 
 /// Workspace transport failure without response or credential bodies.
@@ -103,6 +103,21 @@ impl WorkspaceClient {
         self.exchange(
             Method::GET,
             &format!("v1/projects/{project_id}/branches"),
+            authorization,
+            Option::<&()>::None,
+        )
+        .await
+    }
+
+    /// List the root entries at the project's exact pinned commit.
+    pub async fn repository_tree(
+        &self,
+        authorization: &str,
+        project_id: &str,
+    ) -> Result<Vec<RepositoryEntry>, ClientError> {
+        self.exchange(
+            Method::GET,
+            &format!("v1/projects/{project_id}/tree"),
             authorization,
             Option::<&()>::None,
         )

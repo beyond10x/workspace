@@ -19,6 +19,7 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS workspace_threads (thread_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, owner_subject TEXT NOT NULL, branch TEXT NOT NULL, pinned_commit TEXT NOT NULL, title TEXT NOT NULL, created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS workspace_threads_owner ON workspace_threads (tenant_id, project_id, owner_subject, created_at_ms)",
     "CREATE TABLE IF NOT EXISTS workspace_messages (thread_id TEXT NOT NULL, sequence BIGINT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, branch TEXT NOT NULL, commit_ref TEXT NOT NULL, created_at_ms BIGINT NOT NULL, PRIMARY KEY (thread_id, sequence))",
+    "CREATE TABLE IF NOT EXISTS workspace_project_agents (tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, agent_id TEXT NOT NULL, created_at_ms BIGINT NOT NULL, PRIMARY KEY (tenant_id, project_id))",
     "CREATE TABLE IF NOT EXISTS workspace_workflow_runs (run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, actor_subject TEXT NOT NULL, definition_id TEXT NOT NULL, branch TEXT NOT NULL, commit_ref TEXT NOT NULL, idempotency_key TEXT NOT NULL, state TEXT NOT NULL, failure_code TEXT, created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL, UNIQUE (tenant_id, actor_subject, project_id, idempotency_key))",
 ];
 
@@ -332,19 +333,79 @@ impl Store {
     ) -> Result<Message, StoreError> {
         self.ensure_schema().await?;
         let thread = self.owned_thread(authority, thread_id).await?;
+        self.append_message(
+            &authority.tenant_id,
+            &authority.subject,
+            &thread,
+            MessageRole::User,
+            input.content.trim(),
+        )
+        .await
+    }
+
+    /// Append agent output after a task completes without retaining request credentials.
+    pub async fn append_agent_message(
+        &self,
+        tenant_id: &str,
+        owner_subject: &str,
+        thread_id: &str,
+        role: MessageRole,
+        content: &str,
+    ) -> Result<Message, StoreError> {
+        self.ensure_schema().await?;
+        if !matches!(role, MessageRole::Assistant | MessageRole::System) {
+            return Err(StoreError::Conflict);
+        }
+        let row = sqlx::query("SELECT thread_id, project_id, branch, pinned_commit, title, created_at_ms FROM workspace_threads WHERE tenant_id = ? AND thread_id = ? AND owner_subject = ?")
+            .bind(tenant_id)
+            .bind(thread_id)
+            .bind(owner_subject)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(StoreError::Database)?
+            .ok_or(StoreError::NotFound)?;
+        let thread = thread_from_row(&row)?;
+        self.append_message(tenant_id, owner_subject, &thread, role, content)
+            .await
+    }
+
+    async fn append_message(
+        &self,
+        tenant_id: &str,
+        owner_subject: &str,
+        thread: &Thread,
+        role: MessageRole,
+        content: &str,
+    ) -> Result<Message, StoreError> {
         let now = now_ms()?;
         let mut transaction = self.pool.begin().await.map_err(StoreError::Database)?;
+        let owned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspace_threads WHERE tenant_id = ? AND thread_id = ? AND owner_subject = ?")
+            .bind(tenant_id)
+            .bind(&thread.id)
+            .bind(owner_subject)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(StoreError::Database)?;
+        if owned != 1 {
+            return Err(StoreError::NotFound);
+        }
         let sequence: i64 = sqlx::query_scalar(
             "SELECT COALESCE(MAX(sequence), 0) + 1 FROM workspace_messages WHERE thread_id = ?",
         )
-        .bind(thread_id)
+        .bind(&thread.id)
         .fetch_one(&mut *transaction)
         .await
         .map_err(StoreError::Database)?;
-        sqlx::query("INSERT INTO workspace_messages (thread_id, sequence, role, content, branch, commit_ref, created_at_ms) VALUES (?, ?, 'user', ?, ?, ?, ?)")
-            .bind(thread_id)
+        let role_name = match role {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+            MessageRole::System => "system",
+        };
+        sqlx::query("INSERT INTO workspace_messages (thread_id, sequence, role, content, branch, commit_ref, created_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?)")
+            .bind(&thread.id)
             .bind(sequence)
-            .bind(input.content.trim())
+            .bind(role_name)
+            .bind(content)
             .bind(&thread.branch)
             .bind(&thread.pinned_commit)
             .bind(as_i64(now)?)
@@ -354,12 +415,61 @@ impl Store {
         transaction.commit().await.map_err(StoreError::Database)?;
         Ok(Message {
             sequence: u64::try_from(sequence).map_err(|_| StoreError::Corrupt)?,
-            role: MessageRole::User,
-            content: input.content.trim().to_owned(),
-            branch: thread.branch,
-            commit: thread.pinned_commit,
+            role,
+            content: content.to_owned(),
+            branch: thread.branch.clone(),
+            commit: thread.pinned_commit.clone(),
             created_at_ms: now,
         })
+    }
+
+    /// Read the current subject's thread for project-context dispatch.
+    pub async fn thread(
+        &self,
+        authority: &Authority,
+        thread_id: &str,
+    ) -> Result<Thread, StoreError> {
+        self.ensure_schema().await?;
+        self.owned_thread(authority, thread_id).await
+    }
+
+    /// Read the shared project agent identity when it has been provisioned.
+    pub async fn project_agent(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        self.ensure_schema().await?;
+        sqlx::query_scalar(
+            "SELECT agent_id FROM workspace_project_agents WHERE tenant_id = ? AND project_id = ?",
+        )
+        .bind(tenant_id)
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(StoreError::Database)
+    }
+
+    /// Converge the project-to-agent link after Agent Platform provisioning.
+    pub async fn record_project_agent(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        agent_id: &str,
+    ) -> Result<String, StoreError> {
+        self.ensure_schema().await?;
+        let now = now_ms()?;
+        sqlx::query("INSERT INTO workspace_project_agents (tenant_id, project_id, agent_id, created_at_ms) VALUES (?, ?, ?, ?) ON CONFLICT (tenant_id, project_id) DO NOTHING")
+            .bind(tenant_id)
+            .bind(project_id)
+            .bind(agent_id)
+            .bind(as_i64(now)?)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        self.project_agent(tenant_id, project_id)
+            .await?
+            .ok_or(StoreError::Corrupt)
     }
 
     /// Idempotently admit one exact-snapshot pre-built workflow run.
@@ -558,6 +668,7 @@ mod tests {
             tenant_id: "tenant-one".to_owned(),
             subject: subject.to_owned(),
             connector_bearer: "not-retained".to_owned(),
+            agent_platform_bearer: None,
             context: OwnerContext {
                 tenant_id: "tenant-one".to_owned(),
                 agent_id: "workspace:test".to_owned(),

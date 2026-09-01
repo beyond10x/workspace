@@ -13,7 +13,9 @@ still see the repository.
 ```console
 cargo run --locked -p workspace-service -- \
   --identity-origin http://127.0.0.1:8081 \
-  --connectors-api-base http://127.0.0.1:8091/api/connectors/v1
+  --connectors-api-base http://127.0.0.1:8091/api/connectors/v1 \
+  --agent-platform-origin http://127.0.0.1:8090 \
+  --project-agent-model default
 ```
 
 Use a local Identity session as the HTTP bearer. Hosted deployment supplies PostgreSQL through
@@ -25,9 +27,15 @@ Use a local Identity session as the HTTP bearer. Hosted deployment supplies Post
 - converge users on one tenant/project canonical project;
 - select any branch and pin its observed head only through explicit refresh;
 - keep personal branch-bound threads and commit-boundary messages durable;
+- list the pinned root tree and project root files through exact-commit, read-only Connector
+  operations;
+- provision one project agent and dispatch typed conversation turns containing the prior personal
+  thread and a bounded exact-commit context pack;
 - admit the code review, security review, and reverse AEP + ESS workflow identities against an
   exact branch and commit.
 
-Source materialization, agent task dispatch, and workflow execution remain delegated to Substrate,
-Agent Platform, and Workflow respectively.
+Full source materialization and workflow execution remain delegated to Substrate and Workflow.
+The Connector tree/file projection is the governed browse and chat-context bridge while
+Substrate's existing Git source remains explicitly unserved; it is not presented as a materialized
+workspace.
 Governed repository workspaces for agents and workflows
