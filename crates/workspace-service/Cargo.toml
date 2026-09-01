@@ -13,18 +13,22 @@ identity-client.workspace = true
 connectors-client.workspace = true
 agent-platform-client.workspace = true
 agent-platform-core.workspace = true
+aep-client.workspace = true
+aep-contract.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
 clap.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

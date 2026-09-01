@@ -6,8 +6,9 @@ use reqwest::{Method, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use url::Url;
 use workspace_core::{
-    Branch, CreateMessage, CreateThread, Message, OpenProject, Project, RepositoryCandidate,
-    RepositoryEntry, SelectBranch, StartWorkflow, Thread, WorkflowDefinition, WorkflowRun,
+    Branch, CreateMessage, CreateThread, EngineeringArtifactPage, Message, OpenProject, Project,
+    RepositoryCandidate, RepositoryEntry, SelectBranch, StartWorkflow, Thread, WorkflowDefinition,
+    WorkflowRun,
 };
 
 /// Workspace transport failure without response or credential bodies.
@@ -229,6 +230,21 @@ impl WorkspaceClient {
             &format!("v1/projects/{project_id}/workflow-runs"),
             authorization,
             Some(input),
+        )
+        .await
+    }
+
+    /// List central AEP entities indexed to one accessible project.
+    pub async fn engineering_artifacts(
+        &self,
+        authorization: &str,
+        project_id: &str,
+    ) -> Result<EngineeringArtifactPage, ClientError> {
+        self.exchange(
+            Method::GET,
+            &format!("v1/projects/{project_id}/engineering-artifacts"),
+            authorization,
+            Option::<&()>::None,
         )
         .await
     }

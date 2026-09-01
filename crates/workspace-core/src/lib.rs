@@ -235,6 +235,38 @@ pub struct StartWorkflow {
     pub idempotency_key: String,
 }
 
+/// One central AEP entity associated with a repository project.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EngineeringArtifact {
+    /// Canonical AEP entity identity.
+    pub id: String,
+    /// Logical AEP address.
+    pub locator: String,
+    /// Versioned AEP entity type.
+    pub entity_type: String,
+    /// Current AEP entity revision.
+    pub revision: u64,
+    /// Human-readable title projected from the entity body when present.
+    pub title: Option<String>,
+    /// Lifecycle status projected from the entity body when present.
+    pub status: Option<String>,
+    /// Last AEP update time in Unix milliseconds.
+    pub updated_at_ms: u64,
+    /// Exact source revision recorded by AEP provenance when present.
+    pub source_revision: Option<String>,
+}
+
+/// Bounded project projection from the central AEP authority.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EngineeringArtifactPage {
+    /// Entities whose indexed AEP space is this Workspace project.
+    pub artifacts: Vec<EngineeringArtifact>,
+    /// Whether another central page exists beyond this projection.
+    pub has_more: bool,
+}
+
 /// Safe HTTP problem document.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

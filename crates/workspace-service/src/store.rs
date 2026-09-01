@@ -669,6 +669,7 @@ mod tests {
             subject: subject.to_owned(),
             connector_bearer: "not-retained".to_owned(),
             agent_platform_bearer: None,
+            session_authorization: "Bearer synthetic-session".to_owned(),
             context: OwnerContext {
                 tenant_id: "tenant-one".to_owned(),
                 agent_id: "workspace:test".to_owned(),

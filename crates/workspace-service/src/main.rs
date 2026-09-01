@@ -3,6 +3,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use aep_client::AepClient;
+use aep_contract::query::{EntityQuery, QueryService};
 use agent_platform_client::AgentPlatformClient;
 use agent_platform_core::{
     ActivateRevision, AgentId, ConversationInput, ConversationMessage, ConversationRole,
@@ -27,13 +29,15 @@ use identity_client::{IdentityClient, SessionAuthority};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use workspace_core::{
-    Branch, CreateMessage, CreateThread, MessageRole, OpenProject, Problem, Project,
-    RepositoryCandidate, RepositoryEntry, RepositoryEntryKind, SelectBranch, StartWorkflow,
-    WorkflowDefinition,
+    Branch, CreateMessage, CreateThread, EngineeringArtifact, EngineeringArtifactPage, MessageRole,
+    OpenProject, Problem, Project, RepositoryCandidate, RepositoryEntry, RepositoryEntryKind,
+    SelectBranch, StartWorkflow, WorkflowDefinition,
 };
 
+mod aep;
 mod store;
 
+use aep::{AepTransport, RequestCredential};
 use store::{Store, StoreError};
 
 const CONNECTORS_AUDIENCE: &str = "urn:b10x:connectors";
@@ -70,6 +74,12 @@ struct Args {
     agent_platform_origin: Option<String>,
     #[arg(long, env = "WORKSPACE_PROJECT_AGENT_MODEL")]
     project_agent_model: Option<String>,
+    #[arg(long, env = "WORKSPACE_AEP_SERVICE_ORIGIN")]
+    aep_service_origin: Option<String>,
+    #[arg(long, env = "WORKSPACE_AEP_REALM")]
+    aep_realm: Option<String>,
+    #[arg(long, env = "WORKSPACE_AEP_WORKSPACE")]
+    aep_workspace: Option<String>,
     #[arg(
         long,
         env = "WORKSPACE_DATABASE_URL",
@@ -84,7 +94,15 @@ struct AppState {
     connectors: HostedClient,
     agent_platform: Option<AgentPlatformClient>,
     project_agent_model: Option<String>,
+    aep: Option<AepConfiguration>,
     store: Store,
+}
+
+#[derive(Clone)]
+struct AepConfiguration {
+    transport: AepTransport,
+    realm: String,
+    workspace: String,
 }
 
 #[tokio::main]
@@ -106,6 +124,28 @@ async fn main() -> Result<()> {
         .map(AgentPlatformClient::new)
         .transpose()
         .context("invalid Agent Platform configuration")?;
+    let aep_values = [
+        args.aep_service_origin.is_some(),
+        args.aep_realm.is_some(),
+        args.aep_workspace.is_some(),
+    ];
+    if aep_values.iter().any(|configured| *configured)
+        && !aep_values.iter().all(|configured| *configured)
+    {
+        bail!("AEP Service origin, realm and workspace must be configured together");
+    }
+    let aep = match (
+        args.aep_service_origin.as_deref(),
+        args.aep_realm,
+        args.aep_workspace,
+    ) {
+        (Some(origin), Some(realm), Some(workspace)) => Some(AepConfiguration {
+            transport: AepTransport::new(origin).context("invalid AEP Service configuration")?,
+            realm,
+            workspace,
+        }),
+        _ => None,
+    };
     let store =
         Store::connect_lazy(&args.database_url).context("invalid database configuration")?;
     let listener = tokio::net::TcpListener::bind(args.listen)
@@ -118,6 +158,7 @@ async fn main() -> Result<()> {
             connectors,
             agent_platform,
             project_agent_model: args.project_agent_model,
+            aep,
             store,
         }),
     )
@@ -146,6 +187,10 @@ fn router(state: AppState) -> Router {
             get(messages).post(create_message),
         )
         .route("/v1/projects/{project_id}/workflows", get(workflows))
+        .route(
+            "/v1/projects/{project_id}/engineering-artifacts",
+            get(engineering_artifacts),
+        )
         .route(
             "/v1/projects/{project_id}/workflow-runs",
             post(start_workflow),
@@ -567,6 +612,80 @@ async fn workflows(
     confidential(Json(workflow_definitions()).into_response())
 }
 
+async fn engineering_artifacts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Response {
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    let project = match accessible_project(&state, &authority, &project_id).await {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    let Some(configuration) = state.aep.as_ref() else {
+        return problem(StatusCode::SERVICE_UNAVAILABLE, "aep_service_unavailable");
+    };
+    let Ok(credentials) = RequestCredential::from_authorization(&authority.session_authorization)
+    else {
+        return problem(StatusCode::UNAUTHORIZED, "authentication_refused");
+    };
+    let Ok(client) = AepClient::new(
+        configuration.transport.clone(),
+        credentials,
+        &configuration.realm,
+        &configuration.workspace,
+    ) else {
+        return problem(StatusCode::SERVICE_UNAVAILABLE, "aep_service_unavailable");
+    };
+    let query = EntityQuery {
+        space: Some(project.id),
+        limit: Some(100),
+        ..EntityQuery::default()
+    };
+    let Ok(page) = client.query(&query).await else {
+        return problem(StatusCode::BAD_GATEWAY, "aep_query_refused");
+    };
+    let artifacts = page
+        .items
+        .into_iter()
+        .map(|entity| {
+            let body = entity.data.as_map();
+            let title = body
+                .and_then(|body| body.get("title").or_else(|| body.get("name")))
+                .and_then(|value| value.as_text())
+                .map(str::to_owned);
+            let status = body
+                .and_then(|body| body.get("status").or_else(|| body.get("state")))
+                .and_then(|value| value.as_text())
+                .map(str::to_owned);
+            EngineeringArtifact {
+                id: entity.metadata.id.to_string(),
+                locator: entity.metadata.locator.to_string(),
+                entity_type: entity.metadata.entity_type.to_string(),
+                revision: entity.metadata.revision.get(),
+                title,
+                status,
+                updated_at_ms: entity.metadata.updated_at.epoch_millis(),
+                source_revision: entity
+                    .metadata
+                    .provenance
+                    .source_revision
+                    .map(|revision| revision.to_string()),
+            }
+        })
+        .collect();
+    confidential(
+        Json(EngineeringArtifactPage {
+            artifacts,
+            has_more: page.next.is_some(),
+        })
+        .into_response(),
+    )
+}
+
 async fn start_workflow(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -638,6 +757,7 @@ struct Authority {
     subject: String,
     connector_bearer: String,
     agent_platform_bearer: Option<String>,
+    session_authorization: String,
     context: OwnerContext,
 }
 
@@ -698,6 +818,7 @@ async fn authority(
             .expose_at_authorization_boundary()
             .to_owned(),
         agent_platform_bearer,
+        session_authorization: authorization.to_owned(),
         context: OwnerContext {
             tenant_id: session.tenant_id,
             agent_id: format!("workspace:{}", session.subject),

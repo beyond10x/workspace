@@ -21,6 +21,8 @@ identity-client = { git = "ssh://git@github.com/beyond10x/identity.git", tag = "
 connectors-client = { git = "ssh://git@github.com/beyond10x/connectors.git", rev = "b4f6d655f9e3d7a906d2ba45d4160f2dc03a734b" }
 agent-platform-client = { git = "ssh://git@github.com/beyond10x/agent-platform.git", rev = "c6fa2e846fd0cbc0af310c0ba827b12aeb5d7e9d" }
 agent-platform-core = { git = "ssh://git@github.com/beyond10x/agent-platform.git", rev = "c6fa2e846fd0cbc0af310c0ba827b12aeb5d7e9d" }
+aep-client = { git = "https://github.com/beyond10x/aep", tag = "0.40.3" }
+aep-contract = { git = "https://github.com/beyond10x/aep", tag = "0.40.3" }
 
 anyhow = "1"
 axum = "0.8"
