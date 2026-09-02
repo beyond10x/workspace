@@ -61,9 +61,21 @@ impl WorkspaceClient {
         &self,
         authorization: &str,
     ) -> Result<Vec<RepositoryCandidate>, ClientError> {
+        self.search_repositories(authorization, "").await
+    }
+
+    /// List a bounded set of repositories matching a provider-side search term.
+    pub async fn search_repositories(
+        &self,
+        authorization: &str,
+        query: &str,
+    ) -> Result<Vec<RepositoryCandidate>, ClientError> {
+        let suffix = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("query", query)
+            .finish();
         self.exchange(
             Method::GET,
-            "v1/repositories",
+            &format!("v1/repositories?{suffix}"),
             authorization,
             Option::<&()>::None,
         )

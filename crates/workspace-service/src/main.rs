@@ -12,7 +12,7 @@ use agent_platform_core::{
 };
 use anyhow::{Context, Result, bail};
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -27,6 +27,7 @@ use connectors_client::datasource::{
 };
 use connectors_client::operation::{self, OwnerContext};
 use identity_client::{IdentityClient, SessionAuthority};
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use workspace_core::{
@@ -266,12 +267,28 @@ async fn ready(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn repositories(State(state): State<AppState>, headers: HeaderMap) -> Response {
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RepositoryQuery {
+    query: String,
+}
+
+async fn repositories(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: Result<Query<RepositoryQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return problem(StatusCode::UNPROCESSABLE_ENTITY, "repository_query_invalid");
+    };
+    if query.query.len() > 512 {
+        return problem(StatusCode::UNPROCESSABLE_ENTITY, "repository_query_invalid");
+    }
     let authority = match authenticate(&state, &headers).await {
         Ok(authority) => authority,
         Err(response) => return response,
     };
-    match discover_projects(&state, &authority).await {
+    match search_projects(&state, &authority, query.query.trim()).await {
         Ok(mut projects) => {
             for project in &mut projects {
                 project.opened_project_id = state
@@ -309,15 +326,16 @@ async fn open_project(
     if let Err(response) = substrate_client(&state, &authority).await {
         return response;
     }
-    let candidate = match discover_projects(&state, &authority).await {
-        Ok(projects) => projects.into_iter().find(|project| {
-            project.forge_instance_ref == input.forge_instance_ref
-                && project.project_ref == input.project_ref
-        }),
+    let candidate = match reachable_project(
+        &state,
+        &authority,
+        &input.forge_instance_ref,
+        &input.project_ref,
+    )
+    .await
+    {
+        Ok(candidate) => candidate,
         Err(response) => return response,
-    };
-    let Some(candidate) = candidate else {
-        return problem(StatusCode::FORBIDDEN, "project_access_refused");
     };
     let Some(selected_branch) = candidate.default_branch.clone() else {
         return problem(StatusCode::CONFLICT, "project_default_branch_unavailable");
@@ -783,16 +801,13 @@ async fn accessible_project(
         .project(authority, project_id)
         .await
         .map_err(|error| store_problem(&error))?;
-    let visible = discover_projects(state, authority)
-        .await?
-        .into_iter()
-        .any(|candidate| {
-            candidate.forge_instance_ref == project.forge_instance_ref
-                && candidate.project_ref == project.project_ref
-        });
-    if !visible {
-        return Err(problem(StatusCode::FORBIDDEN, "project_access_refused"));
-    }
+    reachable_project(
+        state,
+        authority,
+        &project.forge_instance_ref,
+        &project.project_ref,
+    )
+    .await?;
     state
         .store
         .record_access(authority, project_id)
@@ -905,82 +920,143 @@ async fn authority(
     })
 }
 
-async fn discover_projects(
+async fn search_projects(
     state: &AppState,
     authority: &Authority,
+    query: &str,
 ) -> Result<Vec<RepositoryCandidate>, Response> {
-    let description = describe(state, authority, "gitlab.projects").await?;
-    let bindings = bindings(state, authority, "gitlab.projects", "").await?;
+    let described = connector_operation(
+        state,
+        authority,
+        operation::OperationRequest::Describe(operation::DescribeRequest {
+            operation_ref: "gitlab-project-list".to_owned(),
+        }),
+    )
+    .await?;
+    let operation::OperationResult::Describe(description) = described else {
+        return Err(problem(
+            StatusCode::BAD_GATEWAY,
+            "connector_protocol_invalid",
+        ));
+    };
     let mut projects = Vec::new();
-    for binding in bindings {
-        let mut cursor = None;
-        loop {
-            let result = datasource(
-                state,
-                authority,
-                DatasourceRequest::Read(ReadRequest {
-                    datasource_ref: "gitlab.projects".to_owned(),
-                    binding_ref: binding.binding_ref.clone(),
-                    description_ref: description.clone(),
-                    read: DatasourceRead::List { limit: 25, cursor },
-                }),
-            )
-            .await?;
-            let DatasourceResult::Read(page) = result else {
-                return Err(problem(
-                    StatusCode::BAD_GATEWAY,
-                    "connector_protocol_invalid",
-                ));
-            };
-            for record in page.records {
-                let value = record.value;
-                let Some(project_ref) = value
-                    .get("id")
-                    .and_then(Value::as_u64)
-                    .map(|id| id.to_string())
-                else {
-                    continue;
-                };
-                let Some(path) = value.get("path_with_namespace").and_then(Value::as_str) else {
-                    continue;
-                };
-                projects.push(RepositoryCandidate {
-                    forge_instance_ref: binding.connection_ref.clone(),
-                    project_ref,
-                    path_with_namespace: path.to_owned(),
-                    name: value
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or(path)
-                        .to_owned(),
-                    default_branch: value
-                        .get("default_branch")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    visibility: value
-                        .get("visibility")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_owned(),
-                    web_url: value
-                        .get("web_url")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned(),
-                    opened_project_id: None,
-                });
-            }
-            cursor = page.next_cursor;
-            if cursor.is_none() {
-                break;
+    for connection in description.connections {
+        let mut input = serde_json::json!({
+            "membership": true,
+            "page": 1,
+            "per_page": 25
+        });
+        if !query.is_empty() {
+            input
+                .as_object_mut()
+                .expect("static object")
+                .insert("search".to_owned(), Value::String(query.to_owned()));
+        }
+        let output = invoke_operation(
+            state,
+            authority,
+            operation::InvokeRequest {
+                operation_ref: "gitlab-project-list".to_owned(),
+                connection_ref: connection.connection_ref.clone(),
+                description_ref: description.description_ref.clone(),
+                input,
+                approval_evidence_ref: None,
+            },
+        )
+        .await?;
+        let values = output
+            .as_array()
+            .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
+        for value in values {
+            if let Some(candidate) = repository_candidate(value, &connection.connection_ref) {
+                projects.push(candidate);
             }
         }
     }
-    projects.sort_by(|left, right| left.path_with_namespace.cmp(&right.path_with_namespace));
     projects.dedup_by(|left, right| {
         left.forge_instance_ref == right.forge_instance_ref && left.project_ref == right.project_ref
     });
+    projects.truncate(25);
     Ok(projects)
+}
+
+async fn reachable_project(
+    state: &AppState,
+    authority: &Authority,
+    connection_ref: &str,
+    project_ref: &str,
+) -> Result<RepositoryCandidate, Response> {
+    let project_id = project_ref
+        .parse::<u64>()
+        .ok()
+        .filter(|project_id| *project_id > 0)
+        .ok_or_else(|| {
+            problem(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "project_reference_invalid",
+            )
+        })?;
+    let description_ref = describe(state, authority, "gitlab.projects").await?;
+    let binding = bindings(state, authority, "gitlab.projects", "")
+        .await?
+        .into_iter()
+        .find(|binding| binding.connection_ref == connection_ref)
+        .ok_or_else(|| problem(StatusCode::FORBIDDEN, "project_access_refused"))?;
+    let result = datasource(
+        state,
+        authority,
+        DatasourceRequest::Read(ReadRequest {
+            datasource_ref: "gitlab.projects".to_owned(),
+            binding_ref: binding.binding_ref,
+            description_ref,
+            read: DatasourceRead::Get {
+                key: Value::from(project_id),
+            },
+        }),
+    )
+    .await?;
+    let DatasourceResult::Read(page) = result else {
+        return Err(problem(
+            StatusCode::BAD_GATEWAY,
+            "connector_protocol_invalid",
+        ));
+    };
+    page.records
+        .into_iter()
+        .next()
+        .and_then(|record| repository_candidate(&record.value, connection_ref))
+        .filter(|candidate| candidate.project_ref == project_ref)
+        .ok_or_else(|| problem(StatusCode::FORBIDDEN, "project_access_refused"))
+}
+
+fn repository_candidate(value: &Value, connection_ref: &str) -> Option<RepositoryCandidate> {
+    let project_ref = value.get("id")?.as_u64()?.to_string();
+    let path = value.get("path_with_namespace")?.as_str()?;
+    Some(RepositoryCandidate {
+        forge_instance_ref: connection_ref.to_owned(),
+        project_ref,
+        path_with_namespace: path.to_owned(),
+        name: value
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(path)
+            .to_owned(),
+        default_branch: value
+            .get("default_branch")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        visibility: value
+            .get("visibility")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned(),
+        web_url: value
+            .get("web_url")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        opened_project_id: None,
+    })
 }
 
 async fn discover_branches(
@@ -1592,7 +1668,7 @@ async fn shutdown() {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_identity_transport;
+    use super::{repository_candidate, validate_identity_transport};
 
     #[test]
     fn public_listener_admits_only_https_or_internal_cluster_identity() {
@@ -1606,5 +1682,28 @@ mod tests {
         );
         assert!(validate_identity_transport(listen, "https://identity.example.test").is_ok());
         assert!(validate_identity_transport(listen, "http://identity.example.test").is_err());
+    }
+
+    #[test]
+    fn repository_candidate_keeps_provider_default_branch() {
+        let candidate = repository_candidate(
+            &serde_json::json!({
+                "id": 42,
+                "path_with_namespace": "group/project",
+                "name": "project",
+                "default_branch": "stable",
+                "visibility": "private",
+                "web_url": "https://git.example.test/group/project",
+                "ignored": "provider detail"
+            }),
+            "connection:gitlab:one",
+        )
+        .expect("valid project");
+
+        assert_eq!(candidate.forge_instance_ref, "connection:gitlab:one");
+        assert_eq!(candidate.project_ref, "42");
+        assert_eq!(candidate.path_with_namespace, "group/project");
+        assert_eq!(candidate.default_branch.as_deref(), Some("stable"));
+        assert!(candidate.opened_project_id.is_none());
     }
 }

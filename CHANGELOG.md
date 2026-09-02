@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.1.3 - 2026-09-02
+
+- Bound repository discovery to one provider-side page per GitLab connection and accept an
+  optional provider-side search query instead of serially loading every reachable repository.
+- Revalidate project access with one exact datasource read when opening or accessing a project,
+  preserving the repository's provider-declared default branch.
+
 ## 0.1.2 - 2026-09-02
 
 - Admit Identity over plaintext only at internal Kubernetes service DNS when Workspace listens on
