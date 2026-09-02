@@ -7,7 +7,8 @@ use sqlx::any::{AnyPoolOptions, AnyRow};
 use sqlx::{AnyPool, Row as _};
 use tokio::sync::OnceCell;
 use workspace_core::{
-    CreateMessage, CreateThread, Message, MessageRole, Project, StartWorkflow, Thread, WorkflowRun,
+    CodingSession, CodingSessionState, CreateCodingSession, CreateMessage, CreateThread,
+    MaterializationLimits, Message, MessageRole, Project, StartWorkflow, Thread, WorkflowRun,
     WorkflowRunState,
 };
 
@@ -20,6 +21,8 @@ const SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS workspace_threads_owner ON workspace_threads (tenant_id, project_id, owner_subject, created_at_ms)",
     "CREATE TABLE IF NOT EXISTS workspace_messages (thread_id TEXT NOT NULL, sequence BIGINT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, branch TEXT NOT NULL, commit_ref TEXT NOT NULL, created_at_ms BIGINT NOT NULL, PRIMARY KEY (thread_id, sequence))",
     "CREATE TABLE IF NOT EXISTS workspace_project_agents (tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, agent_id TEXT NOT NULL, created_at_ms BIGINT NOT NULL, PRIMARY KEY (tenant_id, project_id))",
+    "CREATE TABLE IF NOT EXISTS workspace_coding_sessions (session_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, owner_subject TEXT NOT NULL, source_revision TEXT NOT NULL, idempotency_key TEXT NOT NULL, base_materialization_ref TEXT, working_materialization_ref TEXT, manifest_sha256 TEXT, state TEXT NOT NULL, failure_code TEXT, max_files BIGINT NOT NULL, max_total_bytes BIGINT NOT NULL, max_file_bytes BIGINT NOT NULL, created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL, UNIQUE (tenant_id, owner_subject, project_id, idempotency_key))",
+    "CREATE INDEX IF NOT EXISTS workspace_coding_sessions_owner ON workspace_coding_sessions (tenant_id, project_id, owner_subject, created_at_ms)",
     "CREATE TABLE IF NOT EXISTS workspace_workflow_runs (run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, actor_subject TEXT NOT NULL, definition_id TEXT NOT NULL, branch TEXT NOT NULL, commit_ref TEXT NOT NULL, idempotency_key TEXT NOT NULL, state TEXT NOT NULL, failure_code TEXT, created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL, UNIQUE (tenant_id, actor_subject, project_id, idempotency_key))",
 ];
 
@@ -41,6 +44,12 @@ pub enum StoreError {
     /// Stored state violates the closed domain vocabulary.
     #[error("Workspace store contains invalid data")]
     Corrupt,
+}
+
+/// Whether an idempotent coding-session reservation was newly admitted.
+pub enum SessionReservation {
+    New(CodingSession),
+    Existing(CodingSession),
 }
 
 /// Tenant-scoped durable Workspace state.
@@ -255,6 +264,284 @@ impl Store {
         }
         transaction.commit().await.map_err(StoreError::Database)?;
         self.project(authority, &project.id).await
+    }
+
+    /// Durably reserve one exact-revision coding session before any Substrate mutation.
+    pub async fn reserve_coding_session(
+        &self,
+        authority: &Authority,
+        project_id: &str,
+        input: &CreateCodingSession,
+        limits: MaterializationLimits,
+    ) -> Result<SessionReservation, StoreError> {
+        self.ensure_schema().await?;
+        let now = now_ms()?;
+        let session_id = random_id("session")?;
+        let result = sqlx::query("INSERT INTO workspace_coding_sessions (session_id, tenant_id, project_id, owner_subject, source_revision, idempotency_key, base_materialization_ref, working_materialization_ref, manifest_sha256, state, failure_code, max_files, max_total_bytes, max_file_bytes, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 'preparing', NULL, ?, ?, ?, ?, ?) ON CONFLICT (tenant_id, owner_subject, project_id, idempotency_key) DO NOTHING")
+            .bind(&session_id)
+            .bind(&authority.tenant_id)
+            .bind(project_id)
+            .bind(&authority.subject)
+            .bind(&input.source_revision)
+            .bind(&input.idempotency_key)
+            .bind(i64::from(limits.max_files))
+            .bind(as_i64(limits.max_total_bytes)?)
+            .bind(as_i64(limits.max_file_bytes)?)
+            .bind(as_i64(now)?)
+            .bind(as_i64(now)?)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        let row = sqlx::query("SELECT session_id, project_id, source_revision, base_materialization_ref, working_materialization_ref, manifest_sha256, state, failure_code, max_files, max_total_bytes, max_file_bytes, created_at_ms, updated_at_ms FROM workspace_coding_sessions WHERE tenant_id = ? AND owner_subject = ? AND project_id = ? AND idempotency_key = ?")
+            .bind(&authority.tenant_id)
+            .bind(&authority.subject)
+            .bind(project_id)
+            .bind(&input.idempotency_key)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        let session = coding_session_from_row(&row)?;
+        if session.source_revision != input.source_revision {
+            return Err(StoreError::Conflict);
+        }
+        if result.rows_affected() == 1 {
+            Ok(SessionReservation::New(session))
+        } else {
+            Ok(SessionReservation::Existing(session))
+        }
+    }
+
+    /// List only the current subject's sessions for one canonical project.
+    pub async fn coding_sessions(
+        &self,
+        authority: &Authority,
+        project_id: &str,
+    ) -> Result<Vec<CodingSession>, StoreError> {
+        self.ensure_schema().await?;
+        let rows = sqlx::query("SELECT session_id, project_id, source_revision, base_materialization_ref, working_materialization_ref, manifest_sha256, state, failure_code, max_files, max_total_bytes, max_file_bytes, created_at_ms, updated_at_ms FROM workspace_coding_sessions WHERE tenant_id = ? AND project_id = ? AND owner_subject = ? ORDER BY created_at_ms DESC")
+            .bind(&authority.tenant_id)
+            .bind(project_id)
+            .bind(&authority.subject)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        rows.iter().map(coding_session_from_row).collect()
+    }
+
+    /// Read one session only through its tenant, project and owner coordinates.
+    pub async fn coding_session(
+        &self,
+        authority: &Authority,
+        session_id: &str,
+    ) -> Result<CodingSession, StoreError> {
+        self.ensure_schema().await?;
+        let row = sqlx::query("SELECT session_id, project_id, source_revision, base_materialization_ref, working_materialization_ref, manifest_sha256, state, failure_code, max_files, max_total_bytes, max_file_bytes, created_at_ms, updated_at_ms FROM workspace_coding_sessions WHERE tenant_id = ? AND session_id = ? AND owner_subject = ?")
+            .bind(&authority.tenant_id)
+            .bind(session_id)
+            .bind(&authority.subject)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(StoreError::Database)?
+            .ok_or(StoreError::NotFound)?;
+        coding_session_from_row(&row)
+    }
+
+    /// Record a created Substrate reference while the session is still preparing.
+    pub async fn record_materialization_ref(
+        &self,
+        authority: &Authority,
+        session_id: &str,
+        base: bool,
+        materialization_ref: &str,
+    ) -> Result<CodingSession, StoreError> {
+        self.ensure_schema().await?;
+        let now = now_ms()?;
+        let statement = if base {
+            "UPDATE workspace_coding_sessions SET base_materialization_ref = ?, updated_at_ms = ? WHERE tenant_id = ? AND session_id = ? AND owner_subject = ? AND state = 'preparing' AND (base_materialization_ref IS NULL OR base_materialization_ref = ?)"
+        } else {
+            "UPDATE workspace_coding_sessions SET working_materialization_ref = ?, updated_at_ms = ? WHERE tenant_id = ? AND session_id = ? AND owner_subject = ? AND state = 'preparing' AND (working_materialization_ref IS NULL OR working_materialization_ref = ?)"
+        };
+        let result = sqlx::query(statement)
+            .bind(materialization_ref)
+            .bind(as_i64(now)?)
+            .bind(&authority.tenant_id)
+            .bind(session_id)
+            .bind(&authority.subject)
+            .bind(materialization_ref)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::Conflict);
+        }
+        self.coding_session(authority, session_id).await
+    }
+
+    /// Publish both verified Substrate references and their exact source manifest atomically.
+    pub async fn complete_coding_session(
+        &self,
+        authority: &Authority,
+        session_id: &str,
+        manifest_sha256: &str,
+    ) -> Result<CodingSession, StoreError> {
+        let now = now_ms()?;
+        let result = sqlx::query("UPDATE workspace_coding_sessions SET state = 'ready', failure_code = NULL, manifest_sha256 = ?, updated_at_ms = ? WHERE tenant_id = ? AND session_id = ? AND owner_subject = ? AND state = 'preparing' AND base_materialization_ref IS NOT NULL AND working_materialization_ref IS NOT NULL")
+            .bind(manifest_sha256)
+            .bind(as_i64(now)?)
+            .bind(&authority.tenant_id)
+            .bind(session_id)
+            .bind(&authority.subject)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::Conflict);
+        }
+        self.coding_session(authority, session_id).await
+    }
+
+    /// Record a whole-materialization refusal without publishing partial references as ready.
+    pub async fn refuse_coding_session(
+        &self,
+        authority: &Authority,
+        session_id: &str,
+        failure_code: &str,
+        unknown: bool,
+    ) -> Result<CodingSession, StoreError> {
+        if !unknown {
+            let now = now_ms()?;
+            let result = sqlx::query("UPDATE workspace_coding_sessions SET state = 'refused', failure_code = ?, base_materialization_ref = NULL, working_materialization_ref = NULL, manifest_sha256 = NULL, updated_at_ms = ? WHERE tenant_id = ? AND session_id = ? AND owner_subject = ? AND state = 'preparing'")
+                .bind(failure_code)
+                .bind(as_i64(now)?)
+                .bind(&authority.tenant_id)
+                .bind(session_id)
+                .bind(&authority.subject)
+                .execute(&self.pool)
+                .await
+                .map_err(StoreError::Database)?;
+            if result.rows_affected() != 1 {
+                return Err(StoreError::Conflict);
+            }
+            return self.coding_session(authority, session_id).await;
+        }
+        self.transition_coding_session(
+            authority,
+            session_id,
+            "unknown",
+            Some(failure_code),
+            None,
+            "preparing",
+        )
+        .await
+    }
+
+    /// Move an owned session into cleanup, replaying an already closing or closed request.
+    pub async fn begin_close_coding_session(
+        &self,
+        authority: &Authority,
+        session_id: &str,
+    ) -> Result<CodingSession, StoreError> {
+        let session = self.coding_session(authority, session_id).await?;
+        if matches!(
+            session.state,
+            CodingSessionState::Closing | CodingSessionState::Closed
+        ) {
+            return Ok(session);
+        }
+        let now = now_ms()?;
+        let (next, expected) = if session.state == CodingSessionState::Refused {
+            ("closed", "refused")
+        } else {
+            ("closing", session_state_name(session.state))
+        };
+        let result = sqlx::query("UPDATE workspace_coding_sessions SET state = ?, failure_code = NULL, updated_at_ms = ? WHERE tenant_id = ? AND session_id = ? AND owner_subject = ? AND state = ?")
+            .bind(next)
+            .bind(as_i64(now)?)
+            .bind(&authority.tenant_id)
+            .bind(session_id)
+            .bind(&authority.subject)
+            .bind(expected)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        if result.rows_affected() != 1 {
+            let raced = self.coding_session(authority, session_id).await?;
+            return if matches!(
+                raced.state,
+                CodingSessionState::Closing | CodingSessionState::Closed
+            ) {
+                Ok(raced)
+            } else {
+                Err(StoreError::Conflict)
+            };
+        }
+        self.coding_session(authority, session_id).await
+    }
+
+    /// Finish cleanup and remove all live Substrate references from durable state.
+    pub async fn complete_close_coding_session(
+        &self,
+        authority: &Authority,
+        session_id: &str,
+    ) -> Result<CodingSession, StoreError> {
+        let now = now_ms()?;
+        let result = sqlx::query("UPDATE workspace_coding_sessions SET state = 'closed', failure_code = NULL, base_materialization_ref = NULL, working_materialization_ref = NULL, updated_at_ms = ? WHERE tenant_id = ? AND session_id = ? AND owner_subject = ? AND state = 'closing'")
+            .bind(as_i64(now)?)
+            .bind(&authority.tenant_id)
+            .bind(session_id)
+            .bind(&authority.subject)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::Conflict);
+        }
+        self.coding_session(authority, session_id).await
+    }
+
+    /// Make an uncertain cleanup explicit so a later close can safely retry observation.
+    pub async fn mark_close_unknown(
+        &self,
+        authority: &Authority,
+        session_id: &str,
+    ) -> Result<CodingSession, StoreError> {
+        self.transition_coding_session(
+            authority,
+            session_id,
+            "unknown",
+            Some("materialization_cleanup_unknown"),
+            None,
+            "closing",
+        )
+        .await
+    }
+
+    async fn transition_coding_session(
+        &self,
+        authority: &Authority,
+        session_id: &str,
+        state: &str,
+        failure_code: Option<&str>,
+        manifest_sha256: Option<&str>,
+        expected_state: &str,
+    ) -> Result<CodingSession, StoreError> {
+        let now = now_ms()?;
+        let result = sqlx::query("UPDATE workspace_coding_sessions SET state = ?, failure_code = ?, manifest_sha256 = COALESCE(?, manifest_sha256), updated_at_ms = ? WHERE tenant_id = ? AND session_id = ? AND owner_subject = ? AND state = ?")
+            .bind(state)
+            .bind(failure_code)
+            .bind(manifest_sha256)
+            .bind(as_i64(now)?)
+            .bind(&authority.tenant_id)
+            .bind(session_id)
+            .bind(&authority.subject)
+            .bind(expected_state)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::Conflict);
+        }
+        self.coding_session(authority, session_id).await
     }
 
     /// List only the current subject's personal project threads.
@@ -565,6 +852,61 @@ fn project_from_row(row: &AnyRow) -> Result<Project, StoreError> {
     })
 }
 
+fn coding_session_from_row(row: &AnyRow) -> Result<CodingSession, StoreError> {
+    let state: String = row.try_get("state").map_err(|_| StoreError::Corrupt)?;
+    Ok(CodingSession {
+        id: row.try_get("session_id").map_err(|_| StoreError::Corrupt)?,
+        project_id: row.try_get("project_id").map_err(|_| StoreError::Corrupt)?,
+        source_revision: row
+            .try_get("source_revision")
+            .map_err(|_| StoreError::Corrupt)?,
+        base_materialization_ref: row
+            .try_get("base_materialization_ref")
+            .map_err(|_| StoreError::Corrupt)?,
+        working_materialization_ref: row
+            .try_get("working_materialization_ref")
+            .map_err(|_| StoreError::Corrupt)?,
+        manifest_sha256: row
+            .try_get("manifest_sha256")
+            .map_err(|_| StoreError::Corrupt)?,
+        state: match state.as_str() {
+            "preparing" => CodingSessionState::Preparing,
+            "ready" => CodingSessionState::Ready,
+            "refused" => CodingSessionState::Refused,
+            "unknown" => CodingSessionState::Unknown,
+            "closing" => CodingSessionState::Closing,
+            "closed" => CodingSessionState::Closed,
+            _ => return Err(StoreError::Corrupt),
+        },
+        failure_code: row
+            .try_get("failure_code")
+            .map_err(|_| StoreError::Corrupt)?,
+        limits: MaterializationLimits {
+            max_files: u32::try_from(
+                row.try_get::<i64, _>("max_files")
+                    .map_err(|_| StoreError::Corrupt)?,
+            )
+            .map_err(|_| StoreError::Corrupt)?,
+            max_total_bytes: from_i64(
+                row.try_get("max_total_bytes")
+                    .map_err(|_| StoreError::Corrupt)?,
+            )?,
+            max_file_bytes: from_i64(
+                row.try_get("max_file_bytes")
+                    .map_err(|_| StoreError::Corrupt)?,
+            )?,
+        },
+        created_at_ms: from_i64(
+            row.try_get("created_at_ms")
+                .map_err(|_| StoreError::Corrupt)?,
+        )?,
+        updated_at_ms: from_i64(
+            row.try_get("updated_at_ms")
+                .map_err(|_| StoreError::Corrupt)?,
+        )?,
+    })
+}
+
 fn thread_from_row(row: &AnyRow) -> Result<Thread, StoreError> {
     Ok(Thread {
         id: row.try_get("thread_id").map_err(|_| StoreError::Corrupt)?,
@@ -648,6 +990,17 @@ fn as_i64(value: u64) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::Corrupt)
 }
 
+fn session_state_name(state: CodingSessionState) -> &'static str {
+    match state {
+        CodingSessionState::Preparing => "preparing",
+        CodingSessionState::Ready => "ready",
+        CodingSessionState::Refused => "refused",
+        CodingSessionState::Unknown => "unknown",
+        CodingSessionState::Closing => "closing",
+        CodingSessionState::Closed => "closed",
+    }
+}
+
 fn from_i64(value: i64) -> Result<u64, StoreError> {
     u64::try_from(value).map_err(|_| StoreError::Corrupt)
 }
@@ -725,6 +1078,178 @@ mod tests {
                 .as_deref(),
             Some("project-one")
         );
+    }
+
+    #[tokio::test]
+    async fn coding_session_reservation_is_exact_owned_and_publishes_both_refs_atomically() {
+        let store = store().await;
+        let owner = authority("person:owner");
+        let other = authority("person:other");
+        store.open_project(&owner, &project()).await.unwrap();
+        let input = CreateCodingSession {
+            source_revision: "a".repeat(40),
+            idempotency_key: "open-editor-on-trunk".to_owned(),
+        };
+        let limits = MaterializationLimits {
+            max_files: 4_096,
+            max_total_bytes: 256 * 1024 * 1024,
+            max_file_bytes: 180 * 1024,
+        };
+        let SessionReservation::New(reserved) = store
+            .reserve_coding_session(&owner, "project-one", &input, limits)
+            .await
+            .unwrap()
+        else {
+            panic!("first reservation must be new");
+        };
+        let SessionReservation::Existing(replayed) = store
+            .reserve_coding_session(&owner, "project-one", &input, limits)
+            .await
+            .unwrap()
+        else {
+            panic!("same reservation must replay");
+        };
+        assert_eq!(replayed.id, reserved.id);
+        assert!(matches!(
+            store.coding_session(&other, &reserved.id).await,
+            Err(StoreError::NotFound)
+        ));
+        store
+            .record_materialization_ref(&owner, &reserved.id, true, "ws_base")
+            .await
+            .unwrap();
+        let preparing = store
+            .record_materialization_ref(&owner, &reserved.id, false, "ws_working")
+            .await
+            .unwrap();
+        assert_eq!(preparing.state, CodingSessionState::Preparing);
+        let ready = store
+            .complete_coding_session(&owner, &reserved.id, &"f".repeat(64))
+            .await
+            .unwrap();
+        assert_eq!(ready.state, CodingSessionState::Ready);
+        assert_eq!(ready.base_materialization_ref.as_deref(), Some("ws_base"));
+        assert_eq!(
+            ready.working_materialization_ref.as_deref(),
+            Some("ws_working")
+        );
+        assert_eq!(
+            ready.manifest_sha256.as_deref(),
+            Some("f".repeat(64).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn coding_session_cannot_publish_partial_materialization_and_refusal_clears_references() {
+        let store = store().await;
+        let owner = authority("person:owner");
+        store.open_project(&owner, &project()).await.unwrap();
+        let input = CreateCodingSession {
+            source_revision: "a".repeat(40),
+            idempotency_key: "partial-materialization".to_owned(),
+        };
+        let SessionReservation::New(reserved) = store
+            .reserve_coding_session(
+                &owner,
+                "project-one",
+                &input,
+                MaterializationLimits {
+                    max_files: 4_096,
+                    max_total_bytes: 256 * 1024 * 1024,
+                    max_file_bytes: 180 * 1024,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("first reservation must be new");
+        };
+        store
+            .record_materialization_ref(&owner, &reserved.id, true, "ws_base")
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .complete_coding_session(&owner, &reserved.id, &"f".repeat(64))
+                .await,
+            Err(StoreError::Conflict)
+        ));
+
+        let refused = store
+            .refuse_coding_session(&owner, &reserved.id, "source_refused", false)
+            .await
+            .unwrap();
+        assert_eq!(refused.state, CodingSessionState::Refused);
+        assert!(refused.base_materialization_ref.is_none());
+        assert!(refused.working_materialization_ref.is_none());
+        assert!(refused.manifest_sha256.is_none());
+        let closed = store
+            .begin_close_coding_session(&owner, &reserved.id)
+            .await
+            .unwrap();
+        assert_eq!(closed.state, CodingSessionState::Closed);
+    }
+
+    #[tokio::test]
+    async fn closing_a_ready_session_retains_provenance_but_clears_live_references() {
+        let store = store().await;
+        let owner = authority("person:owner");
+        store.open_project(&owner, &project()).await.unwrap();
+        let input = CreateCodingSession {
+            source_revision: "a".repeat(40),
+            idempotency_key: "close-ready".to_owned(),
+        };
+        let SessionReservation::New(reserved) = store
+            .reserve_coding_session(
+                &owner,
+                "project-one",
+                &input,
+                MaterializationLimits {
+                    max_files: 4_096,
+                    max_total_bytes: 256 * 1024 * 1024,
+                    max_file_bytes: 180 * 1024,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("first reservation must be new");
+        };
+        store
+            .record_materialization_ref(&owner, &reserved.id, true, "ws_base")
+            .await
+            .unwrap();
+        store
+            .record_materialization_ref(&owner, &reserved.id, false, "ws_working")
+            .await
+            .unwrap();
+        let ready = store
+            .complete_coding_session(&owner, &reserved.id, &"f".repeat(64))
+            .await
+            .unwrap();
+        let closing = store
+            .begin_close_coding_session(&owner, &ready.id)
+            .await
+            .unwrap();
+        assert_eq!(closing.state, CodingSessionState::Closing);
+        assert_eq!(closing.base_materialization_ref.as_deref(), Some("ws_base"));
+
+        let closed = store
+            .complete_close_coding_session(&owner, &ready.id)
+            .await
+            .unwrap();
+        assert_eq!(closed.state, CodingSessionState::Closed);
+        assert!(closed.base_materialization_ref.is_none());
+        assert!(closed.working_materialization_ref.is_none());
+        assert_eq!(
+            closed.manifest_sha256.as_deref(),
+            Some("f".repeat(64).as_str())
+        );
+        let replay = store
+            .begin_close_coding_session(&owner, &ready.id)
+            .await
+            .unwrap();
+        assert_eq!(replay.state, CodingSessionState::Closed);
     }
 
     #[tokio::test]

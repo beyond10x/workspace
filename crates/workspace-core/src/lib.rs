@@ -101,6 +101,52 @@ pub struct RepositoryEntry {
     pub mode: String,
 }
 
+/// Effective source-materialization bounds after applying dependency ceilings.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MaterializationLimits {
+    pub max_files: u32,
+    pub max_total_bytes: u64,
+    pub max_file_bytes: u64,
+}
+
+/// Durable lifecycle of one confined coding-session materialization.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodingSessionState {
+    Preparing,
+    Ready,
+    Refused,
+    Unknown,
+    Closing,
+    Closed,
+}
+
+/// One project coding session backed by an immutable base reference and writable working tree.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodingSession {
+    pub id: String,
+    pub project_id: String,
+    pub source_revision: String,
+    pub base_materialization_ref: Option<String>,
+    pub working_materialization_ref: Option<String>,
+    pub manifest_sha256: Option<String>,
+    pub state: CodingSessionState,
+    pub failure_code: Option<String>,
+    pub limits: MaterializationLimits,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// Idempotent request to materialize the project's exact current revision.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CreateCodingSession {
+    pub source_revision: String,
+    pub idempotency_key: String,
+}
+
 /// One personal, branch-bound conversation thread.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

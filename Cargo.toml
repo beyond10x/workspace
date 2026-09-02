@@ -18,12 +18,12 @@ publish = false
 workspace-core = { path = "crates/workspace-core" }
 workspace-client = { path = "crates/workspace-client" }
 identity-client = { git = "https://github.com/beyond10x/identity.git", tag = "0.4.0" }
-connectors-client = { git = "https://github.com/beyond10x/connectors.git", rev = "b4f6d655f9e3d7a906d2ba45d4160f2dc03a734b" }
+connectors-client = { git = "https://github.com/beyond10x/connectors.git", rev = "ea335281ef8029ca4cb375768d98db3dc3135feb" }
 agent-platform-client = { git = "https://github.com/beyond10x/agent-platform.git", tag = "0.5.0" }
 agent-platform-core = { git = "https://github.com/beyond10x/agent-platform.git", tag = "0.5.0" }
 aep-client = { git = "https://github.com/beyond10x/aep", tag = "0.40.3" }
 aep-contract = { git = "https://github.com/beyond10x/aep", tag = "0.40.3" }
-b10x-substrate-sdk = { git = "https://github.com/beyond10x/substrate.git", tag = "0.5.0" }
+b10x-substrate-sdk = { git = "https://github.com/beyond10x/substrate.git", rev = "8d377f0ac0cd290df2c739fd6b0aee9db8936a8c" }
 
 anyhow = "1"
 axum = "0.8"

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add owner-scoped, exact-revision coding sessions under the existing project API. Workspace now
+  recursively materializes a Connector-authorized GitLab commit into complete base and working
+  Substrate workspaces, preserves executable modes, records a source-manifest digest, and refuses
+  or marks uncertain cleanup without exposing partial references.
+- Pin the governed GitLab publication Connector and the Substrate executable-mode preservation
+  change by exact commit.
+
 ## 0.1.5 - 2026-09-02
 
 - Select the AWS-LC Rustls crypto provider during service startup so Substrate HTTPS clients can

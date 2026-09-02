@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::{BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -17,7 +18,11 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, serve};
-use b10x_substrate_sdk::{AccessToken, Client as SubstrateClient, SdkError as SubstrateError};
+use b10x_substrate_sdk::{
+    AccessToken, Client as SubstrateClient, ExecutionPolicy, ExpectedFileState,
+    RefusalClass as SubstrateRefusalClass, SdkError as SubstrateError,
+    Workspace as SubstrateWorkspace,
+};
 use base64::Engine as _;
 use clap::Parser;
 use connectors_client::HostedClient;
@@ -31,21 +36,30 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use workspace_core::{
-    Branch, CreateMessage, CreateThread, EngineeringArtifact, EngineeringArtifactPage, MessageRole,
-    OpenProject, Problem, Project, RepositoryCandidate, RepositoryEntry, RepositoryEntryKind,
-    SelectBranch, StartWorkflow, WorkflowDefinition,
+    Branch, CodingSession, CodingSessionState, CreateCodingSession, CreateMessage, CreateThread,
+    EngineeringArtifact, EngineeringArtifactPage, MaterializationLimits, MessageRole, OpenProject,
+    Problem, Project, RepositoryCandidate, RepositoryEntry, RepositoryEntryKind, SelectBranch,
+    StartWorkflow, WorkflowDefinition,
 };
 
 mod aep;
 mod store;
 
 use aep::{AepTransport, RequestCredential};
-use store::{Store, StoreError};
+use store::{SessionReservation, Store, StoreError};
 
 const CONNECTORS_AUDIENCE: &str = "urn:b10x:connectors";
 const CONNECTORS_SCOPE: &str = "connectors.catalog.read connectors.invoke";
 const SUBSTRATE_AUDIENCE: &str = "urn:b10x:substrate";
-const SUBSTRATE_SCOPE: &str = "observe workspaces";
+const SUBSTRATE_SCOPE: &str = "observe workspaces exec session";
+const SOURCE_MATERIALIZATION_LIMITS: MaterializationLimits = MaterializationLimits {
+    max_files: b10x_substrate_sdk::MAX_LIST_ITEMS,
+    max_total_bytes: 256 * 1024 * 1024,
+    // Connector operation results are capped at 256 KiB and file bytes are base64 plus JSON.
+    max_file_bytes: 180 * 1024,
+};
+const MAX_SOURCE_DIRECTORIES: usize = 4_096;
+const MAX_MATERIALIZATION_KEY_BYTES: usize = 256;
 const PROJECT_CONTEXT_FILES: &[&str] = &[
     "AGENTS.md",
     "README.md",
@@ -240,6 +254,14 @@ fn router(state: AppState) -> Router {
         .route("/v1/projects/{project_id}/branches", get(branches))
         .route("/v1/projects/{project_id}/tree", get(repository_tree))
         .route("/v1/projects/{project_id}/branch", post(select_branch))
+        .route(
+            "/v1/projects/{project_id}/sessions",
+            get(coding_sessions).post(create_coding_session),
+        )
+        .route(
+            "/v1/sessions/{session_id}",
+            get(coding_session).delete(close_coding_session),
+        )
         .route(
             "/v1/projects/{project_id}/threads",
             get(threads).post(create_thread),
@@ -478,6 +500,193 @@ async fn select_branch(
     {
         Ok(project) => confidential(Json(project).into_response()),
         Err(error) => store_problem(&error),
+    }
+}
+
+async fn coding_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Response {
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    if let Err(response) = accessible_project(&state, &authority, &project_id).await {
+        return response;
+    }
+    match state.store.coding_sessions(&authority, &project_id).await {
+        Ok(sessions) => confidential(
+            Json(sessions.into_iter().map(public_session).collect::<Vec<_>>()).into_response(),
+        ),
+        Err(error) => store_problem(&error),
+    }
+}
+
+async fn coding_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Response {
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    let session = match state.store.coding_session(&authority, &session_id).await {
+        Ok(session) => session,
+        Err(error) => return store_problem(&error),
+    };
+    if let Err(response) = accessible_project(&state, &authority, &session.project_id).await {
+        return response;
+    }
+    confidential(Json(public_session(session)).into_response())
+}
+
+async fn close_coding_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Response {
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    let session = match state
+        .store
+        .begin_close_coding_session(&authority, &session_id)
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => return store_problem(&error),
+    };
+    if session.state == CodingSessionState::Closed {
+        return confidential(Json(public_session(session)).into_response());
+    }
+    let client = match substrate_client(&state, &authority).await {
+        Ok(Some(client)) => client,
+        Ok(None) => {
+            return problem(StatusCode::SERVICE_UNAVAILABLE, "substrate_unavailable");
+        }
+        Err(response) => return response,
+    };
+    let cleanup_unknown = cleanup_materializations(&client, &session).await;
+    let stored = if cleanup_unknown {
+        state
+            .store
+            .mark_close_unknown(&authority, &session.id)
+            .await
+    } else {
+        state
+            .store
+            .complete_close_coding_session(&authority, &session.id)
+            .await
+    };
+    match stored {
+        Ok(session) => confidential(Json(public_session(session)).into_response()),
+        Err(error) => store_problem(&error),
+    }
+}
+
+async fn create_coding_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<CreateCodingSession>,
+) -> Response {
+    if !valid_commit(&input.source_revision)
+        || input.idempotency_key.trim().is_empty()
+        || input.idempotency_key.len() > MAX_MATERIALIZATION_KEY_BYTES
+    {
+        return problem(StatusCode::UNPROCESSABLE_ENTITY, "coding_session_invalid");
+    }
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    let project = match accessible_project(&state, &authority, &project_id).await {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    if project.pinned_commit.as_deref() != Some(input.source_revision.as_str()) {
+        return problem(StatusCode::CONFLICT, "project_snapshot_stale");
+    }
+    let client = match substrate_client(&state, &authority).await {
+        Ok(Some(client)) => client,
+        Ok(None) => {
+            return problem(StatusCode::SERVICE_UNAVAILABLE, "substrate_unavailable");
+        }
+        Err(response) => return response,
+    };
+    let reservation = match state
+        .store
+        .reserve_coding_session(
+            &authority,
+            &project_id,
+            &input,
+            SOURCE_MATERIALIZATION_LIMITS,
+        )
+        .await
+    {
+        Ok(reservation) => reservation,
+        Err(error) => return store_problem(&error),
+    };
+    let session = match reservation {
+        SessionReservation::Existing(session) if session.state != CodingSessionState::Preparing => {
+            return confidential(Json(public_session(session)).into_response());
+        }
+        SessionReservation::New(session) | SessionReservation::Existing(session) => session,
+    };
+
+    let files = match collect_source_files(&state, &authority, &project).await {
+        Ok(files) => files,
+        Err(response) => {
+            let cleanup_unknown = cleanup_materializations(&client, &session).await;
+            let stored = state
+                .store
+                .refuse_coding_session(
+                    &authority,
+                    &session.id,
+                    if cleanup_unknown {
+                        "materialization_cleanup_unknown"
+                    } else {
+                        "source_materialization_refused"
+                    },
+                    cleanup_unknown,
+                )
+                .await;
+            return match stored {
+                Ok(session) if cleanup_unknown => {
+                    confidential(Json(public_session(session)).into_response())
+                }
+                Ok(_) => response,
+                Err(error) => store_problem(&error),
+            };
+        }
+    };
+    match provision_materializations(&state, &authority, &client, session, &files).await {
+        Ok(ready) => confidential(Json(public_session(ready)).into_response()),
+        Err((failed, error)) => {
+            let cleanup_unknown = cleanup_materializations(&client, &failed).await;
+            let stored = state
+                .store
+                .refuse_coding_session(
+                    &authority,
+                    &failed.id,
+                    if cleanup_unknown {
+                        "materialization_cleanup_unknown"
+                    } else {
+                        "substrate_materialization_refused"
+                    },
+                    cleanup_unknown,
+                )
+                .await;
+            match stored {
+                Ok(session) if cleanup_unknown => {
+                    confidential(Json(public_session(session)).into_response())
+                }
+                _ => substrate_problem(&error),
+            }
+        }
     }
 }
 
@@ -1279,6 +1488,505 @@ async fn exact_repository_tree(
     Ok(entries)
 }
 
+#[derive(Clone)]
+struct MaterializedFile {
+    path: String,
+    bytes: Vec<u8>,
+    sha256: String,
+    executable: bool,
+}
+
+async fn collect_source_files(
+    state: &AppState,
+    authority: &Authority,
+    project: &Project,
+) -> Result<Vec<MaterializedFile>, Response> {
+    let commit = project
+        .pinned_commit
+        .as_deref()
+        .ok_or_else(|| problem(StatusCode::CONFLICT, "project_snapshot_unpinned"))?;
+    let project_id = project
+        .project_ref
+        .parse::<u64>()
+        .map_err(|_| problem(StatusCode::BAD_GATEWAY, "provider_project_invalid"))?;
+    let tree_description = operation_description(
+        state,
+        authority,
+        "gitlab-repository-tree-list",
+        &project.forge_instance_ref,
+    )
+    .await?;
+    let file_description = operation_description(
+        state,
+        authority,
+        "gitlab-repository-file-get",
+        &project.forge_instance_ref,
+    )
+    .await?;
+    let blobs = collect_source_entries(
+        state,
+        authority,
+        project,
+        &tree_description,
+        project_id,
+        commit,
+    )
+    .await?;
+    let mut total_bytes = 0_u64;
+    let mut files = Vec::with_capacity(blobs.len());
+    for entry in blobs {
+        let file =
+            read_source_file(state, authority, project, &file_description, &entry, commit).await?;
+        total_bytes = total_bytes
+            .checked_add(file.bytes.len() as u64)
+            .ok_or_else(|| {
+                problem(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "repository_total_limit_exceeded",
+                )
+            })?;
+        if total_bytes > SOURCE_MATERIALIZATION_LIMITS.max_total_bytes {
+            return Err(problem(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "repository_total_limit_exceeded",
+            ));
+        }
+        files.push(file);
+    }
+    Ok(files)
+}
+
+async fn collect_source_entries(
+    state: &AppState,
+    authority: &Authority,
+    project: &Project,
+    tree_description: &str,
+    project_id: u64,
+    commit: &str,
+) -> Result<Vec<RepositoryEntry>, Response> {
+    let mut directories = VecDeque::from([String::new()]);
+    let mut visited_directories = BTreeSet::new();
+    let mut seen_paths = BTreeSet::new();
+    let mut blobs = Vec::new();
+    while let Some(directory) = directories.pop_front() {
+        if !visited_directories.insert(directory.clone())
+            || visited_directories.len() > MAX_SOURCE_DIRECTORIES
+        {
+            return Err(problem(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "repository_tree_limit_exceeded",
+            ));
+        }
+        let mut page = 1_u64;
+        loop {
+            let mut input = serde_json::json!({
+                "project_id": project_id,
+                "ref": commit,
+                "page": page,
+                "per_page": 100
+            });
+            if !directory.is_empty() {
+                input
+                    .as_object_mut()
+                    .expect("static object")
+                    .insert("path".to_owned(), Value::String(directory.clone()));
+            }
+            let output = invoke_operation(
+                state,
+                authority,
+                operation::InvokeRequest {
+                    operation_ref: "gitlab-repository-tree-list".to_owned(),
+                    connection_ref: project.forge_instance_ref.clone(),
+                    description_ref: tree_description.to_owned(),
+                    input,
+                    approval_evidence_ref: None,
+                },
+            )
+            .await?;
+            let values = output
+                .as_array()
+                .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
+            for value in values {
+                let entry = strict_repository_entry(value)
+                    .map_err(|error| problem(error.status, error.code))?;
+                if !seen_paths.insert(entry.path.clone()) {
+                    return Err(problem(
+                        StatusCode::BAD_GATEWAY,
+                        "repository_tree_inconsistent",
+                    ));
+                }
+                match entry.kind {
+                    RepositoryEntryKind::Tree => directories.push_back(entry.path),
+                    RepositoryEntryKind::Blob => {
+                        if blobs.len()
+                            >= usize::try_from(SOURCE_MATERIALIZATION_LIMITS.max_files)
+                                .expect("file limit fits usize")
+                        {
+                            return Err(problem(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "repository_file_limit_exceeded",
+                            ));
+                        }
+                        blobs.push(entry);
+                    }
+                }
+            }
+            if values.len() < 100 {
+                break;
+            }
+            page = page.checked_add(1).ok_or_else(|| {
+                problem(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "repository_tree_limit_exceeded",
+                )
+            })?;
+        }
+    }
+    blobs.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(blobs)
+}
+
+#[derive(Clone, Copy)]
+struct EntryProblem {
+    status: StatusCode,
+    code: &'static str,
+}
+
+fn entry_problem(status: StatusCode, code: &'static str) -> EntryProblem {
+    EntryProblem { status, code }
+}
+
+fn strict_repository_entry(value: &Value) -> Result<RepositoryEntry, EntryProblem> {
+    let object_id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| entry_problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| entry_problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
+    let path = value
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|value| valid_repository_path(value))
+        .ok_or_else(|| entry_problem(StatusCode::BAD_GATEWAY, "repository_path_refused"))?;
+    let mode = value
+        .get("mode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| entry_problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
+    let kind = match (value.get("type").and_then(Value::as_str), mode) {
+        (Some("blob"), "100644" | "100755") => RepositoryEntryKind::Blob,
+        (Some("tree"), "040000") => RepositoryEntryKind::Tree,
+        (Some("commit"), _) | (_, "120000" | "160000") => {
+            return Err(entry_problem(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "repository_entry_unsupported",
+            ));
+        }
+        _ => {
+            return Err(entry_problem(
+                StatusCode::BAD_GATEWAY,
+                "repository_tree_inconsistent",
+            ));
+        }
+    };
+    Ok(RepositoryEntry {
+        object_id: object_id.to_owned(),
+        name: name.to_owned(),
+        path: path.to_owned(),
+        kind,
+        mode: mode.to_owned(),
+    })
+}
+
+fn valid_repository_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 1_024
+        && !path.starts_with('/')
+        && !path.contains(['\0', '\\'])
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && !matches!(component, "." | ".." | ".git"))
+}
+
+async fn read_source_file(
+    state: &AppState,
+    authority: &Authority,
+    project: &Project,
+    description_ref: &str,
+    entry: &RepositoryEntry,
+    commit: &str,
+) -> Result<MaterializedFile, Response> {
+    let encoded_path =
+        url::form_urlencoded::byte_serialize(entry.path.as_bytes()).collect::<String>();
+    let output = invoke_operation(
+        state,
+        authority,
+        operation::InvokeRequest {
+            operation_ref: "gitlab-repository-file-get".to_owned(),
+            connection_ref: project.forge_instance_ref.clone(),
+            description_ref: description_ref.to_owned(),
+            input: serde_json::json!({
+                "project_id": project.project_ref.parse::<u64>().map_err(|_| problem(StatusCode::BAD_GATEWAY, "provider_project_invalid"))?,
+                "file_path": encoded_path,
+                "ref": commit
+            }),
+            approval_evidence_ref: None,
+        },
+    )
+    .await?;
+    if output.get("encoding").and_then(Value::as_str) != Some("base64")
+        || output.get("file_path").and_then(Value::as_str) != Some(entry.path.as_str())
+        || output.get("commit_id").and_then(Value::as_str) != Some(commit)
+    {
+        return Err(problem(
+            StatusCode::BAD_GATEWAY,
+            "repository_file_inconsistent",
+        ));
+    }
+    let size = output
+        .get("size")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
+    if size > SOURCE_MATERIALIZATION_LIMITS.max_file_bytes {
+        return Err(problem(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "repository_file_limit_exceeded",
+        ));
+    }
+    let encoded = output
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
+    let compact = encoded
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(compact)
+        .map_err(|_| problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
+    let observed_sha256 = output
+        .get("content_sha256")
+        .and_then(Value::as_str)
+        .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
+    let sha256 = hex::encode(Sha256::digest(&bytes));
+    let executable = entry.mode == "100755";
+    if bytes.len() as u64 != size
+        || observed_sha256 != sha256
+        || output
+            .get("execute_filemode")
+            .and_then(Value::as_bool)
+            .is_some_and(|observed| observed != executable)
+    {
+        return Err(problem(
+            StatusCode::BAD_GATEWAY,
+            "repository_file_inconsistent",
+        ));
+    }
+    Ok(MaterializedFile {
+        path: entry.path.clone(),
+        bytes,
+        sha256,
+        executable,
+    })
+}
+
+async fn provision_materializations(
+    state: &AppState,
+    authority: &Authority,
+    client: &SubstrateClient,
+    mut session: CodingSession,
+    files: &[MaterializedFile],
+) -> Result<CodingSession, (CodingSession, SubstrateError)> {
+    let base = ensure_materialization(state, authority, client, &mut session, true).await?;
+    let working = ensure_materialization(state, authority, client, &mut session, false).await?;
+    upload_materialization(&base, &session.id, "base", files)
+        .await
+        .map_err(|error| (session.clone(), error))?;
+    upload_materialization(&working, &session.id, "working", files)
+        .await
+        .map_err(|error| (session.clone(), error))?;
+    let manifest_sha256 = source_manifest_sha256(&session.source_revision, files);
+    state
+        .store
+        .complete_coding_session(authority, &session.id, &manifest_sha256)
+        .await
+        .map_err(|error| {
+            (
+                session,
+                SubstrateError::Protocol(format!("Workspace store refused completion: {error}")),
+            )
+        })
+}
+
+async fn ensure_materialization(
+    state: &AppState,
+    authority: &Authority,
+    client: &SubstrateClient,
+    session: &mut CodingSession,
+    base: bool,
+) -> Result<SubstrateWorkspace, (CodingSession, SubstrateError)> {
+    let existing = if base {
+        session.base_materialization_ref.as_deref()
+    } else {
+        session.working_materialization_ref.as_deref()
+    };
+    if let Some(reference) = existing {
+        return client
+            .get_workspace(reference)
+            .await
+            .map_err(|error| (session.clone(), error));
+    }
+    let role = if base { "base" } else { "working" };
+    let workspace = client
+        .workspace()
+        .empty()
+        .label("coding.session", &session.id)
+        .label("materialization.role", role)
+        .label("source.revision", &session.source_revision)
+        .operation_id(substrate_operation_id(&session.id, &["create", role]))
+        .create()
+        .await
+        .map_err(|error| (session.clone(), error))?;
+    *session = state
+        .store
+        .record_materialization_ref(authority, &session.id, base, workspace.id())
+        .await
+        .map_err(|error| {
+            (
+                session.clone(),
+                SubstrateError::Protocol(format!(
+                    "Workspace store refused materialization reference: {error}"
+                )),
+            )
+        })?;
+    Ok(workspace)
+}
+
+async fn upload_materialization(
+    workspace: &SubstrateWorkspace,
+    session_id: &str,
+    role: &str,
+    files: &[MaterializedFile],
+) -> Result<(), SubstrateError> {
+    for file in files {
+        workspace
+            .replace_file(
+                &file.path,
+                &file.bytes,
+                ExpectedFileState::Absent,
+                true,
+                Some(substrate_operation_id(
+                    session_id,
+                    &["file", role, &file.path, &file.sha256],
+                )),
+            )
+            .await?;
+    }
+    let executable = files
+        .iter()
+        .filter(|file| file.executable)
+        .map(|file| file.path.as_str())
+        .collect::<Vec<_>>();
+    for (index, chunk) in executable.chunks(64).enumerate() {
+        let mut arguments = Vec::with_capacity(chunk.len() + 2);
+        arguments.push("u+x");
+        arguments.push("--");
+        arguments.extend(chunk.iter().copied());
+        let policy = ExecutionPolicy::builder()
+            .timeout(Duration::from_secs(30))
+            .cpu_time(Duration::from_secs(5))
+            .memory_bytes(64 * 1024 * 1024)
+            .processes(16)
+            .output_bytes(64 * 1024)
+            .build()?;
+        let output = workspace
+            .command("/usr/bin/chmod")
+            .args(arguments)
+            .policy(policy)
+            .operation_id(substrate_operation_id(
+                session_id,
+                &["chmod", role, &index.to_string()],
+            ))
+            .run()
+            .await?;
+        if output.exec.exit.as_ref().and_then(|exit| exit.code) != Some(0) {
+            return Err(SubstrateError::Protocol(
+                "confined executable-mode application failed".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn source_manifest_sha256(source_revision: &str, files: &[MaterializedFile]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"b10x/workspace/source-manifest/v1");
+    append_digest_part(&mut digest, source_revision.as_bytes());
+    for file in files {
+        append_digest_part(&mut digest, file.path.as_bytes());
+        append_digest_part(&mut digest, file.sha256.as_bytes());
+        digest.update((file.bytes.len() as u64).to_be_bytes());
+        digest.update([u8::from(file.executable)]);
+    }
+    hex::encode(digest.finalize())
+}
+
+fn substrate_operation_id(session_id: &str, parts: &[&str]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"b10x/workspace/substrate-operation/v1");
+    append_digest_part(&mut digest, session_id.as_bytes());
+    for part in parts {
+        append_digest_part(&mut digest, part.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
+fn append_digest_part(digest: &mut Sha256, part: &[u8]) {
+    digest.update((part.len() as u64).to_be_bytes());
+    digest.update(part);
+}
+
+async fn cleanup_materializations(client: &SubstrateClient, session: &CodingSession) -> bool {
+    let mut unknown = false;
+    for (role, reference) in [
+        ("base", session.base_materialization_ref.as_deref()),
+        ("working", session.working_materialization_ref.as_deref()),
+    ] {
+        let Some(reference) = reference else {
+            continue;
+        };
+        match client.get_workspace(reference).await {
+            Ok(workspace) => {
+                if workspace
+                    .destroy_with_operation_id(Some(substrate_operation_id(
+                        &session.id,
+                        &["cleanup", role],
+                    )))
+                    .await
+                    .is_err()
+                {
+                    unknown = true;
+                }
+            }
+            Err(SubstrateError::Refusal(refusal)) if refusal.code == "resource.not-found" => {}
+            Err(_) => unknown = true,
+        }
+    }
+    unknown
+}
+
+fn public_session(mut session: CodingSession) -> CodingSession {
+    if session.state != CodingSessionState::Ready {
+        session.base_materialization_ref = None;
+        session.working_materialization_ref = None;
+        session.manifest_sha256 = None;
+    }
+    session
+}
+
 async fn project_context(
     state: &AppState,
     authority: &Authority,
@@ -1661,6 +2369,42 @@ fn store_problem(error: &StoreError) -> Response {
     }
 }
 
+fn substrate_problem(error: &SubstrateError) -> Response {
+    match error {
+        SubstrateError::Refusal(refusal) => match refusal.class {
+            SubstrateRefusalClass::Refused => {
+                problem(StatusCode::UNPROCESSABLE_ENTITY, "substrate_refused")
+            }
+            SubstrateRefusalClass::Conflict => problem(StatusCode::CONFLICT, "substrate_conflict"),
+            SubstrateRefusalClass::Unserved => problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "substrate_capability_unavailable",
+            ),
+            SubstrateRefusalClass::Exhausted => problem(
+                StatusCode::TOO_MANY_REQUESTS,
+                "substrate_capacity_exhausted",
+            ),
+            SubstrateRefusalClass::Failed => problem(StatusCode::BAD_GATEWAY, "substrate_failed"),
+        },
+        SubstrateError::UnknownOperation { .. } => {
+            problem(StatusCode::SERVICE_UNAVAILABLE, "substrate_outcome_unknown")
+        }
+        SubstrateError::Transport(_)
+        | SubstrateError::TokenUnavailable
+        | SubstrateError::Startup(_)
+        | SubstrateError::Shutdown(_) => {
+            problem(StatusCode::SERVICE_UNAVAILABLE, "substrate_unavailable")
+        }
+        SubstrateError::Protocol(_)
+        | SubstrateError::Builder { .. }
+        | SubstrateError::EventGap { .. }
+        | SubstrateError::ContractMismatch { .. } => {
+            problem(StatusCode::BAD_GATEWAY, "substrate_protocol_invalid")
+        }
+        _ => problem(StatusCode::BAD_GATEWAY, "substrate_protocol_invalid"),
+    }
+}
+
 fn confidential(mut response: Response) -> Response {
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -1675,7 +2419,12 @@ async fn shutdown() {
 
 #[cfg(test)]
 mod tests {
-    use super::{install_crypto_provider, repository_candidate, validate_identity_transport};
+    use sha2::Digest as _;
+
+    use super::{
+        MaterializedFile, install_crypto_provider, repository_candidate, source_manifest_sha256,
+        strict_repository_entry, valid_repository_path, validate_identity_transport,
+    };
 
     #[test]
     fn installs_the_process_crypto_provider_before_tls_clients_are_built() {
@@ -1718,5 +2467,52 @@ mod tests {
         assert_eq!(candidate.path_with_namespace, "group/project");
         assert_eq!(candidate.default_branch.as_deref(), Some("stable"));
         assert!(candidate.opened_project_id.is_none());
+    }
+
+    #[test]
+    fn materialization_tree_parser_refuses_git_metadata_and_non_regular_entries() {
+        assert!(!valid_repository_path(".git/config"));
+        assert!(!valid_repository_path("src/../secret"));
+        assert!(!valid_repository_path("/absolute"));
+        assert!(
+            strict_repository_entry(&serde_json::json!({
+                "id": "abc",
+                "name": "link",
+                "path": "link",
+                "type": "blob",
+                "mode": "120000"
+            }))
+            .is_err()
+        );
+        assert!(
+            strict_repository_entry(&serde_json::json!({
+                "id": "abc",
+                "name": "dependency",
+                "path": "dependency",
+                "type": "commit",
+                "mode": "160000"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn source_manifest_commits_to_revision_content_and_executable_mode() {
+        let ordinary = MaterializedFile {
+            path: "tool".to_owned(),
+            bytes: b"hello".to_vec(),
+            sha256: hex::encode(sha2::Sha256::digest(b"hello")),
+            executable: false,
+        };
+        let mut executable = ordinary.clone();
+        executable.executable = true;
+
+        let first = source_manifest_sha256(&"a".repeat(40), std::slice::from_ref(&ordinary));
+        let changed_mode =
+            source_manifest_sha256(&"a".repeat(40), std::slice::from_ref(&executable));
+        let changed_revision = source_manifest_sha256(&"b".repeat(40), &[ordinary]);
+
+        assert_ne!(first, changed_mode);
+        assert_ne!(first, changed_revision);
     }
 }

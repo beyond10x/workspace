@@ -6,9 +6,9 @@ use reqwest::{Method, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use url::Url;
 use workspace_core::{
-    Branch, CreateMessage, CreateThread, EngineeringArtifactPage, Message, OpenProject, Project,
-    RepositoryCandidate, RepositoryEntry, SelectBranch, StartWorkflow, Thread, WorkflowDefinition,
-    WorkflowRun,
+    Branch, CodingSession, CreateCodingSession, CreateMessage, CreateThread,
+    EngineeringArtifactPage, Message, OpenProject, Project, RepositoryCandidate, RepositoryEntry,
+    SelectBranch, StartWorkflow, Thread, WorkflowDefinition, WorkflowRun,
 };
 
 /// Workspace transport failure without response or credential bodies.
@@ -149,6 +149,67 @@ impl WorkspaceClient {
             &format!("v1/projects/{project_id}/branch"),
             authorization,
             Some(input),
+        )
+        .await
+    }
+
+    /// List the authenticated subject's confined coding sessions for one project.
+    pub async fn coding_sessions(
+        &self,
+        authorization: &str,
+        project_id: &str,
+    ) -> Result<Vec<CodingSession>, ClientError> {
+        self.exchange(
+            Method::GET,
+            &format!("v1/projects/{project_id}/sessions"),
+            authorization,
+            Option::<&()>::None,
+        )
+        .await
+    }
+
+    /// Materialize one exact project revision as immutable-base and writable-working references.
+    pub async fn create_coding_session(
+        &self,
+        authorization: &str,
+        project_id: &str,
+        input: &CreateCodingSession,
+    ) -> Result<CodingSession, ClientError> {
+        self.exchange(
+            Method::POST,
+            &format!("v1/projects/{project_id}/sessions"),
+            authorization,
+            Some(input),
+        )
+        .await
+    }
+
+    /// Resume one owned coding-session representation after live project revalidation.
+    pub async fn coding_session(
+        &self,
+        authorization: &str,
+        session_id: &str,
+    ) -> Result<CodingSession, ClientError> {
+        self.exchange(
+            Method::GET,
+            &format!("v1/sessions/{session_id}"),
+            authorization,
+            Option::<&()>::None,
+        )
+        .await
+    }
+
+    /// Explicitly close one owned coding session and clean up both Substrate materializations.
+    pub async fn close_coding_session(
+        &self,
+        authorization: &str,
+        session_id: &str,
+    ) -> Result<CodingSession, ClientError> {
+        self.exchange(
+            Method::DELETE,
+            &format!("v1/sessions/{session_id}"),
+            authorization,
+            Option::<&()>::None,
         )
         .await
     }
