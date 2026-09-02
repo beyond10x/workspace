@@ -10,7 +10,7 @@ still see the repository.
 
 ## Run locally
 
-```console
+```bash
 cargo run --locked -p workspace-service -- \
   --identity-origin http://127.0.0.1:8081 \
   --connectors-api-base http://127.0.0.1:8091/api/connectors/v1 \
@@ -52,3 +52,9 @@ the released Substrate `0.5.0` Git source remains explicitly unserved; the HTTPS
 not present Connector-projected files as a materialized workspace. Reverse-engineering publishers associate central artifacts by using the canonical
 project id as the AEP locator space and record the exact commit as AEP source provenance.
 Governed repository workspaces for agents and workflows
+
+<!-- b10x-docs:start -->
+## Documentation
+
+[Workspace documentation](https://beyond10x.github.io/docs/workspace/) · [Start](https://beyond10x.github.io/) · [Ecosystem](https://beyond10x.github.io/ecosystem/) · [Impact](https://beyond10x.github.io/changes/) · [Releases](https://beyond10x.github.io/releases/)
+<!-- b10x-docs:end -->
