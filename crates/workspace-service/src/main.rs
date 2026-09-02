@@ -43,8 +43,6 @@ use store::{Store, StoreError};
 
 const CONNECTORS_AUDIENCE: &str = "urn:b10x:connectors";
 const CONNECTORS_SCOPE: &str = "connectors.catalog.read connectors.invoke";
-const AGENT_PLATFORM_AUDIENCE: &str = "urn:b10x:agent-platform";
-const AGENT_PLATFORM_SCOPE: &str = "agents.read agents.manage tasks.read tasks.submit";
 const SUBSTRATE_AUDIENCE: &str = "urn:b10x:substrate";
 const SUBSTRATE_SCOPE: &str = "observe workspaces";
 const PROJECT_CONTEXT_FILES: &[&str] = &[
@@ -860,21 +858,13 @@ async fn authority(
                 "connector_authority_unavailable",
             )
         })?;
-    let agent_platform_bearer = if state.agent_platform.is_some() {
-        state
-            .identity
-            .issue_access_token(authorization, AGENT_PLATFORM_AUDIENCE, AGENT_PLATFORM_SCOPE)
-            .await
-            .ok()
-            .map(|access| {
-                access
-                    .credential
-                    .expose_at_authorization_boundary()
-                    .to_owned()
-            })
-    } else {
-        None
-    };
+    // Agent Platform must receive the transient Identity session so it can validate the user and
+    // perform its own current-grant exchange for a user-bound model lease. Exchanging here first
+    // would hand it a narrowed access token that cannot legitimately acquire Connector authority.
+    let agent_platform_bearer = state
+        .agent_platform
+        .as_ref()
+        .map(|_| authorization.to_owned());
     let mut digest = Sha256::new();
     digest.update(session.tenant_id.as_bytes());
     digest.update(b"\0");
