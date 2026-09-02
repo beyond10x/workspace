@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.1.1 - 2026-09-02
+
+- Forward the transient Identity session to Agent Platform for repository chat so it can derive a
+  fresh user-bound Connector model lease instead of receiving an already-narrowed access token.
+
 ## 0.1.0 - 2026-09-02
 
 ### Added
