@@ -17,10 +17,10 @@ publish = false
 [workspace.dependencies]
 workspace-core = { path = "crates/workspace-core" }
 workspace-client = { path = "crates/workspace-client" }
-identity-client = { git = "ssh://git@github.com/beyond10x/identity.git", tag = "0.3.2" }
-connectors-client = { git = "ssh://git@github.com/beyond10x/connectors.git", rev = "b4f6d655f9e3d7a906d2ba45d4160f2dc03a734b" }
-agent-platform-client = { git = "ssh://git@github.com/beyond10x/agent-platform.git", rev = "c6fa2e846fd0cbc0af310c0ba827b12aeb5d7e9d" }
-agent-platform-core = { git = "ssh://git@github.com/beyond10x/agent-platform.git", rev = "c6fa2e846fd0cbc0af310c0ba827b12aeb5d7e9d" }
+identity-client = { git = "https://github.com/beyond10x/identity.git", tag = "0.4.0" }
+connectors-client = { git = "https://github.com/beyond10x/connectors.git", rev = "b4f6d655f9e3d7a906d2ba45d4160f2dc03a734b" }
+agent-platform-client = { git = "https://github.com/beyond10x/agent-platform.git", tag = "0.5.0" }
+agent-platform-core = { git = "https://github.com/beyond10x/agent-platform.git", tag = "0.5.0" }
 aep-client = { git = "https://github.com/beyond10x/aep", tag = "0.40.3" }
 aep-contract = { git = "https://github.com/beyond10x/aep", tag = "0.40.3" }
 b10x-substrate-sdk = { git = "https://github.com/beyond10x/substrate.git", tag = "0.5.0" }
