@@ -123,6 +123,7 @@ struct SubstrateConfiguration {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_crypto_provider()?;
     let args = Args::parse();
     validate_identity_transport(args.listen, &args.identity_origin)?;
     let identity = IdentityClient::new(&args.identity_origin, &args.identity_audience)
@@ -203,6 +204,12 @@ async fn main() -> Result<()> {
     .await
     .context("Workspace HTTP server failed")?;
     Ok(())
+}
+
+fn install_crypto_provider() -> Result<()> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("a Rustls crypto provider was already installed"))
 }
 
 fn validate_identity_transport(listen: SocketAddr, identity_origin: &str) -> Result<()> {
@@ -1668,7 +1675,13 @@ async fn shutdown() {
 
 #[cfg(test)]
 mod tests {
-    use super::{repository_candidate, validate_identity_transport};
+    use super::{install_crypto_provider, repository_candidate, validate_identity_transport};
+
+    #[test]
+    fn installs_the_process_crypto_provider_before_tls_clients_are_built() {
+        install_crypto_provider().expect("AWS-LC provider should install");
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
 
     #[test]
     fn public_listener_admits_only_https_or_internal_cluster_identity() {

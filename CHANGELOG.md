@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.1.5 - 2026-09-02
+
+- Select the AWS-LC Rustls crypto provider during service startup so Substrate HTTPS clients can
+  coexist with Ring-enabled HTTP dependencies without panicking on first use.
+
 ## 0.1.4 - 2026-09-02
 
 - Keep private runtime promotion in the existing private Devcenter package instead of publishing a
