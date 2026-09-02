@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.1.4 - 2026-09-02
+
+- Keep private runtime promotion in the existing private Devcenter package instead of publishing a
+  package linked to this public source repository.
+
 ## 0.1.3 - 2026-09-02
 
 - Bound repository discovery to one provider-side page per GitLab connection and accept an
