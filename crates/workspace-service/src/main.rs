@@ -123,9 +123,7 @@ struct SubstrateConfiguration {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    if args.listen.ip().is_unspecified() && args.identity_origin.starts_with("http://") {
-        bail!("an HTTP Identity origin is allowed only with a non-public listener");
-    }
+    validate_identity_transport(args.listen, &args.identity_origin)?;
     let identity = IdentityClient::new(&args.identity_origin, &args.identity_audience)
         .context("invalid Identity configuration")?;
     let connectors =
@@ -203,6 +201,24 @@ async fn main() -> Result<()> {
     .with_graceful_shutdown(shutdown())
     .await
     .context("Workspace HTTP server failed")?;
+    Ok(())
+}
+
+fn validate_identity_transport(listen: SocketAddr, identity_origin: &str) -> Result<()> {
+    let internal_cluster_http = url::Url::parse(identity_origin).is_ok_and(|origin| {
+        origin.scheme() == "http"
+            && origin
+                .host_str()
+                .is_some_and(|host| host.ends_with(".svc.cluster.local"))
+    });
+    if listen.ip().is_unspecified()
+        && identity_origin.starts_with("http://")
+        && !internal_cluster_http
+    {
+        bail!(
+            "an HTTP Identity origin is allowed only with a non-public listener or internal cluster DNS"
+        );
+    }
     Ok(())
 }
 
@@ -1572,4 +1588,23 @@ fn confidential(mut response: Response) -> Response {
 
 async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_identity_transport;
+
+    #[test]
+    fn public_listener_admits_only_https_or_internal_cluster_identity() {
+        let listen = "0.0.0.0:8094".parse().unwrap();
+        assert!(
+            validate_identity_transport(
+                listen,
+                "http://devcenter-identity.devcenter.svc.cluster.local:8080"
+            )
+            .is_ok()
+        );
+        assert!(validate_identity_transport(listen, "https://identity.example.test").is_ok());
+        assert!(validate_identity_transport(listen, "http://identity.example.test").is_err());
+    }
 }

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.1.2 - 2026-09-02
+
+- Admit Identity over plaintext only at internal Kubernetes service DNS when Workspace listens on
+  a pod-reachable address, while continuing to reject public plaintext Identity origins.
+
 ## 0.1.1 - 2026-09-02
 
 - Forward the transient Identity session to Agent Platform for repository chat so it can derive a
