@@ -2,9 +2,14 @@
 
 ## Unreleased
 
+## 0.2.4 - 2026-09-03
+
 - Derive AgentIDE agent views and intent authorization from a verified Agent Platform task, the
   generated AgentIDE Service SDK projections, and the existing Substrate-backed coding session;
   no second file store or caller-supplied actor identity is introduced.
+- Dispatch pre-built repository workflows to Agent Platform with exact-snapshot context, durable
+  owner-scoped status, idempotent task association, named terminal failures, and persisted Markdown
+  results that clients can reload.
 
 ## 0.2.3 - 2026-09-03
 
