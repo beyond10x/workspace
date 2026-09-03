@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.2.10 - 2026-09-03
+
+- Bind hosted AgentIDE sessions and terminal grants to Workspace's exact working materialization
+  reference instead of a synthetic session label, restoring coding turns without weakening the
+  owner, project, source-revision, or manifest checks.
+
 ## 0.2.9 - 2026-09-03
 
 - Consume AgentIDE 0.2.1's renderer-draft sealing contract so Workspace, Agent Platform, and
