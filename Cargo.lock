@@ -700,16 +700,16 @@ dependencies = [
 
 [[package]]
 name = "connector-state"
-version = "0.5.5"
-source = "git+https://github.com/beyond10x/connectors.git?tag=v0.5.5#440bc95b3820c76052c9ec1af82f7e7583e470e2"
+version = "0.5.6"
+source = "git+https://github.com/beyond10x/connectors.git?tag=v0.5.6#e162cbf4fa45f5938545798fc667cea9f21de85f"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "connectors-client"
-version = "0.5.5"
-source = "git+https://github.com/beyond10x/connectors.git?tag=v0.5.5#440bc95b3820c76052c9ec1af82f7e7583e470e2"
+version = "0.5.6"
+source = "git+https://github.com/beyond10x/connectors.git?tag=v0.5.6#e162cbf4fa45f5938545798fc667cea9f21de85f"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
@@ -918,8 +918,8 @@ dependencies = [
 
 [[package]]
 name = "domain"
-version = "0.5.5"
-source = "git+https://github.com/beyond10x/connectors.git?tag=v0.5.5#440bc95b3820c76052c9ec1af82f7e7583e470e2"
+version = "0.5.6"
+source = "git+https://github.com/beyond10x/connectors.git?tag=v0.5.6#e162cbf4fa45f5938545798fc667cea9f21de85f"
 dependencies = [
  "async-trait",
  "connector-state",
@@ -2135,8 +2135,8 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.5.5"
-source = "git+https://github.com/beyond10x/connectors.git?tag=v0.5.5#440bc95b3820c76052c9ec1af82f7e7583e470e2"
+version = "0.5.6"
+source = "git+https://github.com/beyond10x/connectors.git?tag=v0.5.6#e162cbf4fa45f5938545798fc667cea9f21de85f"
 dependencies = [
  "domain",
  "schemars 1.2.2",
@@ -4065,7 +4065,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workspace-client"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "agentide-contracts 0.2.1 (git+https://github.com/beyond10x/agentide.git?tag=0.2.1)",
  "reqwest 0.13.4",
@@ -4077,7 +4077,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-core"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "serde",
  "serde_json",
@@ -4085,7 +4085,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-service"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "aep-client",
  "aep-contract",
