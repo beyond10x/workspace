@@ -3004,8 +3004,10 @@ async fn read_source_file(
     entry: &RepositoryEntry,
     commit: &str,
 ) -> Result<MaterializedFile, Response> {
-    let encoded_path =
-        url::form_urlencoded::byte_serialize(entry.path.as_bytes()).collect::<String>();
+    let project_id = project
+        .project_ref
+        .parse::<u64>()
+        .map_err(|_| problem(StatusCode::BAD_GATEWAY, "provider_project_invalid"))?;
     let output = invoke_operation(
         state,
         authority,
@@ -3013,11 +3015,7 @@ async fn read_source_file(
             operation_ref: "gitlab-repository-file-get".to_owned(),
             connection_ref: project.forge_instance_ref.clone(),
             description_ref: description_ref.to_owned(),
-            input: serde_json::json!({
-                "project_id": project.project_ref.parse::<u64>().map_err(|_| problem(StatusCode::BAD_GATEWAY, "provider_project_invalid"))?,
-                "file_path": encoded_path,
-                "ref": commit
-            }),
+            input: source_file_input(project_id, &entry.path, commit),
             approval_evidence_ref: None,
         },
     )
@@ -3075,6 +3073,14 @@ async fn read_source_file(
         bytes,
         sha256,
         executable,
+    })
+}
+
+fn source_file_input(project_id: u64, path: &str, commit: &str) -> Value {
+    serde_json::json!({
+        "project_id": project_id,
+        "file_path": path,
+        "ref": commit
     })
 }
 
@@ -4114,8 +4120,9 @@ mod tests {
     use super::{
         Authority, CompleteWorkspaceFile, MaterializedFile, SUBSTRATE_SCOPE, canonical_diff,
         file_operation_id, install_crypto_provider, language_for_path, repository_candidate,
-        source_manifest_sha256, strict_repository_entry, terminal_grant_row_matches,
-        terminal_session_row_matches, valid_repository_path, validate_identity_transport,
+        source_file_input, source_manifest_sha256, strict_repository_entry,
+        terminal_grant_row_matches, terminal_session_row_matches, valid_repository_path,
+        validate_identity_transport,
     };
     use workspace_core::{
         ChangeSelector, CodingSession, CodingSessionState, DiffMode, FileExpectedState,
@@ -4300,6 +4307,17 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn source_file_input_preserves_nested_repository_paths() {
+        let commit = "a".repeat(40);
+        let input = source_file_input(42, ".github/workflows/check.yml", &commit);
+
+        assert_eq!(input["project_id"], 42);
+        assert_eq!(input["file_path"], ".github/workflows/check.yml");
+        assert_eq!(input["ref"], commit);
+        assert_ne!(input["file_path"], ".github%2Fworkflows%2Fcheck.yml");
     }
 
     #[test]
