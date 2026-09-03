@@ -596,6 +596,39 @@ pub struct FileConflict {
     pub latest: FileProjection,
 }
 
+/// Coordinates used by Agent Platform to request the current server-derived agent view.
+///
+/// The request contains no actor identity. Workspace resolves the durable task through Agent
+/// Platform under the current human session and derives the agent, attempt and delegation from
+/// that task.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodingActorViewRequest {
+    pub agentide_session_id: String,
+    pub task_id: String,
+    pub attempt_id: String,
+    pub turn: u64,
+}
+
+/// One `AgentIDE` intent call routed back through the authoritative Workspace materialization.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CodingIntentInvocation {
+    pub agentide_session_id: String,
+    pub task_id: String,
+    pub attempt_id: String,
+    pub call_id: String,
+    pub intent: String,
+    pub arguments: serde_json::Value,
+}
+
+/// Successful semantic result returned to the Agent Platform Harness port.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CodingIntentResult {
+    pub output: serde_json::Value,
+}
+
 /// Safe HTTP problem document.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

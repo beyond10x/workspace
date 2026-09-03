@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Derive AgentIDE agent views and intent authorization from a verified Agent Platform task, the
+  generated AgentIDE Service SDK projections, and the existing Substrate-backed coding session;
+  no second file store or caller-supplied actor identity is introduced.
+
 ## 0.2.3 - 2026-09-03
 
 - Pass nested repository paths to the GitLab Connector as canonical raw paths so exact source

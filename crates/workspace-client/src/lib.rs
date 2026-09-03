@@ -6,11 +6,11 @@ use reqwest::{Method, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use url::Url;
 use workspace_core::{
-    Branch, CodingSession, CodingTreeProjection, CreateCodingSession, CreateMessage,
-    CreateTerminal, CreateThread, DiffProjection, EngineeringArtifactPage, FileConflict,
-    FileProjection, Message, OpenProject, Project, RepositoryCandidate, RepositoryEntry,
-    ResolveDiff, SelectBranch, StartWorkflow, TerminalProfile, TerminalSession, Thread,
-    WorkflowDefinition, WorkflowRun, WriteFile,
+    Branch, CodingActorViewRequest, CodingIntentInvocation, CodingIntentResult, CodingSession,
+    CodingTreeProjection, CreateCodingSession, CreateMessage, CreateTerminal, CreateThread,
+    DiffProjection, EngineeringArtifactPage, FileConflict, FileProjection, Message, OpenProject,
+    Project, RepositoryCandidate, RepositoryEntry, ResolveDiff, SelectBranch, StartWorkflow,
+    TerminalProfile, TerminalSession, Thread, WorkflowDefinition, WorkflowRun, WriteFile,
 };
 
 /// Workspace transport failure without response or credential bodies.
@@ -200,6 +200,38 @@ impl WorkspaceClient {
             &format!("v1/sessions/{session_id}"),
             authorization,
             Option::<&()>::None,
+        )
+        .await
+    }
+
+    /// Refresh the exact `AgentIDE` actor context, attachments and tool inventory for one model turn.
+    pub async fn coding_actor_view(
+        &self,
+        authorization: &str,
+        session_id: &str,
+        input: &CodingActorViewRequest,
+    ) -> Result<agentide_contracts::ActorView, ClientError> {
+        self.exchange(
+            Method::POST,
+            &format!("v1/sessions/{session_id}/actor-view"),
+            authorization,
+            Some(input),
+        )
+        .await
+    }
+
+    /// Invoke one currently authorized semantic coding intent through Workspace.
+    pub async fn invoke_coding_intent(
+        &self,
+        authorization: &str,
+        session_id: &str,
+        input: &CodingIntentInvocation,
+    ) -> Result<CodingIntentResult, ClientError> {
+        self.exchange(
+            Method::POST,
+            &format!("v1/sessions/{session_id}/intents"),
+            authorization,
+            Some(input),
         )
         .await
     }

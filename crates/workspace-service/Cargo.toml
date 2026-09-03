@@ -13,6 +13,7 @@ identity-client.workspace = true
 connectors-client.workspace = true
 agent-platform-client.workspace = true
 agent-platform-core.workspace = true
+agentide-contracts.workspace = true
 aep-client.workspace = true
 aep-contract.workspace = true
 b10x-substrate-sdk.workspace = true
