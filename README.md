@@ -40,9 +40,26 @@ bytes remain in Substrate and forge credentials remain in Connectors. A session 
 only after both complete materializations exist. Refusal cleans up both, while an uncertain cleanup
 is explicit as `unknown` and never exposes partial references.
 
-The development bounds are 4,096 files, 256 MiB total and 180 KiB per file. The per-file bound is
-currently the effective Connector operation-result ceiling after base64 and JSON overhead, and is
-reported explicitly rather than returning truncated content.
+The intended development ceilings are 10,000 files, 256 MiB total and 4 MiB per file; effective
+bounds are always the lowest limit of Workspace and its dependencies. The current effective bounds
+are 1,000 files (Substrate's recursive-tree ceiling), 256 MiB total, and 180 KiB per file
+(Connector's operation-result ceiling after base64 and JSON overhead). These are reported explicitly
+rather than returning truncated content.
+
+Ready coding sessions expose the same Workspace API to Devcenter, AgentIDE, and other clients:
+bounded searchable trees, complete UTF-8 file reads, exact-state Save/create, and canonical
+immutable-base-versus-working diffs. A tree says when content was truncated and whether the omitted
+count is known. File reads return complete-content SHA-256, size, language hint, and base-relative
+modification state; binary files are explicit read-only projections. Save carries either `absent` or
+the digest originally loaded by the editor. A stale save returns HTTP 409 with both base and latest
+Workspace projections, and no blind-overwrite operation exists.
+
+`POST /v1/sessions/{session_id}/diff` is the authoritative diff resolver. Patch, stat, and
+files-only modes are projections of the same server calculation and carry one digest, exact old/new
+line numbers, stable hunk ids, file digests, counts, and server-derived attribution. The first
+release resolves the `workspace` selector; declared plan, agent-attempt, publication, and revision
+pair selectors fail explicitly until their owning services supply immutable references. Browsers do
+not compute authoritative diffs.
 
 ## First contract
 
@@ -53,6 +70,8 @@ reported explicitly rather than returning truncated content.
 - list the pinned root tree and project root files through exact-commit, read-only Connector
   operations;
 - create/list/resume exact-revision coding sessions through the same project API used by Devcenter;
+- browse and edit the session's Substrate working materialization through exact, bounded Workspace
+  file contracts, and resolve its diff only against the immutable base materialization;
 - provision one project agent and dispatch typed conversation turns containing the prior personal
   thread and a bounded exact-commit context pack;
 - query the official central AEP authority for entities whose indexed `space` is the canonical

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -35,11 +35,15 @@ use identity_client::{IdentityClient, SessionAuthority};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use similar::{ChangeTag, TextDiff};
 use workspace_core::{
-    Branch, CodingSession, CodingSessionState, CreateCodingSession, CreateMessage, CreateThread,
-    EngineeringArtifact, EngineeringArtifactPage, MaterializationLimits, MessageRole, OpenProject,
-    Problem, Project, RepositoryCandidate, RepositoryEntry, RepositoryEntryKind, SelectBranch,
-    StartWorkflow, WorkflowDefinition,
+    Branch, ChangeSelector, CodingSession, CodingSessionState, CodingTreeEntry,
+    CodingTreeProjection, CreateCodingSession, CreateMessage, CreateThread, DiffFile, DiffHunk,
+    DiffLine, DiffMode, DiffProjection, DiffRange, EngineeringArtifact, EngineeringArtifactPage,
+    FileConflict, FileExpectedState, FileModificationState, FileProjection, FileRevision,
+    MaterializationLimits, MessageRole, OpenProject, Problem, Project, RepositoryCandidate,
+    RepositoryEntry, RepositoryEntryKind, ResolveDiff, SelectBranch, StartWorkflow,
+    WorkflowDefinition, WriteFile,
 };
 
 mod aep;
@@ -261,6 +265,12 @@ fn router(state: AppState) -> Router {
         .route(
             "/v1/sessions/{session_id}",
             get(coding_session).delete(close_coding_session),
+        )
+        .route("/v1/sessions/{session_id}/tree", get(coding_tree))
+        .route("/v1/sessions/{session_id}/diff", post(resolve_diff))
+        .route(
+            "/v1/sessions/{session_id}/files/{*path}",
+            get(coding_file).put(write_coding_file),
         )
         .route(
             "/v1/projects/{project_id}/threads",
@@ -540,6 +550,246 @@ async fn coding_session(
         return response;
     }
     confidential(Json(public_session(session)).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct CodingTreeQuery {
+    query: String,
+    limit: u32,
+}
+
+impl Default for CodingTreeQuery {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            limit: 1_000,
+        }
+    }
+}
+
+async fn coding_tree(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    query: Result<Query<CodingTreeQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "coding_tree_query_invalid",
+        );
+    };
+    if query.limit == 0
+        || query.limit > b10x_substrate_sdk::MAX_LIST_ITEMS
+        || query.query.len() > 512
+    {
+        return problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "coding_tree_query_invalid",
+        );
+    }
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    let (session, _, working) =
+        match ready_session_materializations(&state, &authority, &session_id).await {
+            Ok(materializations) => materializations,
+            Err(response) => return response,
+        };
+    let tree = match working.tree(session.limits.max_files, true).await {
+        Ok(tree) => tree,
+        Err(error) => return substrate_problem(&error),
+    };
+    let needle = query.query.to_ascii_lowercase();
+    let matching = tree
+        .items
+        .into_iter()
+        .filter_map(|entry| {
+            let kind = serde_json::to_value(entry.kind).ok()?.as_str()?.to_owned();
+            if !needle.is_empty() && !entry.path.to_ascii_lowercase().contains(&needle) {
+                return None;
+            }
+            Some(CodingTreeEntry {
+                path: entry.path,
+                kind,
+                size: entry.size,
+                sha256: None,
+            })
+        })
+        .collect::<Vec<_>>();
+    let returned = matching.len().min(query.limit as usize);
+    let omitted = (!tree.truncated).then_some((matching.len() - returned) as u64);
+    let projection = CodingTreeProjection {
+        format: "workspace.coding-tree/1".to_owned(),
+        entries: matching.into_iter().take(returned).collect(),
+        truncated: tree.truncated || omitted.is_some_and(|count| count > 0),
+        omitted: if tree.truncated { None } else { omitted },
+    };
+    confidential(Json(projection).into_response())
+}
+
+async fn coding_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((session_id, path)): Path<(String, String)>,
+) -> Response {
+    if !valid_repository_path(&path) {
+        return problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace_file_path_invalid",
+        );
+    }
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    let (session, base, working) =
+        match ready_session_materializations(&state, &authority, &session_id).await {
+            Ok(materializations) => materializations,
+            Err(response) => return response,
+        };
+    match project_file(&path, &base, &working, session.limits.max_file_bytes).await {
+        Ok(Some(file)) => confidential(Json(file).into_response()),
+        Ok(None) => problem(StatusCode::NOT_FOUND, "workspace_file_not_found"),
+        Err(response) => response,
+    }
+}
+
+async fn write_coding_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((session_id, path)): Path<(String, String)>,
+    Json(input): Json<WriteFile>,
+) -> Response {
+    if !valid_repository_path(&path)
+        || input.operation_id.trim().is_empty()
+        || input.operation_id.len() > MAX_MATERIALIZATION_KEY_BYTES
+        || matches!(
+            &input.expected,
+            FileExpectedState::Sha256 { sha256 } if !valid_sha256(sha256)
+        )
+    {
+        return problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "workspace_file_write_invalid",
+        );
+    }
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    let (session, base, working) =
+        match ready_session_materializations(&state, &authority, &session_id).await {
+            Ok(materializations) => materializations,
+            Err(response) => return response,
+        };
+    if input.content.len() as u64 > session.limits.max_file_bytes {
+        return problem(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "workspace_file_limit_exceeded",
+        );
+    }
+    let expected = match &input.expected {
+        FileExpectedState::Absent => ExpectedFileState::Absent,
+        FileExpectedState::Sha256 { sha256 } => ExpectedFileState::Sha256 {
+            sha256: sha256.clone(),
+        },
+    };
+    let operation_id = file_operation_id(&session.id, &path, &input);
+    let result = working
+        .replace_file(
+            &path,
+            input.content.as_bytes(),
+            expected,
+            input.create_parents,
+            Some(operation_id),
+        )
+        .await;
+    match result {
+        Ok(_) => match project_file(&path, &base, &working, session.limits.max_file_bytes).await {
+            Ok(Some(file)) => {
+                let status = if matches!(input.expected, FileExpectedState::Absent) {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                };
+                confidential((status, Json(file)).into_response())
+            }
+            Ok(None) => problem(StatusCode::BAD_GATEWAY, "workspace_file_write_inconsistent"),
+            Err(response) => response,
+        },
+        Err(SubstrateError::Refusal(refusal))
+            if refusal.class == SubstrateRefusalClass::Conflict =>
+        {
+            match project_file(&path, &base, &working, session.limits.max_file_bytes).await {
+                Ok(Some(latest)) => {
+                    let base =
+                        match base_file_projection(&path, &base, session.limits.max_file_bytes)
+                            .await
+                        {
+                            Ok(base) => base,
+                            Err(response) => return response,
+                        };
+                    confidential(
+                        (
+                            StatusCode::CONFLICT,
+                            Json(FileConflict {
+                                code: "workspace_file_stale".to_owned(),
+                                base,
+                                latest,
+                            }),
+                        )
+                            .into_response(),
+                    )
+                }
+                Ok(None) => problem(StatusCode::CONFLICT, "workspace_file_stale"),
+                Err(response) => response,
+            }
+        }
+        Err(error) => substrate_problem(&error),
+    }
+}
+
+async fn resolve_diff(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(input): Json<ResolveDiff>,
+) -> Response {
+    if !matches!(input.selector, ChangeSelector::Workspace) {
+        return problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "diff_selector_unavailable",
+        );
+    }
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    let (session, base, working) =
+        match ready_session_materializations(&state, &authority, &session_id).await {
+            Ok(materializations) => materializations,
+            Err(response) => return response,
+        };
+    let base_files = match materialization_files(&base, &session).await {
+        Ok(files) => files,
+        Err(response) => return response,
+    };
+    let working_files = match materialization_files(&working, &session).await {
+        Ok(files) => files,
+        Err(response) => return response,
+    };
+    let projection = canonical_diff(
+        &input.selector,
+        input.mode,
+        &session.source_revision,
+        &base_files,
+        &working_files,
+        &authority.subject,
+    );
+    confidential(Json(projection).into_response())
 }
 
 async fn close_coding_session(
@@ -1088,6 +1338,49 @@ async fn substrate_client(
         .await
         .map(Some)
         .map_err(|_| problem(StatusCode::SERVICE_UNAVAILABLE, "substrate_unavailable"))
+}
+
+async fn ready_session_materializations(
+    state: &AppState,
+    authority: &Authority,
+    session_id: &str,
+) -> Result<(CodingSession, SubstrateWorkspace, SubstrateWorkspace), Response> {
+    let session = state
+        .store
+        .coding_session(authority, session_id)
+        .await
+        .map_err(|error| store_problem(&error))?;
+    accessible_project(state, authority, &session.project_id).await?;
+    if session.state != CodingSessionState::Ready {
+        return Err(problem(StatusCode::CONFLICT, "coding_session_not_ready"));
+    }
+    let base_ref = session.base_materialization_ref.as_deref().ok_or_else(|| {
+        problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "coding_session_inconsistent",
+        )
+    })?;
+    let working_ref = session
+        .working_materialization_ref
+        .as_deref()
+        .ok_or_else(|| {
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "coding_session_inconsistent",
+            )
+        })?;
+    let client = substrate_client(state, authority)
+        .await?
+        .ok_or_else(|| problem(StatusCode::SERVICE_UNAVAILABLE, "substrate_unavailable"))?;
+    let base = client
+        .get_workspace(base_ref)
+        .await
+        .map_err(|error| substrate_problem(&error))?;
+    let working = client
+        .get_workspace(working_ref)
+        .await
+        .map_err(|error| substrate_problem(&error))?;
+    Ok((session, base, working))
 }
 
 async fn authority(
@@ -1934,6 +2227,318 @@ fn source_manifest_sha256(source_revision: &str, files: &[MaterializedFile]) -> 
     hex::encode(digest.finalize())
 }
 
+#[derive(Clone)]
+struct CompleteWorkspaceFile {
+    bytes: Vec<u8>,
+    sha256: String,
+    size: u64,
+}
+
+async fn project_file(
+    path: &str,
+    base: &SubstrateWorkspace,
+    working: &SubstrateWorkspace,
+    max_file_bytes: u64,
+) -> Result<Option<FileProjection>, Response> {
+    let Some(current) = read_complete_file(working, path, max_file_bytes).await? else {
+        return Ok(None);
+    };
+    let base = read_complete_file(base, path, max_file_bytes).await?;
+    let modification = match base {
+        None => FileModificationState::Added,
+        Some(base) if base.sha256 == current.sha256 => FileModificationState::Unchanged,
+        Some(_) => FileModificationState::Modified,
+    };
+    Ok(Some(file_projection(path, current, modification)))
+}
+
+async fn base_file_projection(
+    path: &str,
+    base: &SubstrateWorkspace,
+    max_file_bytes: u64,
+) -> Result<Option<FileProjection>, Response> {
+    Ok(read_complete_file(base, path, max_file_bytes)
+        .await?
+        .map(|file| file_projection(path, file, FileModificationState::Unchanged)))
+}
+
+fn file_projection(
+    path: &str,
+    file: CompleteWorkspaceFile,
+    modification: FileModificationState,
+) -> FileProjection {
+    let content = String::from_utf8(file.bytes).ok();
+    FileProjection {
+        format: "workspace.file-projection/1".to_owned(),
+        revision: FileRevision {
+            path: path.to_owned(),
+            sha256: file.sha256,
+            size: file.size,
+            language: language_for_path(path).map(str::to_owned),
+            modification,
+        },
+        binary: content.is_none(),
+        content,
+        truncated: false,
+    }
+}
+
+async fn read_complete_file(
+    workspace: &SubstrateWorkspace,
+    path: &str,
+    max_file_bytes: u64,
+) -> Result<Option<CompleteWorkspaceFile>, Response> {
+    match workspace.read_file_v2(path, 0, max_file_bytes).await {
+        Ok(file) if file.eof => Ok(Some(CompleteWorkspaceFile {
+            bytes: file.bytes,
+            sha256: file.sha256,
+            size: file.size,
+        })),
+        Ok(_) => Err(problem(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "workspace_file_limit_exceeded",
+        )),
+        Err(SubstrateError::Refusal(refusal)) if refusal.code == "resource.not-found" => Ok(None),
+        Err(error) => Err(substrate_problem(&error)),
+    }
+}
+
+fn language_for_path(path: &str) -> Option<&'static str> {
+    let extension = path.rsplit_once('.').map(|(_, extension)| extension)?;
+    match extension.to_ascii_lowercase().as_str() {
+        "c" | "h" => Some("c"),
+        "cc" | "cpp" | "cxx" | "hh" | "hpp" => Some("cpp"),
+        "css" => Some("css"),
+        "go" => Some("go"),
+        "html" | "htm" => Some("html"),
+        "java" => Some("java"),
+        "js" | "mjs" | "cjs" => Some("javascript"),
+        "json" | "jsonc" => Some("json"),
+        "md" | "mdx" => Some("markdown"),
+        "py" => Some("python"),
+        "rb" => Some("ruby"),
+        "rs" => Some("rust"),
+        "sh" | "bash" => Some("shell"),
+        "sql" => Some("sql"),
+        "toml" => Some("toml"),
+        "ts" | "mts" | "cts" => Some("typescript"),
+        "tsx" => Some("typescriptreact"),
+        "xml" => Some("xml"),
+        "yaml" | "yml" => Some("yaml"),
+        _ => None,
+    }
+}
+
+fn file_operation_id(session_id: &str, path: &str, input: &WriteFile) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"b10x/workspace/file-operation/v1");
+    append_digest_part(&mut digest, session_id.as_bytes());
+    append_digest_part(&mut digest, path.as_bytes());
+    append_digest_part(&mut digest, input.operation_id.as_bytes());
+    append_digest_part(&mut digest, input.content.as_bytes());
+    append_digest_part(
+        &mut digest,
+        &serde_json::to_vec(&input.expected).expect("file expected state serializes"),
+    );
+    digest.update([u8::from(input.create_parents)]);
+    hex::encode(digest.finalize())
+}
+
+async fn materialization_files(
+    workspace: &SubstrateWorkspace,
+    session: &CodingSession,
+) -> Result<BTreeMap<String, CompleteWorkspaceFile>, Response> {
+    let tree = workspace
+        .tree(session.limits.max_files, true)
+        .await
+        .map_err(|error| substrate_problem(&error))?;
+    if tree.truncated {
+        return Err(problem(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "diff_tree_truncated",
+        ));
+    }
+    let mut files = BTreeMap::new();
+    for entry in tree.items {
+        if serde_json::to_value(entry.kind)
+            .ok()
+            .and_then(|kind| kind.as_str().map(str::to_owned))
+            .as_deref()
+            != Some("file")
+        {
+            continue;
+        }
+        let file = read_complete_file(workspace, &entry.path, session.limits.max_file_bytes)
+            .await?
+            .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "workspace_tree_file_inconsistent"))?;
+        files.insert(entry.path, file);
+    }
+    Ok(files)
+}
+
+fn canonical_diff(
+    selector: &ChangeSelector,
+    mode: DiffMode,
+    source_revision: &str,
+    base: &BTreeMap<String, CompleteWorkspaceFile>,
+    working: &BTreeMap<String, CompleteWorkspaceFile>,
+    actor: &str,
+) -> DiffProjection {
+    let paths = base
+        .keys()
+        .chain(working.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut files = Vec::new();
+    let mut additions = 0_u64;
+    let mut deletions = 0_u64;
+    for path in paths {
+        let old = base.get(&path);
+        let new = working.get(&path);
+        if old
+            .zip(new)
+            .is_some_and(|(old, new)| old.sha256 == new.sha256)
+        {
+            continue;
+        }
+        let (file, file_additions, file_deletions) = canonical_file_diff(
+            &path,
+            old,
+            new,
+            mode,
+            &[format!("actor:{actor}"), "operation:workspace".to_owned()],
+        );
+        additions = additions.saturating_add(file_additions);
+        deletions = deletions.saturating_add(file_deletions);
+        files.push(file);
+    }
+    let mut seal = serde_json::json!({
+        "format": "workspace.diff-projection/1",
+        "selector": selector,
+        "mode": mode,
+        "source_revision": source_revision,
+        "files": files,
+        "additions": additions,
+        "deletions": deletions,
+        "partial": false
+    });
+    let digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&seal).expect("canonical diff serializes"),
+    ));
+    seal.as_object_mut()
+        .expect("static diff seal is an object")
+        .insert("digest".to_owned(), Value::String(digest));
+    serde_json::from_value(seal).expect("canonical diff contract is self-consistent")
+}
+
+fn canonical_file_diff(
+    path: &str,
+    old: Option<&CompleteWorkspaceFile>,
+    new: Option<&CompleteWorkspaceFile>,
+    mode: DiffMode,
+    attribution: &[String],
+) -> (DiffFile, u64, u64) {
+    let status = match (old, new) {
+        (None, Some(_)) => "added",
+        (Some(_), None) => "deleted",
+        (Some(_), Some(_)) => "modified",
+        (None, None) => unreachable!("union path exists on at least one side"),
+    };
+    let old_text = old.and_then(|file| std::str::from_utf8(&file.bytes).ok());
+    let new_text = new.and_then(|file| std::str::from_utf8(&file.bytes).ok());
+    let text_representable =
+        old.is_none_or(|_| old_text.is_some()) && new.is_none_or(|_| new_text.is_some());
+    let (additions, deletions, mut hunks) = if text_representable {
+        text_diff(
+            old_text.unwrap_or_default(),
+            new_text.unwrap_or_default(),
+            path,
+        )
+    } else {
+        (0, 0, Vec::new())
+    };
+    if mode != DiffMode::Patch {
+        hunks.clear();
+    }
+    let counts_visible = text_representable && mode != DiffMode::FilesOnly;
+    (
+        DiffFile {
+            old_path: old.map(|_| path.to_owned()),
+            new_path: new.map(|_| path.to_owned()),
+            status: status.to_owned(),
+            additions: counts_visible.then_some(additions),
+            deletions: counts_visible.then_some(deletions),
+            old_sha256: old.map(|file| file.sha256.clone()),
+            new_sha256: new.map(|file| file.sha256.clone()),
+            hunks,
+            attribution: attribution.to_vec(),
+        },
+        additions,
+        deletions,
+    )
+}
+
+fn text_diff(old: &str, new: &str, path: &str) -> (u64, u64, Vec<DiffHunk>) {
+    let diff = TextDiff::from_lines(old, new);
+    let mut additions = 0_u64;
+    let mut deletions = 0_u64;
+    let mut hunks = Vec::new();
+    for group in diff.grouped_ops(3) {
+        let first = group.first().expect("diff group is non-empty");
+        let last = group.last().expect("diff group is non-empty");
+        let old_start = first.old_range().start;
+        let old_end = last.old_range().end;
+        let new_start = first.new_range().start;
+        let new_end = last.new_range().end;
+        let mut lines = Vec::new();
+        for operation in group {
+            for change in diff.iter_changes(&operation) {
+                let kind = match change.tag() {
+                    ChangeTag::Equal => "context",
+                    ChangeTag::Delete => {
+                        deletions = deletions.saturating_add(1);
+                        "deletion"
+                    }
+                    ChangeTag::Insert => {
+                        additions = additions.saturating_add(1);
+                        "addition"
+                    }
+                };
+                lines.push(DiffLine {
+                    kind: kind.to_owned(),
+                    old_line: change.old_index().map(|line| line as u64 + 1),
+                    new_line: change.new_index().map(|line| line as u64 + 1),
+                    content: change
+                        .value()
+                        .strip_suffix('\n')
+                        .unwrap_or(change.value())
+                        .to_owned(),
+                });
+            }
+        }
+        let old_range = DiffRange {
+            start: old_start as u64 + 1,
+            lines: (old_end - old_start) as u64,
+        };
+        let new_range = DiffRange {
+            start: new_start as u64 + 1,
+            lines: (new_end - new_start) as u64,
+        };
+        let hunk_id = hex::encode(Sha256::digest(
+            serde_json::to_vec(&(path, &old_range, &new_range, &lines))
+                .expect("diff hunk serializes"),
+        ));
+        hunks.push(DiffHunk {
+            id: hunk_id,
+            old: old_range,
+            new: new_range,
+            heading: None,
+            lines,
+        });
+    }
+    (additions, deletions, hunks)
+}
+
 fn substrate_operation_id(session_id: &str, parts: &[&str]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"b10x/workspace/substrate-operation/v1");
@@ -2346,6 +2951,13 @@ fn valid_commit(value: &str) -> bool {
     (7..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn problem(status: StatusCode, code: &str) -> Response {
     confidential(
         (
@@ -2371,6 +2983,12 @@ fn store_problem(error: &StoreError) -> Response {
 
 fn substrate_problem(error: &SubstrateError) -> Response {
     match error {
+        SubstrateError::Refusal(refusal) if refusal.code == "resource.not-found" => {
+            problem(StatusCode::NOT_FOUND, "workspace_file_not_found")
+        }
+        SubstrateError::Refusal(refusal) if refusal.code == "workspace.stale-content" => {
+            problem(StatusCode::CONFLICT, "workspace_file_stale")
+        }
         SubstrateError::Refusal(refusal) => match refusal.class {
             SubstrateRefusalClass::Refused => {
                 problem(StatusCode::UNPROCESSABLE_ENTITY, "substrate_refused")
@@ -2422,9 +3040,11 @@ mod tests {
     use sha2::Digest as _;
 
     use super::{
-        MaterializedFile, install_crypto_provider, repository_candidate, source_manifest_sha256,
+        CompleteWorkspaceFile, MaterializedFile, canonical_diff, file_operation_id,
+        install_crypto_provider, language_for_path, repository_candidate, source_manifest_sha256,
         strict_repository_entry, valid_repository_path, validate_identity_transport,
     };
+    use workspace_core::{ChangeSelector, DiffMode, FileExpectedState, WriteFile};
 
     #[test]
     fn installs_the_process_crypto_provider_before_tls_clients_are_built() {
@@ -2514,5 +3134,79 @@ mod tests {
 
         assert_ne!(first, changed_mode);
         assert_ne!(first, changed_revision);
+    }
+
+    #[test]
+    fn canonical_diff_is_deterministic_structured_and_mode_specific() {
+        let file = |bytes: &[u8]| CompleteWorkspaceFile {
+            bytes: bytes.to_vec(),
+            sha256: hex::encode(sha2::Sha256::digest(bytes)),
+            size: bytes.len() as u64,
+        };
+        let base = std::collections::BTreeMap::from([
+            ("src/lib.rs".to_owned(), file(b"one\ntwo\n")),
+            ("old.txt".to_owned(), file(b"removed\n")),
+        ]);
+        let working = std::collections::BTreeMap::from([
+            ("src/lib.rs".to_owned(), file(b"one\nchanged\n")),
+            ("new.txt".to_owned(), file(b"added\n")),
+        ]);
+        let selector = ChangeSelector::Workspace;
+        let patch = canonical_diff(
+            &selector,
+            DiffMode::Patch,
+            &"a".repeat(40),
+            &base,
+            &working,
+            "person-a",
+        );
+        let repeated = canonical_diff(
+            &selector,
+            DiffMode::Patch,
+            &"a".repeat(40),
+            &base,
+            &working,
+            "person-a",
+        );
+        assert_eq!(patch, repeated);
+        assert_eq!(patch.files.len(), 3);
+        assert_eq!(patch.additions, 2);
+        assert_eq!(patch.deletions, 2);
+        assert!(patch.files.iter().any(|file| {
+            file.new_path.as_deref() == Some("src/lib.rs")
+                && file.hunks.iter().any(|hunk| {
+                    hunk.lines
+                        .iter()
+                        .any(|line| line.kind == "addition" && line.new_line == Some(2))
+                })
+        }));
+        let files_only = canonical_diff(
+            &selector,
+            DiffMode::FilesOnly,
+            &"a".repeat(40),
+            &base,
+            &working,
+            "person-a",
+        );
+        assert_ne!(patch.digest, files_only.digest);
+        assert!(files_only.files.iter().all(|file| {
+            file.additions.is_none() && file.deletions.is_none() && file.hunks.is_empty()
+        }));
+    }
+
+    #[test]
+    fn file_operations_are_sealed_to_expected_state_and_content() {
+        let input = WriteFile {
+            content: "hello".to_owned(),
+            expected: FileExpectedState::Absent,
+            create_parents: true,
+            operation_id: "save-one".to_owned(),
+        };
+        let first = file_operation_id("session", "src/lib.rs", &input);
+        let mut changed = input.clone();
+        changed.content = "goodbye".to_owned();
+        assert_ne!(first, file_operation_id("session", "src/lib.rs", &changed));
+        assert_eq!(language_for_path("src/lib.rs"), Some("rust"));
+        assert_eq!(language_for_path("Makefile"), None);
     }
 }

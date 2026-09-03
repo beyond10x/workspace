@@ -311,6 +311,171 @@ pub struct EngineeringArtifactPage {
     pub has_more: bool,
 }
 
+/// One entry in a bounded working-materialization tree.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodingTreeEntry {
+    pub path: String,
+    pub kind: String,
+    pub size: Option<u64>,
+    pub sha256: Option<String>,
+}
+
+/// Bounded searchable project tree with explicit partial-result state.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodingTreeProjection {
+    pub format: String,
+    pub entries: Vec<CodingTreeEntry>,
+    pub truncated: bool,
+    pub omitted: Option<u64>,
+}
+
+/// Relationship between a working file and the immutable session base.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileModificationState {
+    Unchanged,
+    Added,
+    Modified,
+}
+
+/// Complete file identity returned by Workspace, not by browser inference.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileRevision {
+    pub path: String,
+    pub sha256: String,
+    pub size: u64,
+    pub language: Option<String>,
+    pub modification: FileModificationState,
+}
+
+/// One complete editable UTF-8 file or an explicit binary refusal projection.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileProjection {
+    pub format: String,
+    pub revision: FileRevision,
+    pub content: Option<String>,
+    pub binary: bool,
+    pub truncated: bool,
+}
+
+/// Expected destination state for one exact reversible write.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FileExpectedState {
+    Absent,
+    Sha256 { sha256: String },
+}
+
+/// Exact content replacement used for both Save and create.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WriteFile {
+    pub content: String,
+    pub expected: FileExpectedState,
+    pub create_parents: bool,
+    pub operation_id: String,
+}
+
+/// Authoritative source selector for one canonical Workspace diff.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChangeSelector {
+    Workspace,
+    Plan { digest: String },
+    AgentAttempt { attempt_id: String },
+    Publication { publication_id: String },
+    RevisionPair { old: String, new: String },
+}
+
+/// Amount of canonical diff detail requested.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffMode {
+    Patch,
+    Stat,
+    FilesOnly,
+}
+
+/// Request to resolve an authoritative diff selector.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveDiff {
+    pub selector: ChangeSelector,
+    pub mode: DiffMode,
+}
+
+/// One old or new range in a canonical hunk.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DiffRange {
+    pub start: u64,
+    pub lines: u64,
+}
+
+/// One canonical text-diff line.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DiffLine {
+    pub kind: String,
+    pub old_line: Option<u64>,
+    pub new_line: Option<u64>,
+    pub content: String,
+}
+
+/// One stable canonical diff hunk.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DiffHunk {
+    pub id: String,
+    pub old: DiffRange,
+    pub new: DiffRange,
+    pub heading: Option<String>,
+    pub lines: Vec<DiffLine>,
+}
+
+/// One changed file in the canonical projection.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DiffFile {
+    pub old_path: Option<String>,
+    pub new_path: Option<String>,
+    pub status: String,
+    pub additions: Option<u64>,
+    pub deletions: Option<u64>,
+    pub old_sha256: Option<String>,
+    pub new_sha256: Option<String>,
+    pub hunks: Vec<DiffHunk>,
+    pub attribution: Vec<String>,
+}
+
+/// Canonical server-resolved diff consumed unchanged by every renderer and approval link.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DiffProjection {
+    pub format: String,
+    pub selector: ChangeSelector,
+    pub mode: DiffMode,
+    pub digest: String,
+    pub source_revision: String,
+    pub files: Vec<DiffFile>,
+    pub additions: u64,
+    pub deletions: u64,
+    pub partial: bool,
+}
+
+/// Conflict payload used by an editor to render base, local draft, and latest content.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileConflict {
+    pub code: String,
+    pub base: Option<FileProjection>,
+    pub latest: FileProjection,
+}
+
 /// Safe HTTP problem document.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

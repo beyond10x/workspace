@@ -8,6 +8,9 @@
   or marks uncertain cleanup without exposing partial references.
 - Pin the governed GitLab publication Connector and the Substrate executable-mode preservation
   change by exact commit.
+- Add bounded searchable coding-session trees, complete file projections, exact digest-based
+  Save/create with structured conflicts, and one canonical server-side diff resolver shared by
+  Devcenter and AgentIDE clients.
 
 ## 0.1.5 - 2026-09-02
 

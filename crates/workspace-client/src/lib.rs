@@ -6,9 +6,10 @@ use reqwest::{Method, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use url::Url;
 use workspace_core::{
-    Branch, CodingSession, CreateCodingSession, CreateMessage, CreateThread,
-    EngineeringArtifactPage, Message, OpenProject, Project, RepositoryCandidate, RepositoryEntry,
-    SelectBranch, StartWorkflow, Thread, WorkflowDefinition, WorkflowRun,
+    Branch, CodingSession, CodingTreeProjection, CreateCodingSession, CreateMessage, CreateThread,
+    DiffProjection, EngineeringArtifactPage, FileConflict, FileProjection, Message, OpenProject,
+    Project, RepositoryCandidate, RepositoryEntry, ResolveDiff, SelectBranch, StartWorkflow,
+    Thread, WorkflowDefinition, WorkflowRun, WriteFile,
 };
 
 /// Workspace transport failure without response or credential bodies.
@@ -23,6 +24,9 @@ pub enum ClientError {
     /// Workspace refused the operation with the returned HTTP status.
     #[error("Workspace refused the operation with status {0}")]
     Refused(u16),
+    /// An exact file write raced newer Workspace content.
+    #[error("Workspace file content changed after it was loaded")]
+    FileConflict(Box<FileConflict>),
 }
 
 /// Exact-origin Workspace HTTP client.
@@ -214,6 +218,98 @@ impl WorkspaceClient {
         .await
     }
 
+    /// Search and list a bounded working-materialization tree with explicit truncation state.
+    pub async fn coding_tree(
+        &self,
+        authorization: &str,
+        session_id: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<CodingTreeProjection, ClientError> {
+        let suffix = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("query", query)
+            .append_pair("limit", &limit.to_string())
+            .finish();
+        self.exchange(
+            Method::GET,
+            &format!("v1/sessions/{session_id}/tree?{suffix}"),
+            authorization,
+            Option::<&()>::None,
+        )
+        .await
+    }
+
+    /// Read one complete working file with its base-relative modification state.
+    pub async fn coding_file(
+        &self,
+        authorization: &str,
+        session_id: &str,
+        path: &str,
+    ) -> Result<FileProjection, ClientError> {
+        self.exchange(
+            Method::GET,
+            &format!(
+                "v1/sessions/{session_id}/files/{}",
+                encode_workspace_path(path)
+            ),
+            authorization,
+            Option::<&()>::None,
+        )
+        .await
+    }
+
+    /// Save or create one UTF-8 file using exact expected state.
+    pub async fn write_coding_file(
+        &self,
+        authorization: &str,
+        session_id: &str,
+        path: &str,
+        input: &WriteFile,
+    ) -> Result<FileProjection, ClientError> {
+        let endpoint = self
+            .base
+            .join(&format!(
+                "v1/sessions/{session_id}/files/{}",
+                encode_workspace_path(path)
+            ))
+            .map_err(|_| ClientError::Configuration)?;
+        let response = self
+            .http
+            .put(endpoint)
+            .header("authorization", authorization)
+            .json(input)
+            .send()
+            .await
+            .map_err(|_| ClientError::Transport)?;
+        if response.status() == StatusCode::CONFLICT {
+            let conflict = response
+                .json::<FileConflict>()
+                .await
+                .map_err(|_| ClientError::Transport)?;
+            return Err(ClientError::FileConflict(Box::new(conflict)));
+        }
+        if !response.status().is_success() {
+            return Err(ClientError::Refused(response.status().as_u16()));
+        }
+        response.json().await.map_err(|_| ClientError::Transport)
+    }
+
+    /// Resolve one canonical server-side diff projection.
+    pub async fn resolve_diff(
+        &self,
+        authorization: &str,
+        session_id: &str,
+        input: &ResolveDiff,
+    ) -> Result<DiffProjection, ClientError> {
+        self.exchange(
+            Method::POST,
+            &format!("v1/sessions/{session_id}/diff"),
+            authorization,
+            Some(input),
+        )
+        .await
+    }
+
     /// List the authenticated subject's personal threads.
     pub async fn threads(
         &self,
@@ -349,4 +445,13 @@ impl WorkspaceClient {
         }
         response.json().await.map_err(|_| ClientError::Transport)
     }
+}
+
+fn encode_workspace_path(path: &str) -> String {
+    path.split('/')
+        .map(|component| {
+            url::form_urlencoded::byte_serialize(component.as_bytes()).collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
