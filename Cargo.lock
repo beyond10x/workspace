@@ -4,8 +4,8 @@ version = 4
 
 [[package]]
 name = "aep-client"
-version = "0.40.3"
-source = "git+https://github.com/beyond10x/aep?tag=0.40.3#52ca1ec48da9c744e2e551eab64f7cbad6ab7c3c"
+version = "0.45.0"
+source = "git+https://github.com/beyond10x/aep?tag=0.45.0#9de3c9995c551782cc9c34155580b54a272040e2"
 dependencies = [
  "aep-contract",
  "aep-domain",
@@ -17,8 +17,8 @@ dependencies = [
 
 [[package]]
 name = "aep-contract"
-version = "0.40.3"
-source = "git+https://github.com/beyond10x/aep?tag=0.40.3#52ca1ec48da9c744e2e551eab64f7cbad6ab7c3c"
+version = "0.45.0"
+source = "git+https://github.com/beyond10x/aep?tag=0.45.0#9de3c9995c551782cc9c34155580b54a272040e2"
 dependencies = [
  "aep-domain",
  "schemars 0.8.22",
@@ -28,8 +28,8 @@ dependencies = [
 
 [[package]]
 name = "aep-domain"
-version = "0.40.3"
-source = "git+https://github.com/beyond10x/aep?tag=0.40.3#52ca1ec48da9c744e2e551eab64f7cbad6ab7c3c"
+version = "0.45.0"
+source = "git+https://github.com/beyond10x/aep?tag=0.45.0#9de3c9995c551782cc9c34155580b54a272040e2"
 dependencies = [
  "proptest",
  "schemars 0.8.22",
@@ -51,8 +51,8 @@ dependencies = [
 
 [[package]]
 name = "agent-platform-client"
-version = "0.6.3"
-source = "git+https://github.com/beyond10x/agent-platform.git?rev=782b553ba04e4c410c5033abb1a713b05dc148de#782b553ba04e4c410c5033abb1a713b05dc148de"
+version = "0.6.6"
+source = "git+https://github.com/beyond10x/agent-platform.git?tag=0.6.6#fa5b697f0931f26cd8dd3968a62e02927307bab9"
 dependencies = [
  "agent-platform-core",
  "reqwest 0.13.4",
@@ -64,10 +64,10 @@ dependencies = [
 
 [[package]]
 name = "agent-platform-core"
-version = "0.6.3"
-source = "git+https://github.com/beyond10x/agent-platform.git?rev=782b553ba04e4c410c5033abb1a713b05dc148de#782b553ba04e4c410c5033abb1a713b05dc148de"
+version = "0.6.6"
+source = "git+https://github.com/beyond10x/agent-platform.git?tag=0.6.6#fa5b697f0931f26cd8dd3968a62e02927307bab9"
 dependencies = [
- "agentide-contracts 0.1.1",
+ "agentide-contracts 0.2.1 (git+https://github.com/beyond10x/agentide.git?rev=c25e73330fc130895d8f1538c9746858a265186b)",
  "schemars 0.8.22",
  "serde",
  "serde_json",
@@ -76,10 +76,11 @@ dependencies = [
 
 [[package]]
 name = "agentide-contracts"
-version = "0.1.1"
-source = "git+https://github.com/beyond10x/agentide.git?rev=ed6250bb1f1a3ff56f3c5a6acffe11cbd4f07e20#ed6250bb1f1a3ff56f3c5a6acffe11cbd4f07e20"
+version = "0.2.1"
+source = "git+https://github.com/beyond10x/agentide.git?tag=0.2.1#c25e73330fc130895d8f1538c9746858a265186b"
 dependencies = [
  "chrono",
+ "schemars 1.2.2",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -425,7 +426,7 @@ dependencies = [
 [[package]]
 name = "b10x-substrate-sdk"
 version = "0.5.0"
-source = "git+https://github.com/beyond10x/substrate.git?rev=8d377f0ac0cd290df2c739fd6b0aee9db8936a8c#8d377f0ac0cd290df2c739fd6b0aee9db8936a8c"
+source = "git+https://github.com/beyond10x/substrate.git?tag=0.5.0#fcb48e5b503be32ce4749e7d8ac7a15331637354"
 dependencies = [
  "b10x-substrate-wire",
  "base64 0.23.1",
@@ -452,7 +453,7 @@ dependencies = [
 [[package]]
 name = "b10x-substrate-wire"
 version = "0.5.0"
-source = "git+https://github.com/beyond10x/substrate.git?rev=8d377f0ac0cd290df2c739fd6b0aee9db8936a8c#8d377f0ac0cd290df2c739fd6b0aee9db8936a8c"
+source = "git+https://github.com/beyond10x/substrate.git?tag=0.5.0#fcb48e5b503be32ce4749e7d8ac7a15331637354"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -699,20 +700,20 @@ dependencies = [
 
 [[package]]
 name = "connector-state"
-version = "0.5.0"
-source = "git+https://github.com/beyond10x/connectors.git?rev=ea335281ef8029ca4cb375768d98db3dc3135feb#ea335281ef8029ca4cb375768d98db3dc3135feb"
+version = "0.5.4"
+source = "git+https://github.com/beyond10x/connectors.git?tag=v0.5.4#c586247819a4d4f517afdff83c2b88a3716b89e3"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "connectors-client"
-version = "0.5.0"
-source = "git+https://github.com/beyond10x/connectors.git?rev=ea335281ef8029ca4cb375768d98db3dc3135feb#ea335281ef8029ca4cb375768d98db3dc3135feb"
+version = "0.5.4"
+source = "git+https://github.com/beyond10x/connectors.git?tag=v0.5.4#c586247819a4d4f517afdff83c2b88a3716b89e3"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
- "identity-client 0.4.0 (git+https://github.com/beyond10x/identity?rev=bb3fdab4f5cfd64774a9df121d438e488431bbb8)",
+ "identity-client",
  "keyring",
  "protocol",
  "reqwest 0.12.28",
@@ -917,8 +918,8 @@ dependencies = [
 
 [[package]]
 name = "domain"
-version = "0.5.0"
-source = "git+https://github.com/beyond10x/connectors.git?rev=ea335281ef8029ca4cb375768d98db3dc3135feb#ea335281ef8029ca4cb375768d98db3dc3135feb"
+version = "0.5.4"
+source = "git+https://github.com/beyond10x/connectors.git?tag=v0.5.4#c586247819a4d4f517afdff83c2b88a3716b89e3"
 dependencies = [
  "async-trait",
  "connector-state",
@@ -1559,20 +1560,8 @@ dependencies = [
 
 [[package]]
 name = "identity-client"
-version = "0.4.0"
-source = "git+https://github.com/beyond10x/identity.git?tag=0.4.0#bb3fdab4f5cfd64774a9df121d438e488431bbb8"
-dependencies = [
- "reqwest 0.12.28",
- "serde",
- "thiserror",
- "url",
- "zeroize",
-]
-
-[[package]]
-name = "identity-client"
-version = "0.4.0"
-source = "git+https://github.com/beyond10x/identity?rev=bb3fdab4f5cfd64774a9df121d438e488431bbb8#bb3fdab4f5cfd64774a9df121d438e488431bbb8"
+version = "0.5.6"
+source = "git+https://github.com/beyond10x/identity.git?tag=0.5.6#e3231bc34eb65695ba0486e1bbe3a0f1ec5b2a23"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
@@ -2146,8 +2135,8 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.5.0"
-source = "git+https://github.com/beyond10x/connectors.git?rev=ea335281ef8029ca4cb375768d98db3dc3135feb#ea335281ef8029ca4cb375768d98db3dc3135feb"
+version = "0.5.4"
+source = "git+https://github.com/beyond10x/connectors.git?tag=v0.5.4#c586247819a4d4f517afdff83c2b88a3716b89e3"
 dependencies = [
  "domain",
  "schemars 1.2.2",
@@ -4076,9 +4065,9 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workspace-client"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
- "agentide-contracts 0.2.1",
+ "agentide-contracts 0.2.1 (git+https://github.com/beyond10x/agentide.git?tag=0.2.1)",
  "reqwest 0.13.4",
  "serde",
  "thiserror",
@@ -4088,7 +4077,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-core"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "serde",
  "serde_json",
@@ -4096,13 +4085,13 @@ dependencies = [
 
 [[package]]
 name = "workspace-service"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "aep-client",
  "aep-contract",
  "agent-platform-client",
  "agent-platform-core",
- "agentide-contracts 0.2.1",
+ "agentide-contracts 0.2.1 (git+https://github.com/beyond10x/agentide.git?tag=0.2.1)",
  "anyhow",
  "axum",
  "b10x-substrate-sdk",
@@ -4113,7 +4102,7 @@ dependencies = [
  "connectors-client",
  "getrandom 0.3.4",
  "hex",
- "identity-client 0.4.0 (git+https://github.com/beyond10x/identity.git?tag=0.4.0)",
+ "identity-client",
  "reqwest 0.13.4",
  "rustls",
  "serde",

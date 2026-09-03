@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.2.11 - 2026-09-03
+
+- Align every first-party client with the current released Identity, Connectors, Agent Platform,
+  AgentIDE, AEP, and Substrate contracts while retaining the exact working-materialization binding.
+
 ## 0.2.10 - 2026-09-03
 
 - Bind hosted AgentIDE sessions and terminal grants to Workspace's exact working materialization
