@@ -99,7 +99,7 @@ cannot serve Substrate's `sessions.pty` capability.
 Build `substrate-daemon` from the exact Substrate revision pinned by this repository, place the lab
 inside a delegated cgroup carrying `cpu`, `memory`, and `pids`, and run:
 
-```console
+```bash
 cargo run --locked -p workspace-service --bin workspace-terminal-lab -- \
   --substrate-daemon "$SUBSTRATE_DAEMON" \
   --cgroup-root "$SUBSTRATE_DELEGATED_CGROUP"
