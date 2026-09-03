@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.2.13 - 2026-09-03
+
+- Align Workspace's hosted coding boundary with AgentIDE 0.3.1 and Agent Platform 0.6.7 so
+  downstream clients resolve one current contract graph without compatibility adapters.
+
 ## 0.2.12 - 2026-09-03
 
 - Consume Connectors 0.5.6's canonical Identity source so Workspace resolves exactly one Identity
