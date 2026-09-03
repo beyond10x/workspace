@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Associate each admitted project-chat turn with its exact Agent Platform task and expose an
+  owner-scoped SSE relay of ordered execution events for live clients without disclosing the
+  upstream task identity or bearer.
+
 ## 0.2.5 - 2026-09-03
 
 - Align the repository toolchain and release image with the declared Rust 1.98 minimum so the

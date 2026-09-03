@@ -22,6 +22,7 @@ use agentide_contracts::{
 };
 use anyhow::{Context, Result, bail};
 use axum::Router;
+use axum::body::Body;
 use axum::extract::ws::{Message as WebSocketMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -344,6 +345,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/v1/threads/{thread_id}/messages",
             get(messages).post(create_message),
+        )
+        .route(
+            "/v1/threads/{thread_id}/messages/{message_sequence}/events",
+            get(message_events),
         )
         .route("/v1/projects/{project_id}/workflows", get(workflows))
         .route(
@@ -3292,15 +3297,24 @@ async fn create_message(
         .submit_task(agent_platform_bearer, &task)
         .await
     {
-        Ok(task) => spawn_task_completion(
-            state.store.clone(),
-            agent_platform.clone(),
-            agent_platform_bearer.to_owned(),
-            authority.tenant_id,
-            authority.subject,
-            thread.id,
-            task.id,
-        ),
+        Ok(task) => {
+            if let Err(error) = state
+                .store
+                .record_message_task(&authority, &thread.id, message.sequence, task.id.as_str())
+                .await
+            {
+                return store_problem(&error);
+            }
+            spawn_task_completion(
+                state.store.clone(),
+                agent_platform.clone(),
+                agent_platform_bearer.to_owned(),
+                authority.tenant_id,
+                authority.subject,
+                thread.id,
+                task.id,
+            );
+        }
         Err(_) => {
             let _ = state
                 .store
@@ -3315,6 +3329,56 @@ async fn create_message(
         }
     }
     confidential(Json(message).into_response())
+}
+
+async fn message_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((thread_id, message_sequence)): Path<(String, u64)>,
+) -> Response {
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    let Some(agent_platform) = state.agent_platform.as_ref() else {
+        return problem(StatusCode::SERVICE_UNAVAILABLE, "project_agent_unavailable");
+    };
+    let Some(agent_platform_bearer) = authority.agent_platform_bearer.as_deref() else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "project_agent_authority_unavailable",
+        );
+    };
+    let task_id = match state
+        .store
+        .message_task(&authority, &thread_id, message_sequence)
+        .await
+    {
+        Ok(task_id) => task_id,
+        Err(error) => return store_problem(&error),
+    };
+    let Ok(task_id) = TaskId::new(task_id) else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "project_agent_task_invalid",
+        );
+    };
+    let Ok(upstream) = agent_platform
+        .task_events(agent_platform_bearer, &task_id)
+        .await
+    else {
+        return problem(StatusCode::BAD_GATEWAY, "project_agent_stream_unavailable");
+    };
+    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/event-stream"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    confidential(response)
 }
 
 async fn workflows(
