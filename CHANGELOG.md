@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.2.2 - 2026-09-03
+
+- Request Substrate scopes in Identity's canonical lexical order so the access-token client
+  accepts the successfully minted authority before opening the hosted TLS connection.
+
 ## 0.2.1 - 2026-09-03
 
 - Request only Substrate's admitted `observe`, `workspaces`, and `exec` scopes. Session routes are

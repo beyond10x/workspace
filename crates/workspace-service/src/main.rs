@@ -55,8 +55,10 @@ use store::{SessionReservation, Store, StoreError};
 const CONNECTORS_AUDIENCE: &str = "urn:b10x:connectors";
 const CONNECTORS_SCOPE: &str = "connectors.catalog.read connectors.invoke";
 const SUBSTRATE_AUDIENCE: &str = "urn:b10x:substrate";
+// Identity canonicalizes admitted scopes lexically. Keep this exact order because the client
+// rejects a minted authority whose returned scope string differs from the requested scope.
 // Substrate's session routes are governed by `exec`; `session` is not a Substrate scope.
-const SUBSTRATE_SCOPE: &str = "observe workspaces exec";
+const SUBSTRATE_SCOPE: &str = "exec observe workspaces";
 const SOURCE_MATERIALIZATION_LIMITS: MaterializationLimits = MaterializationLimits {
     max_files: b10x_substrate_sdk::MAX_LIST_ITEMS,
     max_total_bytes: 256 * 1024 * 1024,
@@ -3092,8 +3094,12 @@ mod tests {
     }
 
     #[test]
-    fn substrate_authority_uses_only_runtime_admitted_scopes() {
-        assert_eq!(SUBSTRATE_SCOPE, "observe workspaces exec");
+    fn substrate_authority_uses_identity_canonical_runtime_scopes() {
+        assert_eq!(SUBSTRATE_SCOPE, "exec observe workspaces");
+        let mut scopes = SUBSTRATE_SCOPE.split_ascii_whitespace().collect::<Vec<_>>();
+        let admitted = scopes.clone();
+        scopes.sort_unstable();
+        assert_eq!(admitted, scopes);
         assert!(
             !SUBSTRATE_SCOPE
                 .split_ascii_whitespace()
