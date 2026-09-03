@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.2.5 - 2026-09-03
+
+- Align the repository toolchain and release image with the declared Rust 1.98 minimum so the
+  promoted Workspace runtime is built by the same compiler that passes the source gate.
+- Gate the declared minimum, repository toolchain, and release-image Rust versions as one release
+  invariant so a source gate cannot pass an image that is guaranteed to fail.
+
 ## 0.2.4 - 2026-09-03
 
 - Derive AgentIDE agent views and intent authorization from a verified Agent Platform task, the
