@@ -422,6 +422,17 @@ struct VerifiedCodingTurn {
     active_diff: Option<AgentIdeChangeSelector>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CodingSessionTurnContext {
+    workspace_session_id: String,
+    agentide_session_id: String,
+    #[serde(default)]
+    focused_selections: Vec<ContextSelection>,
+    #[serde(default)]
+    open_files: Vec<OpenFileReference>,
+    active_diff: Option<AgentIdeChangeSelector>,
+}
+
 async fn agentide_service_rows(
     state: &AppState,
     authority: &Authority,
@@ -558,22 +569,24 @@ async fn verified_coding_turn(
             "coding_task_binding_refused",
         ));
     }
-    let input: ConversationInput = serde_json::from_value(task.input.clone())
+    if task.input.get("kind").and_then(Value::as_str) != Some("coding_session_turn") {
+        return Err(problem(
+            StatusCode::FORBIDDEN,
+            "coding_task_binding_refused",
+        ));
+    }
+    // Normalize deliberate prompt attachments into Workspace's released AgentIDE contract at the
+    // network boundary. Agent Platform remains the task authority, while Workspace remains the
+    // context authority; neither crate's source revision becomes the other's runtime type identity.
+    let input: CodingSessionTurnContext = serde_json::from_value(task.input.clone())
         .map_err(|_| problem(StatusCode::FORBIDDEN, "coding_task_binding_refused"))?;
-    let ConversationInput::CodingSessionTurn {
+    let CodingSessionTurnContext {
         workspace_session_id,
         agentide_session_id: task_agentide_session_id,
         focused_selections,
         open_files,
         active_diff,
-        ..
-    } = input
-    else {
-        return Err(problem(
-            StatusCode::FORBIDDEN,
-            "coding_task_binding_refused",
-        ));
-    };
+    } = input;
     if workspace_session_id != session.id || task_agentide_session_id != agentide_session_id {
         return Err(problem(
             StatusCode::FORBIDDEN,
