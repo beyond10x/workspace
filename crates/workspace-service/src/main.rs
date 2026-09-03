@@ -62,11 +62,10 @@ use workspace_core::{
 
 mod aep;
 mod store;
-mod terminal;
 
 use aep::{AepTransport, RequestCredential};
 use store::{SessionReservation, Store, StoreError, StoredTerminal, TerminalReservation};
-use terminal::{
+use workspace_service::terminal::{
     TerminalBroker, TerminalBrokerCommand, TerminalBrokerEvent, TerminalBrokers, TerminalProfiles,
     TerminalReplayHub,
 };
@@ -2692,25 +2691,25 @@ async fn terminal_websocket(
                     }
                     WebSocketMessage::Text(text) => {
                         let control = serde_json::from_str::<TerminalControl>(&text);
-                        let result = match control {
+                        let accepted = match control {
                             Ok(TerminalControl::Resize { columns, rows }) => {
                                 let window = PtyWindow { columns, rows };
                                 if window.within_bounds() {
-                                    broker.command(TerminalBrokerCommand::Resize { columns, rows }).await
+                                    broker.command(TerminalBrokerCommand::Resize { columns, rows }).await.is_ok()
                                 } else {
-                                    Err(())
+                                    false
                                 }
                             }
                             Ok(TerminalControl::Signal { signal, grace_ms }) if grace_ms <= 30_000 => {
                                 if matches!(signal.as_str(), "INT" | "TERM" | "KILL") {
-                                    broker.command(TerminalBrokerCommand::Signal { signal, grace_ms }).await
+                                    broker.command(TerminalBrokerCommand::Signal { signal, grace_ms }).await.is_ok()
                                 } else {
-                                    Err(())
+                                    false
                                 }
                             }
-                            _ => Err(()),
+                            _ => false,
                         };
-                        if result.is_err() {
+                        if !accepted {
                             let _ = send_terminal_json(&mut socket, serde_json::json!({
                                 "kind": "refused",
                                 "code": "terminal_control_refused"

@@ -1,7 +1,7 @@
 //! Deployment-declared terminal profiles and bounded in-memory replay.
 //!
-//! Durable lifecycle metadata lives in [`crate::store`]. Raw PTY output is deliberately confined
-//! to this bounded process-local ring and disappears on service restart.
+//! Durable lifecycle metadata lives in the Workspace store. Raw PTY output is deliberately
+//! confined to this bounded process-local ring and disappears on service restart.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
@@ -151,8 +151,14 @@ impl TerminalBroker {
         (Self { commands, events }, receiver)
     }
 
-    pub async fn command(&self, command: TerminalBrokerCommand) -> Result<(), ()> {
-        self.commands.send(command).await.map_err(|_| ())
+    pub async fn command(
+        &self,
+        command: TerminalBrokerCommand,
+    ) -> Result<(), TerminalBrokerClosed> {
+        self.commands
+            .send(command)
+            .await
+            .map_err(|_| TerminalBrokerClosed)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<TerminalBrokerEvent> {
@@ -163,6 +169,10 @@ impl TerminalBroker {
         let _ = self.events.send(event);
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("terminal broker is no longer available")]
+pub struct TerminalBrokerClosed;
 
 #[derive(Clone)]
 pub enum TerminalBrokerCommand {

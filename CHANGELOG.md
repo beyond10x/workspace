@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add a loopback-only terminal lab that combines the production Workspace replay/broker code with
+  a real, externally built Substrate daemon for isolated Ghostty integration testing.
+
 ## 0.2.6 - 2026-09-03
 
 - Associate each admitted project-chat turn with its exact Agent Platform task and expose an

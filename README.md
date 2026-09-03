@@ -86,6 +86,31 @@ The PTY is always created through the configured remote Substrate client against
 session's existing working materialization. It is never a Workspace, Devcenter, or host shell;
 terminal profiles cannot enable ambient credentials or undeclared network access.
 
+### Isolated terminal lab
+
+`workspace-terminal-lab` is a loopback-only development binary for testing Devcenter's Ghostty
+renderer against the production Workspace replay/broker primitives and a real Substrate daemon,
+without bringing up Identity, Connectors, AgentIDE, or a forge. The lab creates an ephemeral
+Substrate workspace containing a small `README.md` and `Cargo.toml`, starts `/bin/sh` in a
+probe-verified confined PTY with no network, and serves only a health route and the terminal
+WebSocket used by Devcenter review mode. It refuses non-loopback listeners and an environment that
+cannot serve Substrate's `sessions.pty` capability.
+
+Build `substrate-daemon` from the exact Substrate revision pinned by this repository, place the lab
+inside a delegated cgroup carrying `cpu`, `memory`, and `pids`, and run:
+
+```console
+cargo run --locked -p workspace-service --bin workspace-terminal-lab -- \
+  --substrate-daemon "$SUBSTRATE_DAEMON" \
+  --cgroup-root "$SUBSTRATE_DELEGATED_CGROUP"
+```
+
+Then start Devcenter review mode with
+`DEVCENTER_REVIEW_TERMINAL_UPSTREAM=ws://127.0.0.1:8095`. The rest of the project workbench remains
+sample review data; only the terminal transport is real. The production Workspace service never
+enables this path and still requires authenticated session binding and an exact
+`interactive_terminal` grant.
+
 ## First contract
 
 - discover all GitLab projects visible through the subject's current Connections;
