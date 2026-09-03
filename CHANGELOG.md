@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.2.3 - 2026-09-03
+
+- Pass nested repository paths to the GitLab Connector as canonical raw paths so exact source
+  materialization no longer fails on every file below the repository root.
 - Add deployment-declared interactive terminal profiles over the existing Substrate working
   materialization. Workspace verifies the authenticated human's exact AgentIDE
   `interactive_terminal` grant through generated Service SDK projections, persists lifecycle but
