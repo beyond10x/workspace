@@ -513,7 +513,7 @@ fn agentide_session_row(
     if matching.next().is_some()
         || row.state != "Active"
         || row.owner != authority.subject
-        || row.workspace_root != format!("workspace-session/{}", session.id)
+        || Some(row.workspace_root.as_str()) != session.working_materialization_ref.as_deref()
         || row.workspace_session_id.as_deref() != Some(session.id.as_str())
         || row.project_id.as_deref() != Some(session.project_id.as_str())
         || row.source_revision.as_deref() != Some(session.source_revision.as_str())
@@ -2954,7 +2954,7 @@ fn terminal_session_row_matches(
 ) -> bool {
     row.get("session_id").and_then(Value::as_str) == Some(agentide_session_id)
         && row.get("workspace_root").and_then(Value::as_str)
-            == Some(format!("workspace-session/{}", coding_session.id).as_str())
+            == coding_session.working_materialization_ref.as_deref()
         && row.get("workspace_session_id").and_then(Value::as_str)
             == Some(coding_session.id.as_str())
         && row.get("project_id").and_then(Value::as_str) == Some(coding_session.project_id.as_str())
@@ -5764,7 +5764,7 @@ mod tests {
         };
         let session_row = serde_json::json!({
             "session_id": "agentide-session-one",
-            "workspace_root": "workspace-session/workspace-session-one",
+            "workspace_root": "working-one",
             "workspace_session_id": "workspace-session-one",
             "project_id": "project-one",
             "source_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -5863,7 +5863,7 @@ mod tests {
         };
         let session_record = serde_json::json!({
             "session_id": "agentide-session-one",
-            "workspace_root": "workspace-session/workspace-session-one",
+            "workspace_root": "working-one",
             "objective": "Fix the bounded issue",
             "workspace_session_id": "workspace-session-one",
             "project_id": "project-one",
@@ -5885,7 +5885,7 @@ mod tests {
             "Fix the bounded issue"
         );
         let mut spoofed = session_record;
-        spoofed["workspace_session_id"] = serde_json::json!("workspace-session-other");
+        spoofed["workspace_root"] = serde_json::json!("working-other");
         assert!(
             agentide_session_row(vec![spoofed], &authority, &session, "agentide-session-one")
                 .is_err()
