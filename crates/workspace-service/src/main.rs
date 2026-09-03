@@ -47,7 +47,7 @@ use workspace_core::{
     FileProjection, FileRevision, MaterializationLimits, MessageRole, OpenProject, Problem,
     Project, RepositoryCandidate, RepositoryEntry, RepositoryEntryKind, ResolveDiff, SelectBranch,
     StartWorkflow, TerminalExit, TerminalProfile, TerminalSession, TerminalState,
-    TerminalWorkspaceAccess, WorkflowDefinition, WriteFile,
+    TerminalWorkspaceAccess, WorkflowDefinition, WorkflowRunState, WriteFile,
 };
 
 mod aep;
@@ -323,7 +323,7 @@ fn router(state: AppState) -> Router {
         )
         .route(
             "/v1/projects/{project_id}/workflow-runs",
-            post(start_workflow),
+            get(workflow_runs).post(start_workflow),
         )
         .with_state(state)
 }
@@ -2211,6 +2211,7 @@ async fn engineering_artifacts(
     )
 }
 
+#[allow(clippy::too_many_lines)] // Validation, context binding, dispatch and durable admission stay visibly ordered.
 async fn start_workflow(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2230,6 +2231,18 @@ async fn start_workflow(
         Ok(authority) => authority,
         Err(response) => return response,
     };
+    let Some(agent_platform) = state.agent_platform.as_ref() else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workflow_executor_unavailable",
+        );
+    };
+    let Some(agent_platform_bearer) = authority.agent_platform_bearer.as_deref() else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workflow_authority_unavailable",
+        );
+    };
     let project = match accessible_project(&state, &authority, &project_id).await {
         Ok(project) => project,
         Err(response) => return response,
@@ -2239,12 +2252,103 @@ async fn start_workflow(
     {
         return problem(StatusCode::CONFLICT, "project_snapshot_stale");
     }
-    match state
+    let context = match project_context(&state, &authority, &project).await {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    let agent_id = match ensure_project_agent(
+        &state,
+        agent_platform,
+        agent_platform_bearer,
+        &authority,
+        &project,
+    )
+    .await
+    {
+        Ok(agent_id) => agent_id,
+        Err(response) => return response,
+    };
+    let run = match state
         .store
         .start_workflow(&authority, &project_id, &input)
         .await
     {
-        Ok(run) => confidential(Json(run).into_response()),
+        Ok(run) => run,
+        Err(error) => return store_problem(&error),
+    };
+    if matches!(
+        run.state,
+        WorkflowRunState::Succeeded | WorkflowRunState::Failed | WorkflowRunState::Refused
+    ) {
+        return confidential(Json(run).into_response());
+    }
+    let task = SubmitTask {
+        agent_id,
+        idempotency_key: format!("workspace-workflow:{}", run.id),
+        input: match serde_json::to_value(ConversationInput::ProjectConversation {
+            prompt: workflow_prompt(&input.definition_id).to_owned(),
+            messages: Vec::new(),
+            context,
+        }) {
+            Ok(input) => input,
+            Err(_) => {
+                return problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "workflow_context_unavailable",
+                );
+            }
+        },
+    };
+    let Ok(task) = agent_platform
+        .submit_task(agent_platform_bearer, &task)
+        .await
+    else {
+        let _ = state
+            .store
+            .update_workflow_run(
+                &authority.tenant_id,
+                &authority.subject,
+                &run.id,
+                WorkflowRunState::Failed,
+                Some("workflow_dispatch_refused"),
+                None,
+            )
+            .await;
+        return problem(StatusCode::BAD_GATEWAY, "workflow_dispatch_refused");
+    };
+    if let Err(error) = state
+        .store
+        .record_workflow_task(&authority, &run.id, task.id.as_str())
+        .await
+    {
+        return store_problem(&error);
+    }
+    spawn_workflow_completion(
+        state.store.clone(),
+        agent_platform.clone(),
+        agent_platform_bearer.to_owned(),
+        authority.tenant_id,
+        authority.subject,
+        run.id.clone(),
+        task.id,
+    );
+    confidential(Json(run).into_response())
+}
+
+async fn workflow_runs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Response {
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    if let Err(response) = accessible_project(&state, &authority, &project_id).await {
+        return response;
+    }
+    match state.store.workflow_runs(&authority, &project_id).await {
+        Ok(runs) => confidential(Json(runs).into_response()),
         Err(error) => store_problem(&error),
     }
 }
@@ -3975,6 +4079,119 @@ fn spawn_task_completion(
             )
             .await;
     });
+}
+
+fn spawn_workflow_completion(
+    store: Store,
+    client: AgentPlatformClient,
+    bearer: String,
+    tenant_id: String,
+    subject: String,
+    run_id: String,
+    task_id: agent_platform_core::TaskId,
+) {
+    tokio::spawn(async move {
+        for _ in 0..300 {
+            let Ok(task) = client.get_task(&bearer, &task_id).await else {
+                let _ = store
+                    .update_workflow_run(
+                        &tenant_id,
+                        &subject,
+                        &run_id,
+                        WorkflowRunState::Failed,
+                        Some("workflow_observation_refused"),
+                        None,
+                    )
+                    .await;
+                return;
+            };
+            match task.status {
+                TaskStatus::Succeeded => {
+                    let output = task.output.unwrap_or_else(|| {
+                        "The workflow completed without a Markdown result.".to_owned()
+                    });
+                    let _ = store
+                        .update_workflow_run(
+                            &tenant_id,
+                            &subject,
+                            &run_id,
+                            WorkflowRunState::Succeeded,
+                            None,
+                            Some(&output),
+                        )
+                        .await;
+                    return;
+                }
+                TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::OutcomeUnknown => {
+                    let _ = store
+                        .update_workflow_run(
+                            &tenant_id,
+                            &subject,
+                            &run_id,
+                            WorkflowRunState::Failed,
+                            Some("workflow_execution_failed"),
+                            None,
+                        )
+                        .await;
+                    return;
+                }
+                TaskStatus::Refused => {
+                    let _ = store
+                        .update_workflow_run(
+                            &tenant_id,
+                            &subject,
+                            &run_id,
+                            WorkflowRunState::Refused,
+                            Some("workflow_execution_refused"),
+                            None,
+                        )
+                        .await;
+                    return;
+                }
+                TaskStatus::Running | TaskStatus::AwaitingApproval => {
+                    let _ = store
+                        .update_workflow_run(
+                            &tenant_id,
+                            &subject,
+                            &run_id,
+                            WorkflowRunState::Running,
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+                TaskStatus::Accepted => {}
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let _ = store
+            .update_workflow_run(
+                &tenant_id,
+                &subject,
+                &run_id,
+                WorkflowRunState::Failed,
+                Some("workflow_observation_timed_out"),
+                None,
+            )
+            .await;
+    });
+}
+
+fn workflow_prompt(definition_id: &str) -> &'static str {
+    match definition_id {
+        "review.code/v1" => {
+            "Review this exact repository snapshot for correctness, regressions, maintainability risks, and missing tests. Return a concise Markdown report ordered by severity. Cite every finding with repository paths from the supplied context and say explicitly when the bounded context is insufficient."
+        }
+        "review.security/v1" => {
+            "Perform a security review of this exact repository snapshot. Return a concise Markdown report with severity, exploit preconditions, impact, and remediation for each finding. Cite repository paths from the supplied context and do not claim evidence that was not supplied."
+        }
+        "reverse.aep-ess/v1" => {
+            "Reverse-engineer this exact repository snapshot into an evidence-backed current-state system specification and a proposed AEP plan. Return Markdown with system boundaries, interfaces, invariants, risks, and sequenced work. Cite repository paths from the supplied context and distinguish observed facts from proposals."
+        }
+        _ => {
+            "Analyze this exact repository snapshot and return an evidence-backed Markdown report."
+        }
+    }
 }
 
 fn workflow_definitions() -> Vec<WorkflowDefinition> {

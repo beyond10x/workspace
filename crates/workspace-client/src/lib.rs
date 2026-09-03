@@ -514,6 +514,21 @@ impl WorkspaceClient {
         .await
     }
 
+    /// List the current subject's recent runs for one project.
+    pub async fn workflow_runs(
+        &self,
+        authorization: &str,
+        project_id: &str,
+    ) -> Result<Vec<WorkflowRun>, ClientError> {
+        self.exchange(
+            Method::GET,
+            &format!("v1/projects/{project_id}/workflow-runs"),
+            authorization,
+            Option::<&()>::None,
+        )
+        .await
+    }
+
     /// List central AEP entities indexed to one accessible project.
     pub async fn engineering_artifacts(
         &self,
