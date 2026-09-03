@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.2.7 - 2026-09-03
+
+- Align the actor-view and hosted terminal boundary with the released AgentIDE 0.1.3 contracts.
+- Normalize verified coding-task attachments into Workspace's AgentIDE contract at the service
+  boundary so independent Agent Platform and Workspace releases cannot create split Rust types.
 - Add a loopback-only terminal lab that combines the production Workspace replay/broker code with
   a real, externally built Substrate daemon for isolated Ghostty integration testing.
 
