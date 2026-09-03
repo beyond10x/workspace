@@ -29,6 +29,9 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS workspace_terminals (terminal_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, coding_session_id TEXT NOT NULL, owner_subject TEXT NOT NULL, agentide_session_id TEXT NOT NULL, authority_grant_id TEXT NOT NULL, profile_json TEXT NOT NULL, initial_columns BIGINT NOT NULL, initial_rows BIGINT NOT NULL, idempotency_key TEXT NOT NULL, substrate_session_ref TEXT, process_id TEXT, state TEXT NOT NULL, exit_code BIGINT, exit_signal TEXT, failure_code TEXT, created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL, UNIQUE (tenant_id, owner_subject, coding_session_id, idempotency_key))",
     "CREATE INDEX IF NOT EXISTS workspace_terminals_owner ON workspace_terminals (tenant_id, coding_session_id, owner_subject, created_at_ms)",
     "CREATE TABLE IF NOT EXISTS workspace_workflow_runs (run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, actor_subject TEXT NOT NULL, definition_id TEXT NOT NULL, branch TEXT NOT NULL, commit_ref TEXT NOT NULL, idempotency_key TEXT NOT NULL, state TEXT NOT NULL, failure_code TEXT, created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL, UNIQUE (tenant_id, actor_subject, project_id, idempotency_key))",
+    "CREATE INDEX IF NOT EXISTS workspace_workflow_runs_owner ON workspace_workflow_runs (tenant_id, project_id, actor_subject, created_at_ms)",
+    "CREATE TABLE IF NOT EXISTS workspace_workflow_tasks (run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, actor_subject TEXT NOT NULL, task_id TEXT NOT NULL, created_at_ms BIGINT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS workspace_workflow_results (run_id TEXT PRIMARY KEY, output TEXT NOT NULL, created_at_ms BIGINT NOT NULL)",
 ];
 
 /// Store failures with no SQL or tenant data exposed to transports.
@@ -1014,7 +1017,7 @@ impl Store {
         input: &StartWorkflow,
     ) -> Result<WorkflowRun, StoreError> {
         self.ensure_schema().await?;
-        if let Some(row) = sqlx::query("SELECT run_id, definition_id, project_id, branch, commit_ref, state, failure_code, created_at_ms FROM workspace_workflow_runs WHERE tenant_id = ? AND actor_subject = ? AND project_id = ? AND idempotency_key = ?")
+        if let Some(row) = sqlx::query("SELECT r.run_id, r.definition_id, r.project_id, r.branch, r.commit_ref, r.state, r.failure_code, r.created_at_ms, o.output FROM workspace_workflow_runs r LEFT JOIN workspace_workflow_results o ON o.run_id = r.run_id WHERE r.tenant_id = ? AND r.actor_subject = ? AND r.project_id = ? AND r.idempotency_key = ?")
             .bind(&authority.tenant_id)
             .bind(&authority.subject)
             .bind(project_id)
@@ -1038,6 +1041,7 @@ impl Store {
             commit: input.commit.clone(),
             state: WorkflowRunState::Accepted,
             failure_code: None,
+            output: None,
             created_at_ms: now,
         };
         sqlx::query("INSERT INTO workspace_workflow_runs (run_id, tenant_id, project_id, actor_subject, definition_id, branch, commit_ref, idempotency_key, state, failure_code, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'accepted', NULL, ?, ?)")
@@ -1055,6 +1059,117 @@ impl Store {
             .await
             .map_err(StoreError::Database)?;
         Ok(run)
+    }
+
+    /// List one subject's recent workflow runs for an accessible project.
+    pub async fn workflow_runs(
+        &self,
+        authority: &Authority,
+        project_id: &str,
+    ) -> Result<Vec<WorkflowRun>, StoreError> {
+        self.ensure_schema().await?;
+        let rows = sqlx::query("SELECT r.run_id, r.definition_id, r.project_id, r.branch, r.commit_ref, r.state, r.failure_code, r.created_at_ms, o.output FROM workspace_workflow_runs r LEFT JOIN workspace_workflow_results o ON o.run_id = r.run_id WHERE r.tenant_id = ? AND r.actor_subject = ? AND r.project_id = ? ORDER BY r.created_at_ms DESC LIMIT 100")
+            .bind(&authority.tenant_id)
+            .bind(&authority.subject)
+            .bind(project_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        rows.iter().map(workflow_from_row).collect()
+    }
+
+    /// Converge the Agent Platform task associated with one owned workflow run.
+    pub async fn record_workflow_task(
+        &self,
+        authority: &Authority,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<String, StoreError> {
+        self.ensure_schema().await?;
+        let owned: Option<i64> = sqlx::query_scalar("SELECT 1 FROM workspace_workflow_runs WHERE tenant_id = ? AND actor_subject = ? AND run_id = ?")
+            .bind(&authority.tenant_id)
+            .bind(&authority.subject)
+            .bind(run_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        if owned.is_none() {
+            return Err(StoreError::NotFound);
+        }
+        sqlx::query("INSERT INTO workspace_workflow_tasks (run_id, tenant_id, actor_subject, task_id, created_at_ms) VALUES (?, ?, ?, ?, ?) ON CONFLICT (run_id) DO NOTHING")
+            .bind(run_id)
+            .bind(&authority.tenant_id)
+            .bind(&authority.subject)
+            .bind(task_id)
+            .bind(as_i64(now_ms()?)?)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        let recorded: String = sqlx::query_scalar("SELECT task_id FROM workspace_workflow_tasks WHERE run_id = ? AND tenant_id = ? AND actor_subject = ?")
+            .bind(run_id)
+            .bind(&authority.tenant_id)
+            .bind(&authority.subject)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(StoreError::Database)?
+            .ok_or(StoreError::Corrupt)?;
+        if recorded != task_id {
+            return Err(StoreError::Conflict);
+        }
+        Ok(recorded)
+    }
+
+    /// Persist a monotonic workflow state transition and optional final Markdown output.
+    pub async fn update_workflow_run(
+        &self,
+        tenant_id: &str,
+        subject: &str,
+        run_id: &str,
+        state: WorkflowRunState,
+        failure_code: Option<&str>,
+        output: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.ensure_schema().await?;
+        let state_name = match state {
+            WorkflowRunState::Accepted => "accepted",
+            WorkflowRunState::Running => "running",
+            WorkflowRunState::Succeeded => "succeeded",
+            WorkflowRunState::Failed => "failed",
+            WorkflowRunState::Refused => "refused",
+        };
+        let mut transaction = self.pool.begin().await.map_err(StoreError::Database)?;
+        let updated = sqlx::query("UPDATE workspace_workflow_runs SET state = ?, failure_code = ?, updated_at_ms = ? WHERE tenant_id = ? AND actor_subject = ? AND run_id = ? AND state NOT IN ('succeeded', 'failed', 'refused')")
+            .bind(state_name)
+            .bind(failure_code)
+            .bind(as_i64(now_ms()?)?)
+            .bind(tenant_id)
+            .bind(subject)
+            .bind(run_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(StoreError::Database)?;
+        if updated.rows_affected() == 0 {
+            let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM workspace_workflow_runs WHERE tenant_id = ? AND actor_subject = ? AND run_id = ?")
+                .bind(tenant_id)
+                .bind(subject)
+                .bind(run_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(StoreError::Database)?;
+            if exists.is_none() {
+                return Err(StoreError::NotFound);
+            }
+        }
+        if let Some(output) = output {
+            sqlx::query("INSERT INTO workspace_workflow_results (run_id, output, created_at_ms) VALUES (?, ?, ?) ON CONFLICT (run_id) DO NOTHING")
+                .bind(run_id)
+                .bind(output)
+                .bind(as_i64(now_ms()?)?)
+                .execute(&mut *transaction)
+                .await
+                .map_err(StoreError::Database)?;
+        }
+        transaction.commit().await.map_err(StoreError::Database)
     }
 
     async fn owned_thread(
@@ -1290,6 +1405,7 @@ fn workflow_from_row(row: &AnyRow) -> Result<WorkflowRun, StoreError> {
         failure_code: row
             .try_get("failure_code")
             .map_err(|_| StoreError::Corrupt)?,
+        output: row.try_get("output").map_err(|_| StoreError::Corrupt)?,
         created_at_ms: from_i64(
             row.try_get("created_at_ms")
                 .map_err(|_| StoreError::Corrupt)?,
@@ -1765,6 +1881,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.id, replay.id);
+        let task_id = store
+            .record_workflow_task(&actor, &first.id, "task-one")
+            .await
+            .unwrap();
+        assert_eq!(task_id, "task-one");
+        store
+            .update_workflow_run(
+                &actor.tenant_id,
+                &actor.subject,
+                &first.id,
+                WorkflowRunState::Running,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .update_workflow_run(
+                &actor.tenant_id,
+                &actor.subject,
+                &first.id,
+                WorkflowRunState::Succeeded,
+                None,
+                Some("# Review\n\nNo findings."),
+            )
+            .await
+            .unwrap();
+        let runs = store.workflow_runs(&actor, "project-one").await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].state, WorkflowRunState::Succeeded);
+        assert_eq!(runs[0].output.as_deref(), Some("# Review\n\nNo findings."));
 
         let changed = StartWorkflow {
             commit: "d".repeat(40),

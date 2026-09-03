@@ -381,6 +381,8 @@ pub struct WorkflowRun {
     pub state: WorkflowRunState,
     /// Safe refusal or failure code.
     pub failure_code: Option<String>,
+    /// Final Markdown result when the workflow succeeded.
+    pub output: Option<String>,
     /// Creation time in Unix milliseconds.
     pub created_at_ms: u64,
 }
