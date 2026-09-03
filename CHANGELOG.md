@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.6 - 2026-09-03
+
 - Associate each admitted project-chat turn with its exact Agent Platform task and expose an
   owner-scoped SSE relay of ordered execution events for live clients without disclosing the
   upstream task identity or bearer.
