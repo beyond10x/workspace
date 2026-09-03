@@ -89,8 +89,8 @@ dependencies = [
 
 [[package]]
 name = "agentide-contracts"
-version = "0.2.0"
-source = "git+https://github.com/beyond10x/agentide.git?rev=a90cb6cbe5a5cf6dd91bade6071df13b376947e3#a90cb6cbe5a5cf6dd91bade6071df13b376947e3"
+version = "0.2.1"
+source = "git+https://github.com/beyond10x/agentide.git?rev=c25e73330fc130895d8f1538c9746858a265186b#c25e73330fc130895d8f1538c9746858a265186b"
 dependencies = [
  "chrono",
  "schemars 1.2.2",
@@ -1847,9 +1847,9 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "mio"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30d65c71f1ce40ab09135ce117d742b9f8a19ff91a41a8b57ed50bc2de59c427"
+checksum = "4b18443e9c262bfe8fa82f51666e2642c53393f7e5c27b3e1aeab922cff5b9d8"
 dependencies = [
  "libc",
  "wasi",
@@ -3272,7 +3272,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3836,7 +3836,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4076,9 +4076,9 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workspace-client"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
- "agentide-contracts 0.2.0",
+ "agentide-contracts 0.2.1",
  "reqwest 0.13.4",
  "serde",
  "thiserror",
@@ -4088,7 +4088,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-core"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "serde",
  "serde_json",
@@ -4096,13 +4096,13 @@ dependencies = [
 
 [[package]]
 name = "workspace-service"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "aep-client",
  "aep-contract",
  "agent-platform-client",
  "agent-platform-core",
- "agentide-contracts 0.2.0",
+ "agentide-contracts 0.2.1",
  "anyhow",
  "axum",
  "b10x-substrate-sdk",
