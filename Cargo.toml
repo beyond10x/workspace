@@ -18,7 +18,7 @@ publish = false
 workspace-core = { path = "crates/workspace-core" }
 workspace-client = { path = "crates/workspace-client" }
 identity-client = { git = "https://github.com/beyond10x/identity.git", tag = "0.5.6" }
-connectors-client = { git = "https://github.com/beyond10x/connectors.git", tag = "v0.5.4" }
+connectors-client = { git = "https://github.com/beyond10x/connectors.git", tag = "v0.5.5" }
 agent-platform-client = { git = "https://github.com/beyond10x/agent-platform.git", tag = "0.6.6" }
 agent-platform-core = { git = "https://github.com/beyond10x/agent-platform.git", tag = "0.6.6" }
 agentide-contracts = { git = "https://github.com/beyond10x/agentide.git", tag = "0.2.1" }
