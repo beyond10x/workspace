@@ -4,6 +4,7 @@ tasks:
   check:
     desc: Run the complete Workspace repository gate
     cmds:
+      - bash ci/check-toolchain-consistency.sh
       - cargo fmt --all --check
       - cargo clippy --workspace --all-targets --locked -- -D warnings
       - cargo test --workspace --locked

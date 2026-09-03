@@ -4062,7 +4062,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workspace-client"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "agentide-contracts",
  "reqwest 0.13.4",
@@ -4074,7 +4074,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-core"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -4082,7 +4082,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-service"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "aep-client",
  "aep-contract",
