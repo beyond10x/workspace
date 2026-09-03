@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.2.1 - 2026-09-03
+
+- Request only Substrate's admitted `observe`, `workspaces`, and `exec` scopes. Session routes are
+  governed by `exec`; requesting a separate `session` scope caused hosted project opening to fail.
+
 ## 0.2.0 - 2026-09-03
 
 - Add owner-scoped, exact-revision coding sessions under the existing project API. Workspace now

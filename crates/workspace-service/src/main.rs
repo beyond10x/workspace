@@ -55,7 +55,8 @@ use store::{SessionReservation, Store, StoreError};
 const CONNECTORS_AUDIENCE: &str = "urn:b10x:connectors";
 const CONNECTORS_SCOPE: &str = "connectors.catalog.read connectors.invoke";
 const SUBSTRATE_AUDIENCE: &str = "urn:b10x:substrate";
-const SUBSTRATE_SCOPE: &str = "observe workspaces exec session";
+// Substrate's session routes are governed by `exec`; `session` is not a Substrate scope.
+const SUBSTRATE_SCOPE: &str = "observe workspaces exec";
 const SOURCE_MATERIALIZATION_LIMITS: MaterializationLimits = MaterializationLimits {
     max_files: b10x_substrate_sdk::MAX_LIST_ITEMS,
     max_total_bytes: 256 * 1024 * 1024,
@@ -3040,9 +3041,10 @@ mod tests {
     use sha2::Digest as _;
 
     use super::{
-        CompleteWorkspaceFile, MaterializedFile, canonical_diff, file_operation_id,
-        install_crypto_provider, language_for_path, repository_candidate, source_manifest_sha256,
-        strict_repository_entry, valid_repository_path, validate_identity_transport,
+        CompleteWorkspaceFile, MaterializedFile, SUBSTRATE_SCOPE, canonical_diff,
+        file_operation_id, install_crypto_provider, language_for_path, repository_candidate,
+        source_manifest_sha256, strict_repository_entry, valid_repository_path,
+        validate_identity_transport,
     };
     use workspace_core::{ChangeSelector, DiffMode, FileExpectedState, WriteFile};
 
@@ -3087,6 +3089,16 @@ mod tests {
         assert_eq!(candidate.path_with_namespace, "group/project");
         assert_eq!(candidate.default_branch.as_deref(), Some("stable"));
         assert!(candidate.opened_project_id.is_none());
+    }
+
+    #[test]
+    fn substrate_authority_uses_only_runtime_admitted_scopes() {
+        assert_eq!(SUBSTRATE_SCOPE, "observe workspaces exec");
+        assert!(
+            !SUBSTRATE_SCOPE
+                .split_ascii_whitespace()
+                .any(|scope| scope == "session")
+        );
     }
 
     #[test]
