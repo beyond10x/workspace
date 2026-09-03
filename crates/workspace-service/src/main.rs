@@ -10,7 +10,15 @@ use aep_contract::query::{EntityQuery, QueryService};
 use agent_platform_client::AgentPlatformClient;
 use agent_platform_core::{
     ActivateRevision, AgentId, ConversationInput, ConversationMessage, ConversationRole,
-    CreateAgent, ProjectContext, ProjectContextFile, RevisionSpec, SubmitTask, TaskStatus,
+    CreateAgent, ProjectContext, ProjectContextFile, RevisionSpec, SubmitTask, Task, TaskId,
+    TaskStatus,
+};
+use agentide_contracts::{
+    ActorContext, ActorKind, ActorView, ActorWorkbench, AuthorityGrant,
+    ChangeSelector as AgentIdeChangeSelector, ContextPack, ContextSelection, IntentProfile,
+    OpenFileReference, Risk as AgentIdeRisk, SelectionKind,
+    TerminalSession as AgentIdeTerminalSession, TerminalState as AgentIdeTerminalState,
+    authorize_intent, resolve_intent_inventory,
 };
 use anyhow::{Context, Result, bail};
 use axum::Router;
@@ -40,14 +48,15 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use workspace_core::{
-    Branch, ChangeSelector, CodingSession, CodingSessionState, CodingTreeEntry,
-    CodingTreeProjection, CreateCodingSession, CreateMessage, CreateTerminal, CreateThread,
-    DiffFile, DiffHunk, DiffLine, DiffMode, DiffProjection, DiffRange, EngineeringArtifact,
-    EngineeringArtifactPage, FileConflict, FileExpectedState, FileModificationState,
-    FileProjection, FileRevision, MaterializationLimits, MessageRole, OpenProject, Problem,
-    Project, RepositoryCandidate, RepositoryEntry, RepositoryEntryKind, ResolveDiff, SelectBranch,
-    StartWorkflow, TerminalExit, TerminalProfile, TerminalSession, TerminalState,
-    TerminalWorkspaceAccess, WorkflowDefinition, WorkflowRunState, WriteFile,
+    Branch, ChangeSelector, CodingActorViewRequest, CodingIntentInvocation, CodingIntentResult,
+    CodingSession, CodingSessionState, CodingTreeEntry, CodingTreeProjection, CreateCodingSession,
+    CreateMessage, CreateTerminal, CreateThread, DiffFile, DiffHunk, DiffLine, DiffMode,
+    DiffProjection, DiffRange, EngineeringArtifact, EngineeringArtifactPage, FileConflict,
+    FileExpectedState, FileModificationState, FileProjection, FileRevision, MaterializationLimits,
+    MessageRole, OpenProject, Problem, Project, RepositoryCandidate, RepositoryEntry,
+    RepositoryEntryKind, ResolveDiff, SelectBranch, StartWorkflow, TerminalExit, TerminalProfile,
+    TerminalSession, TerminalState, TerminalWorkspaceAccess, WorkflowDefinition, WorkflowRunState,
+    WriteFile,
 };
 
 mod aep;
@@ -76,6 +85,18 @@ const SOURCE_MATERIALIZATION_LIMITS: MaterializationLimits = MaterializationLimi
 };
 const MAX_SOURCE_DIRECTORIES: usize = 4_096;
 const MAX_MATERIALIZATION_KEY_BYTES: usize = 256;
+const MAX_CONTEXT_SELECTIONS: usize = 8;
+const MAX_CONTEXT_SELECTION_BYTES: usize = 32 * 1024;
+const MAX_CONTEXT_TOTAL_BYTES: usize = 64 * 1024;
+const MAX_CONTEXT_OPEN_FILES: usize = 64;
+const MAX_AGENTIDE_SERVICE_ROWS: usize = 10_000;
+const CODING_AGENT_INTENTS: [&str; 5] = [
+    "code_read",
+    "code_changes",
+    "code_edit",
+    "code_create",
+    "terminal_list",
+];
 const PROJECT_CONTEXT_FILES: &[&str] = &[
     "AGENTS.md",
     "README.md",
@@ -289,6 +310,14 @@ fn router(state: AppState) -> Router {
             "/v1/sessions/{session_id}",
             get(coding_session).delete(close_coding_session),
         )
+        .route(
+            "/v1/sessions/{session_id}/actor-view",
+            post(coding_actor_view),
+        )
+        .route(
+            "/v1/sessions/{session_id}/intents",
+            post(invoke_coding_intent),
+        )
         .route("/v1/sessions/{session_id}/tree", get(coding_tree))
         .route("/v1/sessions/{session_id}/diff", post(resolve_diff))
         .route(
@@ -340,6 +369,1168 @@ async fn ready(State(state): State<AppState>) -> Response {
             "workspace_store_unavailable",
         ),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentIdeSessionRow {
+    session_id: String,
+    workspace_root: String,
+    objective: String,
+    project_id: Option<String>,
+    source_revision: Option<String>,
+    workspace_session_id: Option<String>,
+    manifest_digest: Option<String>,
+    owner: String,
+    state: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentIdeGrantRow {
+    grant_id: String,
+    session_id: String,
+    grantee: String,
+    allowed_intents: Vec<String>,
+    path_prefixes: Vec<String>,
+    maximum_risk: String,
+    expires_at: Option<String>,
+    revision: i64,
+    owner: String,
+    state: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentIdePinRow {
+    pin_id: String,
+    session_id: String,
+    kind: String,
+    reference: String,
+    start_line: Option<i64>,
+    end_line: Option<i64>,
+    sha256: String,
+    state: String,
+}
+
+struct VerifiedCodingTurn {
+    actor: ActorContext,
+    objective: String,
+    focused_selections: Vec<ContextSelection>,
+    open_files: Vec<OpenFileReference>,
+    active_diff: Option<AgentIdeChangeSelector>,
+}
+
+async fn agentide_service_rows(
+    state: &AppState,
+    authority: &Authority,
+    operation_ref: &str,
+    session_id: &str,
+) -> Result<Vec<Value>, Response> {
+    let mut rows = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut page = serde_json::json!({"limit": 1000});
+        if let Some(current) = &cursor {
+            page.as_object_mut()
+                .expect("static page object")
+                .insert("cursor".into(), Value::String(current.clone()));
+        }
+        let output = invoke_unique_operation(
+            state,
+            authority,
+            operation_ref,
+            serde_json::json!({"session_id": session_id, "$page": page}),
+        )
+        .await
+        .map_err(|_| {
+            problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "coding_context_authority_unavailable",
+            )
+        })?;
+        if let Some(items) = output.as_array() {
+            rows.extend(items.iter().cloned());
+            break;
+        }
+        let object = output
+            .as_object()
+            .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "coding_context_authority_invalid"))?;
+        if object.get("partial").and_then(Value::as_bool) != Some(false) {
+            return Err(problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "coding_context_authority_partial",
+            ));
+        }
+        let items = object
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "coding_context_authority_invalid"))?;
+        rows.extend(items.iter().cloned());
+        if rows.len() > MAX_AGENTIDE_SERVICE_ROWS {
+            return Err(problem(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "coding_context_authority_limit_exceeded",
+            ));
+        }
+        cursor = object
+            .get("next_cursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(rows)
+}
+
+fn agentide_session_row(
+    rows: Vec<Value>,
+    authority: &Authority,
+    session: &CodingSession,
+    agentide_session_id: &str,
+) -> Result<AgentIdeSessionRow, Response> {
+    let mut matching = rows
+        .into_iter()
+        .filter_map(|row| serde_json::from_value::<AgentIdeSessionRow>(row).ok())
+        .filter(|row| row.session_id == agentide_session_id);
+    let row = matching
+        .next()
+        .ok_or_else(|| problem(StatusCode::FORBIDDEN, "coding_session_binding_refused"))?;
+    if matching.next().is_some()
+        || row.state != "Active"
+        || row.owner != authority.subject
+        || row.workspace_root != format!("workspace-session/{}", session.id)
+        || row.workspace_session_id.as_deref() != Some(session.id.as_str())
+        || row.project_id.as_deref() != Some(session.project_id.as_str())
+        || row.source_revision.as_deref() != Some(session.source_revision.as_str())
+        || row.manifest_digest.as_deref() != session.manifest_sha256.as_deref()
+    {
+        return Err(problem(
+            StatusCode::FORBIDDEN,
+            "coding_session_binding_refused",
+        ));
+    }
+    Ok(row)
+}
+
+async fn verified_coding_turn(
+    state: &AppState,
+    authority: &Authority,
+    session: &CodingSession,
+    agentide_session_id: &str,
+    task_id: &str,
+    attempt_id: &str,
+) -> Result<VerifiedCodingTurn, Response> {
+    let client = state.agent_platform.as_ref().ok_or_else(|| {
+        problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "coding_agent_platform_unavailable",
+        )
+    })?;
+    let bearer = authority.agent_platform_bearer.as_deref().ok_or_else(|| {
+        problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "coding_agent_platform_unavailable",
+        )
+    })?;
+    let task_id = TaskId::new(task_id).map_err(|_| {
+        problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "coding_task_reference_invalid",
+        )
+    })?;
+    let task: Task = client
+        .get_task(bearer, &task_id)
+        .await
+        .map_err(|_| problem(StatusCode::FORBIDDEN, "coding_task_binding_refused"))?;
+    if task.tenant_id.as_str() != authority.tenant_id
+        || task.actor.as_str() != authority.subject
+        || task.attempt_id.as_str() != attempt_id
+        || !matches!(
+            task.status,
+            TaskStatus::Running | TaskStatus::AwaitingApproval
+        )
+    {
+        return Err(problem(
+            StatusCode::FORBIDDEN,
+            "coding_task_binding_refused",
+        ));
+    }
+    let input: ConversationInput = serde_json::from_value(task.input.clone())
+        .map_err(|_| problem(StatusCode::FORBIDDEN, "coding_task_binding_refused"))?;
+    let ConversationInput::CodingSessionTurn {
+        workspace_session_id,
+        agentide_session_id: task_agentide_session_id,
+        focused_selections,
+        open_files,
+        active_diff,
+        ..
+    } = input
+    else {
+        return Err(problem(
+            StatusCode::FORBIDDEN,
+            "coding_task_binding_refused",
+        ));
+    };
+    if workspace_session_id != session.id || task_agentide_session_id != agentide_session_id {
+        return Err(problem(
+            StatusCode::FORBIDDEN,
+            "coding_task_binding_refused",
+        ));
+    }
+    let session_rows = agentide_service_rows(
+        state,
+        authority,
+        "agentide.get_session",
+        agentide_session_id,
+    )
+    .await?;
+    let agentide_session =
+        agentide_session_row(session_rows, authority, session, agentide_session_id)?;
+    let mut actor = ActorContext::new(ActorKind::Agent, task.agent_id.as_str())
+        .map_err(|_| problem(StatusCode::BAD_GATEWAY, "coding_actor_context_invalid"))?;
+    actor.agent = Some(task.agent_id.to_string());
+    actor.attempt = Some(task.attempt_id.to_string());
+    actor.delegation = task.delegation_id.map(|delegation| delegation.to_string());
+    actor
+        .validate()
+        .map_err(|_| problem(StatusCode::BAD_GATEWAY, "coding_actor_context_invalid"))?;
+    Ok(VerifiedCodingTurn {
+        actor,
+        objective: agentide_session.objective,
+        focused_selections,
+        open_files,
+        active_diff,
+    })
+}
+
+fn agentide_grants(
+    rows: Vec<Value>,
+    authority: &Authority,
+    agentide_session_id: &str,
+) -> Result<Vec<AuthorityGrant>, Response> {
+    rows.into_iter()
+        .map(|row| {
+            let row: AgentIdeGrantRow = serde_json::from_value(row).map_err(|_| {
+                problem(StatusCode::BAD_GATEWAY, "coding_context_authority_invalid")
+            })?;
+            if row.session_id != agentide_session_id
+                || row.owner != authority.subject
+                || !matches!(row.state.as_str(), "Active" | "Revoked")
+            {
+                return Err(problem(
+                    StatusCode::BAD_GATEWAY,
+                    "coding_context_authority_invalid",
+                ));
+            }
+            let maximum_risk = match row.maximum_risk.as_str() {
+                "Low" => AgentIdeRisk::Low,
+                "Medium" => AgentIdeRisk::Medium,
+                _ => {
+                    return Err(problem(
+                        StatusCode::BAD_GATEWAY,
+                        "coding_context_authority_invalid",
+                    ));
+                }
+            };
+            let revision = u64::try_from(row.revision)
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    problem(StatusCode::BAD_GATEWAY, "coding_context_authority_invalid")
+                })?;
+            let grant = AuthorityGrant {
+                format: "agentide.authority-grant/1".into(),
+                id: row.grant_id,
+                session_id: row.session_id,
+                grantee: row.grantee,
+                allowed_intents: row.allowed_intents,
+                path_prefixes: row.path_prefixes,
+                maximum_risk,
+                expires_at: row.expires_at,
+                revision,
+                revoked: row.state == "Revoked",
+            };
+            grant.validate().map_err(|_| {
+                problem(StatusCode::BAD_GATEWAY, "coding_context_authority_invalid")
+            })?;
+            Ok(grant)
+        })
+        .collect()
+}
+
+fn coding_intent_profile() -> Result<(IntentProfile, BTreeSet<String>), Response> {
+    let profile = IntentProfile::embedded().map_err(|_| {
+        problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "coding_intent_profile_invalid",
+        )
+    })?;
+    let implemented = CODING_AGENT_INTENTS
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    Ok((profile, implemented))
+}
+
+fn sha256_text(content: &str) -> String {
+    hex::encode(Sha256::digest(content.as_bytes()))
+}
+
+fn context_activity(code: &str, reference: &str) -> Value {
+    serde_json::json!({"code": code, "reference": reference})
+}
+
+fn valid_context_selection(selection: &ContextSelection) -> bool {
+    !selection.id.trim().is_empty()
+        && selection.id.len() <= MAX_MATERIALIZATION_KEY_BYTES
+        && !selection.reference.trim().is_empty()
+        && selection.reference.len() <= 4 * 1024
+        && !selection.reference.contains('\0')
+        && !selection.truncated
+        && selection.content.len() <= MAX_CONTEXT_SELECTION_BYTES
+        && valid_sha256(&selection.sha256)
+        && selection.sha256 == sha256_text(&selection.content)
+        && match (selection.start_line, selection.end_line) {
+            (Some(start), Some(end)) => start > 0 && end >= start,
+            (None, None) => true,
+            _ => false,
+        }
+        && match selection.kind {
+            SelectionKind::Editor => valid_repository_path(&selection.reference),
+            SelectionKind::DiffHunk => selection.reference.starts_with("workspace-diff/"),
+            SelectionKind::Terminal => selection.reference.starts_with("terminal/"),
+            SelectionKind::Process | SelectionKind::Evidence => true,
+        }
+}
+
+fn admit_context_selection(
+    selection: &ContextSelection,
+    selection_count: &mut usize,
+    total_bytes: &mut usize,
+) -> bool {
+    if !valid_context_selection(selection)
+        || *selection_count >= MAX_CONTEXT_SELECTIONS
+        || total_bytes.saturating_add(selection.content.len()) > MAX_CONTEXT_TOTAL_BYTES
+    {
+        return false;
+    }
+    *selection_count += 1;
+    *total_bytes += selection.content.len();
+    true
+}
+
+fn pin_kind(value: &str) -> Option<SelectionKind> {
+    match value {
+        "Editor" => Some(SelectionKind::Editor),
+        "DiffHunk" => Some(SelectionKind::DiffHunk),
+        "Terminal" => Some(SelectionKind::Terminal),
+        "Process" => Some(SelectionKind::Process),
+        "Evidence" => Some(SelectionKind::Evidence),
+        _ => None,
+    }
+}
+
+fn pin_line(value: Option<i64>) -> Result<Option<u64>, ()> {
+    match value {
+        None => Ok(None),
+        Some(line) => u64::try_from(line)
+            .ok()
+            .filter(|line| *line > 0)
+            .map(Some)
+            .ok_or(()),
+    }
+}
+
+fn editor_pin_content(file: &CompleteWorkspaceFile, start: u64, end: u64) -> Option<String> {
+    let content = std::str::from_utf8(&file.bytes).ok()?;
+    let lines = content.split('\n').collect::<Vec<_>>();
+    let start = usize::try_from(start.checked_sub(1)?).ok()?;
+    let end = usize::try_from(end).ok()?;
+    (start < end && end <= lines.len()).then(|| lines[start..end].join("\n"))
+}
+
+fn diff_pin_content(diff: &DiffProjection, reference: &str) -> Option<String> {
+    let suffix = reference.strip_prefix("workspace-diff/")?;
+    let (digest, suffix) = suffix.split_once('/')?;
+    if digest != diff.digest {
+        return None;
+    }
+    let (path, hunk_id) = suffix.rsplit_once('/')?;
+    let hunk = diff
+        .files
+        .iter()
+        .find(|file| {
+            file.new_path.as_deref() == Some(path) || file.old_path.as_deref() == Some(path)
+        })?
+        .hunks
+        .iter()
+        .find(|hunk| hunk.id == hunk_id)?;
+    Some(
+        hunk.lines
+            .iter()
+            .map(|line| line.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+async fn hydrate_context_pin(
+    row: AgentIdePinRow,
+    agentide_session_id: &str,
+    working: &SubstrateWorkspace,
+    max_file_bytes: u64,
+    diff: &DiffProjection,
+) -> Result<ContextSelection, &'static str> {
+    if row.session_id != agentide_session_id || row.state != "Active" || !valid_sha256(&row.sha256)
+    {
+        return Err("context_pin_invalid");
+    }
+    let kind = pin_kind(&row.kind).ok_or("context_pin_invalid")?;
+    let start_line = pin_line(row.start_line).map_err(|()| "context_pin_invalid")?;
+    let end_line = pin_line(row.end_line).map_err(|()| "context_pin_invalid")?;
+    let content = match kind {
+        SelectionKind::Editor => {
+            let (Some(start), Some(end)) = (start_line, end_line) else {
+                return Err("context_pin_invalid");
+            };
+            if !valid_repository_path(&row.reference) || end < start {
+                return Err("context_pin_invalid");
+            }
+            let file = read_complete_file(working, &row.reference, max_file_bytes)
+                .await
+                .map_err(|_| "context_pin_content_unavailable")?
+                .ok_or("context_pin_stale")?;
+            editor_pin_content(&file, start, end).ok_or("context_pin_stale")?
+        }
+        SelectionKind::DiffHunk => {
+            diff_pin_content(diff, &row.reference).ok_or("context_pin_stale")?
+        }
+        SelectionKind::Terminal | SelectionKind::Process | SelectionKind::Evidence => {
+            return Err("context_pin_content_unavailable");
+        }
+    };
+    let selection = ContextSelection {
+        id: row.pin_id,
+        kind,
+        reference: row.reference,
+        start_line,
+        end_line,
+        sha256: row.sha256,
+        content,
+        truncated: false,
+    };
+    if valid_context_selection(&selection) {
+        Ok(selection)
+    } else {
+        Err("context_pin_stale")
+    }
+}
+
+async fn current_open_files(
+    requested: Vec<OpenFileReference>,
+    working: &SubstrateWorkspace,
+    max_file_bytes: u64,
+    recent_activity: &mut Vec<Value>,
+) -> Vec<OpenFileReference> {
+    let mut current = Vec::new();
+    for requested in requested.into_iter().take(MAX_CONTEXT_OPEN_FILES) {
+        if !valid_repository_path(&requested.path)
+            || !valid_sha256(&requested.sha256)
+            || requested
+                .cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.line == 0 || cursor.column == 0)
+        {
+            recent_activity.push(context_activity("open_file_invalid", &requested.path));
+            continue;
+        }
+        let Ok(Some(file)) = read_complete_file(working, &requested.path, max_file_bytes).await
+        else {
+            recent_activity.push(context_activity("open_file_unavailable", &requested.path));
+            continue;
+        };
+        if requested.sha256 != file.sha256 {
+            recent_activity.push(context_activity("open_file_stale", &requested.path));
+        }
+        current.push(OpenFileReference {
+            path: requested.path,
+            sha256: file.sha256,
+            cursor: requested.cursor,
+            dirty: requested.dirty,
+        });
+    }
+    current
+}
+
+fn agentide_terminals(
+    terminals: Vec<StoredTerminal>,
+    agentide_session_id: &str,
+    recent_activity: &mut Vec<Value>,
+) -> Vec<AgentIdeTerminalSession> {
+    let mut projected = Vec::new();
+    for terminal in terminals {
+        let terminal = terminal.public;
+        if terminal.agentide_session_id != agentide_session_id {
+            continue;
+        }
+        let state = match terminal.state {
+            TerminalState::Running => AgentIdeTerminalState::Running,
+            TerminalState::Exited => AgentIdeTerminalState::Exited,
+            TerminalState::Terminated => AgentIdeTerminalState::Terminated,
+            TerminalState::Preparing | TerminalState::Refused | TerminalState::Unknown => {
+                recent_activity.push(context_activity(
+                    "terminal_lifecycle_not_projected",
+                    &terminal.id,
+                ));
+                continue;
+            }
+        };
+        let Some(process_id) = terminal.process_id else {
+            recent_activity.push(context_activity("terminal_process_unknown", &terminal.id));
+            continue;
+        };
+        let Ok(actor) = ActorContext::new(ActorKind::Human, terminal.actor) else {
+            recent_activity.push(context_activity("terminal_actor_invalid", &terminal.id));
+            continue;
+        };
+        projected.push(AgentIdeTerminalSession {
+            format: "agentide.terminal-session/1".into(),
+            id: terminal.id,
+            session_id: terminal.agentide_session_id,
+            profile: terminal.profile.id,
+            actor,
+            process_id,
+            working_directory: terminal.profile.working_directory,
+            network: "none".into(),
+            state,
+            output_sequence: 0,
+            exit_code: terminal.exit.and_then(|exit| exit.code),
+        });
+    }
+    projected
+}
+
+fn pending_approvals(rows: Vec<Value>, agentide_session_id: &str, attempt_id: &str) -> Vec<Value> {
+    rows.into_iter()
+        .filter(|row| {
+            row.get("session_id").and_then(Value::as_str) == Some(agentide_session_id)
+                && row.get("attempt_ref").and_then(Value::as_str) == Some(attempt_id)
+                && row.get("state").and_then(Value::as_str) == Some("Pending")
+        })
+        .filter_map(|row| {
+            Some(serde_json::json!({
+                "checkpoint_id": row.get("checkpoint_id")?.as_str()?,
+                "attempt_ref": row.get("attempt_ref")?.as_str()?,
+                "plan_digest": row.get("plan_digest")?.as_str()?,
+                "checkpoint_ref": row.get("checkpoint_ref")?.as_str()?,
+                "state": "Pending"
+            }))
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_lines)]
+async fn coding_actor_view(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(input): Json<CodingActorViewRequest>,
+) -> Response {
+    if !valid_ref(&input.agentide_session_id)
+        || !valid_ref(&input.task_id)
+        || !valid_ref(&input.attempt_id)
+        || input.turn == 0
+    {
+        return problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "coding_actor_view_invalid",
+        );
+    }
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    let (session, base, working) =
+        match ready_session_materializations(&state, &authority, &session_id).await {
+            Ok(materializations) => materializations,
+            Err(response) => return response,
+        };
+    let verified = match verified_coding_turn(
+        &state,
+        &authority,
+        &session,
+        &input.agentide_session_id,
+        &input.task_id,
+        &input.attempt_id,
+    )
+    .await
+    {
+        Ok(verified) => verified,
+        Err(response) => return response,
+    };
+    let grant_rows = match agentide_service_rows(
+        &state,
+        &authority,
+        "agentide.list_grants",
+        &input.agentide_session_id,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(response) => return response,
+    };
+    let grants = match agentide_grants(grant_rows, &authority, &input.agentide_session_id) {
+        Ok(grants) => grants,
+        Err(response) => return response,
+    };
+    let (profile, implemented) = match coding_intent_profile() {
+        Ok(profile) => profile,
+        Err(response) => return response,
+    };
+    let Ok((inventory, withheld)) = resolve_intent_inventory(
+        &profile,
+        &verified.actor,
+        &implemented,
+        &grants,
+        true,
+        Utc::now(),
+        input.turn,
+    ) else {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "coding_intent_inventory_invalid",
+        );
+    };
+    let base_files = match materialization_files(&base, &session).await {
+        Ok(files) => files,
+        Err(response) => return response,
+    };
+    let working_files = match materialization_files(&working, &session).await {
+        Ok(files) => files,
+        Err(response) => return response,
+    };
+    let diff = canonical_diff(
+        &ChangeSelector::Workspace,
+        DiffMode::Patch,
+        &session.source_revision,
+        &base_files,
+        &working_files,
+        &verified.actor.subject,
+    );
+    let mut recent_activity = Vec::new();
+    let mut focused_selections = Vec::new();
+    let mut selection_count = 0;
+    let mut selection_bytes = 0;
+    for selection in verified.focused_selections {
+        if admit_context_selection(&selection, &mut selection_count, &mut selection_bytes) {
+            focused_selections.push(selection);
+        } else {
+            recent_activity.push(context_activity(
+                "focused_selection_refused",
+                &selection.reference,
+            ));
+        }
+    }
+    let pin_rows = match agentide_service_rows(
+        &state,
+        &authority,
+        "agentide.list_context_pins",
+        &input.agentide_session_id,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(response) => return response,
+    };
+    let mut pins = Vec::new();
+    for row in pin_rows {
+        let reference = row
+            .get("reference")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        let Ok(row) = serde_json::from_value::<AgentIdePinRow>(row) else {
+            recent_activity.push(context_activity("context_pin_invalid", &reference));
+            continue;
+        };
+        if row.state == "Removed" {
+            continue;
+        }
+        match hydrate_context_pin(
+            row,
+            &input.agentide_session_id,
+            &working,
+            session.limits.max_file_bytes,
+            &diff,
+        )
+        .await
+        {
+            Ok(selection)
+                if admit_context_selection(
+                    &selection,
+                    &mut selection_count,
+                    &mut selection_bytes,
+                ) =>
+            {
+                pins.push(selection);
+            }
+            Ok(selection) => recent_activity.push(context_activity(
+                "context_selection_limit_exceeded",
+                &selection.reference,
+            )),
+            Err(code) => recent_activity.push(context_activity(code, &reference)),
+        }
+    }
+    let open_files = current_open_files(
+        verified.open_files,
+        &working,
+        session.limits.max_file_bytes,
+        &mut recent_activity,
+    )
+    .await;
+    let terminals = match state.store.terminals(&authority, &session.id).await {
+        Ok(terminals) => {
+            agentide_terminals(terminals, &input.agentide_session_id, &mut recent_activity)
+        }
+        Err(error) => return store_problem(&error),
+    };
+    let approval_rows = match agentide_service_rows(
+        &state,
+        &authority,
+        "agentide.list_approval_checkpoints",
+        &input.agentide_session_id,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(response) => return response,
+    };
+    let approvals = pending_approvals(approval_rows, &input.agentide_session_id, &input.attempt_id);
+    let active_diff = match verified.active_diff {
+        None => None,
+        Some(AgentIdeChangeSelector::Workspace) => Some(AgentIdeChangeSelector::Workspace),
+        Some(_) => {
+            recent_activity.push(context_activity(
+                "active_diff_selector_unavailable",
+                "active-diff",
+            ));
+            None
+        }
+    };
+    let mut workbench = ActorWorkbench {
+        tabs: open_files.iter().map(|file| file.path.clone()).collect(),
+        focused_file: focused_selections
+            .iter()
+            .find(|selection| selection.kind == SelectionKind::Editor)
+            .map(|selection| selection.reference.clone())
+            .or_else(|| open_files.first().map(|file| file.path.clone())),
+        dirty_paths: open_files
+            .iter()
+            .filter(|file| file.dirty)
+            .map(|file| file.path.clone())
+            .collect(),
+        ..ActorWorkbench::default()
+    };
+    workbench
+        .cursors
+        .extend(open_files.iter().filter_map(|file| {
+            file.cursor
+                .clone()
+                .map(|cursor| (file.path.clone(), cursor))
+        }));
+    let view = ActorView {
+        format: "agentide.actor-view/1".into(),
+        actor: verified.actor,
+        workbench,
+        context: ContextPack {
+            format: "agentide.context-pack/1".into(),
+            objective: verified.objective,
+            source_revision: session.source_revision,
+            working_changes: Some(diff.digest),
+            pins,
+            focused_selections,
+            open_files,
+            active_diff,
+            terminals,
+            processes: Vec::new(),
+            agent_lanes: Vec::new(),
+            approvals,
+            evidence: Vec::new(),
+            recent_activity,
+            revision: input.turn,
+        },
+        inventory,
+        withheld,
+    };
+    confidential(Json(view).into_response())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodeReadArguments {
+    path: String,
+    offset: u64,
+    limit_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodeEditArguments {
+    operation_id: String,
+    path: String,
+    content: String,
+    expected_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodeCreateArguments {
+    operation_id: String,
+    path: String,
+    content: String,
+    expected_absent: bool,
+}
+
+fn coding_intent_path(intent: &str, arguments: &Value) -> Result<Option<String>, Response> {
+    if matches!(intent, "code_read" | "code_edit" | "code_create") {
+        let path = arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| valid_repository_path(path))
+            .ok_or_else(|| {
+                problem(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "coding_intent_arguments_invalid",
+                )
+            })?;
+        Ok(Some(path.to_owned()))
+    } else {
+        Ok(None)
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn invoke_coding_intent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(input): Json<CodingIntentInvocation>,
+) -> Response {
+    if !valid_ref(&input.agentide_session_id)
+        || !valid_ref(&input.task_id)
+        || !valid_ref(&input.attempt_id)
+        || !valid_ref(&input.call_id)
+        || !CODING_AGENT_INTENTS.contains(&input.intent.as_str())
+        || !input.arguments.is_object()
+    {
+        return problem(StatusCode::UNPROCESSABLE_ENTITY, "coding_intent_invalid");
+    }
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    let (session, base, working) =
+        match ready_session_materializations(&state, &authority, &session_id).await {
+            Ok(materializations) => materializations,
+            Err(response) => return response,
+        };
+    let verified = match verified_coding_turn(
+        &state,
+        &authority,
+        &session,
+        &input.agentide_session_id,
+        &input.task_id,
+        &input.attempt_id,
+    )
+    .await
+    {
+        Ok(verified) => verified,
+        Err(response) => return response,
+    };
+    let grant_rows = match agentide_service_rows(
+        &state,
+        &authority,
+        "agentide.list_grants",
+        &input.agentide_session_id,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(response) => return response,
+    };
+    let grants = match agentide_grants(grant_rows, &authority, &input.agentide_session_id) {
+        Ok(grants) => grants,
+        Err(response) => return response,
+    };
+    let (profile, implemented) = match coding_intent_profile() {
+        Ok(profile) => profile,
+        Err(response) => return response,
+    };
+    let Some(definition) = profile.find(&input.intent) else {
+        return problem(StatusCode::NOT_FOUND, "coding_intent_unavailable");
+    };
+    let path = match coding_intent_path(&input.intent, &input.arguments) {
+        Ok(path) => path,
+        Err(response) => return response,
+    };
+    if let Err(reason) = authorize_intent(
+        definition,
+        &verified.actor,
+        &implemented,
+        &grants,
+        true,
+        Utc::now(),
+        path.as_deref(),
+    ) {
+        return problem(StatusCode::FORBIDDEN, &reason.code);
+    }
+    let output = match input.intent.as_str() {
+        "code_read" => {
+            let arguments = match serde_json::from_value::<CodeReadArguments>(input.arguments) {
+                Ok(arguments)
+                    if valid_repository_path(&arguments.path)
+                        && arguments.limit_bytes > 0
+                        && arguments.limit_bytes <= session.limits.max_file_bytes =>
+                {
+                    arguments
+                }
+                _ => {
+                    return problem(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "coding_intent_arguments_invalid",
+                    );
+                }
+            };
+            let file = match working
+                .read_file_v2(&arguments.path, arguments.offset, arguments.limit_bytes)
+                .await
+            {
+                Ok(file) => file,
+                Err(error) => return substrate_problem(&error),
+            };
+            let Ok(content) = String::from_utf8(file.bytes) else {
+                return problem(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "coding_file_binary_refused",
+                );
+            };
+            serde_json::json!({
+                "path": file.path,
+                "sha256": file.sha256,
+                "size": file.size,
+                "offset": file.offset,
+                "next_offset": file.next_offset,
+                "eof": file.eof,
+                "content": content,
+                "truncated": !file.eof
+            })
+        }
+        "code_changes" => {
+            if !input
+                .arguments
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+            {
+                return problem(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "coding_intent_arguments_invalid",
+                );
+            }
+            let base_files = match materialization_files(&base, &session).await {
+                Ok(files) => files,
+                Err(response) => return response,
+            };
+            let working_files = match materialization_files(&working, &session).await {
+                Ok(files) => files,
+                Err(response) => return response,
+            };
+            match serde_json::to_value(canonical_diff(
+                &ChangeSelector::Workspace,
+                DiffMode::Patch,
+                &session.source_revision,
+                &base_files,
+                &working_files,
+                &verified.actor.subject,
+            )) {
+                Ok(value) => value,
+                Err(_) => {
+                    return problem(StatusCode::BAD_GATEWAY, "coding_intent_result_invalid");
+                }
+            }
+        }
+        "code_edit" => {
+            let arguments = match serde_json::from_value::<CodeEditArguments>(input.arguments) {
+                Ok(arguments)
+                    if valid_repository_path(&arguments.path)
+                        && valid_ref(&arguments.operation_id)
+                        && arguments.content.len() as u64 <= session.limits.max_file_bytes
+                        && arguments
+                            .expected_sha256
+                            .as_deref()
+                            .is_some_and(valid_sha256) =>
+                {
+                    arguments
+                }
+                _ => {
+                    return problem(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "coding_intent_arguments_invalid",
+                    );
+                }
+            };
+            let expected_sha256 = arguments
+                .expected_sha256
+                .as_deref()
+                .expect("validated expected digest");
+            let operation_id = substrate_operation_id(
+                &session.id,
+                &[
+                    &input.task_id,
+                    &input.attempt_id,
+                    &input.call_id,
+                    &input.intent,
+                    &arguments.operation_id,
+                    &arguments.path,
+                    expected_sha256,
+                    &sha256_text(&arguments.content),
+                ],
+            );
+            match working
+                .replace_file(
+                    &arguments.path,
+                    arguments.content.as_bytes(),
+                    ExpectedFileState::Sha256 {
+                        sha256: expected_sha256.to_owned(),
+                    },
+                    false,
+                    Some(operation_id),
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(SubstrateError::Refusal(refusal))
+                    if refusal.class == SubstrateRefusalClass::Conflict =>
+                {
+                    return problem(StatusCode::CONFLICT, "coding_intent_stale");
+                }
+                Err(error) => return substrate_problem(&error),
+            }
+            let file = match project_file(
+                &arguments.path,
+                &base,
+                &working,
+                session.limits.max_file_bytes,
+            )
+            .await
+            {
+                Ok(Some(file)) => file,
+                Ok(None) => {
+                    return problem(StatusCode::BAD_GATEWAY, "coding_intent_result_invalid");
+                }
+                Err(response) => return response,
+            };
+            match serde_json::to_value(file) {
+                Ok(value) => value,
+                Err(_) => {
+                    return problem(StatusCode::BAD_GATEWAY, "coding_intent_result_invalid");
+                }
+            }
+        }
+        "code_create" => {
+            let arguments = match serde_json::from_value::<CodeCreateArguments>(input.arguments) {
+                Ok(arguments)
+                    if valid_repository_path(&arguments.path)
+                        && valid_ref(&arguments.operation_id)
+                        && arguments.expected_absent
+                        && arguments.content.len() as u64 <= session.limits.max_file_bytes =>
+                {
+                    arguments
+                }
+                _ => {
+                    return problem(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "coding_intent_arguments_invalid",
+                    );
+                }
+            };
+            let operation_id = substrate_operation_id(
+                &session.id,
+                &[
+                    &input.task_id,
+                    &input.attempt_id,
+                    &input.call_id,
+                    &input.intent,
+                    &arguments.operation_id,
+                    &arguments.path,
+                    &sha256_text(&arguments.content),
+                ],
+            );
+            match working
+                .replace_file(
+                    &arguments.path,
+                    arguments.content.as_bytes(),
+                    ExpectedFileState::Absent,
+                    true,
+                    Some(operation_id),
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(SubstrateError::Refusal(refusal))
+                    if refusal.class == SubstrateRefusalClass::Conflict =>
+                {
+                    return problem(StatusCode::CONFLICT, "coding_intent_stale");
+                }
+                Err(error) => return substrate_problem(&error),
+            }
+            let file = match project_file(
+                &arguments.path,
+                &base,
+                &working,
+                session.limits.max_file_bytes,
+            )
+            .await
+            {
+                Ok(Some(file)) => file,
+                Ok(None) => {
+                    return problem(StatusCode::BAD_GATEWAY, "coding_intent_result_invalid");
+                }
+                Err(response) => return response,
+            };
+            match serde_json::to_value(file) {
+                Ok(value) => value,
+                Err(_) => {
+                    return problem(StatusCode::BAD_GATEWAY, "coding_intent_result_invalid");
+                }
+            }
+        }
+        "terminal_list" => {
+            if !input
+                .arguments
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+            {
+                return problem(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "coding_intent_arguments_invalid",
+                );
+            }
+            let terminals = match state.store.terminals(&authority, &session.id).await {
+                Ok(terminals) => terminals,
+                Err(error) => return store_problem(&error),
+            };
+            let mut recent_activity = Vec::new();
+            serde_json::json!({
+                "terminals": agentide_terminals(
+                    terminals,
+                    &input.agentide_session_id,
+                    &mut recent_activity,
+                ),
+                "recent_activity": recent_activity
+            })
+        }
+        _ => return problem(StatusCode::NOT_FOUND, "coding_intent_unavailable"),
+    };
+    confidential(Json(CodingIntentResult { output }).into_response())
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1692,11 +2883,15 @@ fn terminal_session_row_matches(
     agentide_session_id: &str,
 ) -> bool {
     row.get("session_id").and_then(Value::as_str) == Some(agentide_session_id)
+        && row.get("workspace_root").and_then(Value::as_str)
+            == Some(format!("workspace-session/{}", coding_session.id).as_str())
         && row.get("workspace_session_id").and_then(Value::as_str)
             == Some(coding_session.id.as_str())
         && row.get("project_id").and_then(Value::as_str) == Some(coding_session.project_id.as_str())
         && row.get("source_revision").and_then(Value::as_str)
             == Some(coding_session.source_revision.as_str())
+        && row.get("manifest_digest").and_then(Value::as_str)
+            == coding_session.manifest_sha256.as_deref()
         && row.get("owner").and_then(Value::as_str) == Some(authority.subject.as_str())
         && row.get("state").and_then(Value::as_str) == Some("Active")
 }
@@ -4335,12 +5530,14 @@ mod tests {
     use sha2::Digest as _;
 
     use super::{
-        Authority, CompleteWorkspaceFile, MaterializedFile, SUBSTRATE_SCOPE, canonical_diff,
+        Authority, CompleteWorkspaceFile, MaterializedFile, SUBSTRATE_SCOPE, agentide_grants,
+        agentide_session_row, canonical_diff, coding_intent_profile, diff_pin_content,
         file_operation_id, install_crypto_provider, language_for_path, repository_candidate,
-        source_file_input, source_manifest_sha256, strict_repository_entry,
+        sha256_text, source_file_input, source_manifest_sha256, strict_repository_entry,
         terminal_grant_row_matches, terminal_session_row_matches, valid_repository_path,
         validate_identity_transport,
     };
+    use agentide_contracts::{ActorContext, ActorKind, authorize_intent};
     use workspace_core::{
         ChangeSelector, CodingSession, CodingSessionState, DiffMode, FileExpectedState,
         MaterializationLimits, WriteFile,
@@ -4438,9 +5635,11 @@ mod tests {
         };
         let session_row = serde_json::json!({
             "session_id": "agentide-session-one",
+            "workspace_root": "workspace-session/workspace-session-one",
             "workspace_session_id": "workspace-session-one",
             "project_id": "project-one",
             "source_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "manifest_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "owner": "person:owner",
             "state": "Active"
         });
@@ -4497,6 +5696,117 @@ mod tests {
                 "{field} must be receiver-verified"
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn coding_session_and_agent_grant_are_derived_from_server_records() {
+        let authority = Authority {
+            tenant_id: "tenant-one".to_owned(),
+            subject: "person:owner".to_owned(),
+            connector_bearer: "not-retained".to_owned(),
+            agent_platform_bearer: None,
+            session_authorization: "Bearer synthetic-session".to_owned(),
+            context: OwnerContext {
+                tenant_id: "tenant-one".to_owned(),
+                agent_id: "workspace:test".to_owned(),
+                agent_revision: 1,
+                authority_snapshot_id: "identity:test".to_owned(),
+                authority_snapshot_sha256: "a".repeat(64),
+            },
+        };
+        let session = CodingSession {
+            id: "workspace-session-one".to_owned(),
+            project_id: "project-one".to_owned(),
+            source_revision: "b".repeat(40),
+            base_materialization_ref: Some("base-one".to_owned()),
+            working_materialization_ref: Some("working-one".to_owned()),
+            manifest_sha256: Some("c".repeat(64)),
+            state: CodingSessionState::Ready,
+            failure_code: None,
+            limits: MaterializationLimits {
+                max_files: 1_000,
+                max_total_bytes: 256 * 1024 * 1024,
+                max_file_bytes: 180 * 1024,
+            },
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let session_record = serde_json::json!({
+            "session_id": "agentide-session-one",
+            "workspace_root": "workspace-session/workspace-session-one",
+            "objective": "Fix the bounded issue",
+            "workspace_session_id": "workspace-session-one",
+            "project_id": "project-one",
+            "source_revision": "b".repeat(40),
+            "manifest_digest": "c".repeat(64),
+            "owner": "person:owner",
+            "scopes": {"principal": "person:owner", "team": null, "project": null},
+            "state": "Active"
+        });
+        assert_eq!(
+            agentide_session_row(
+                vec![session_record.clone()],
+                &authority,
+                &session,
+                "agentide-session-one"
+            )
+            .expect("bound session")
+            .objective,
+            "Fix the bounded issue"
+        );
+        let mut spoofed = session_record;
+        spoofed["workspace_session_id"] = serde_json::json!("workspace-session-other");
+        assert!(
+            agentide_session_row(vec![spoofed], &authority, &session, "agentide-session-one")
+                .is_err()
+        );
+
+        let grants = agentide_grants(
+            vec![serde_json::json!({
+                "grant_id": "grant-one",
+                "session_id": "agentide-session-one",
+                "grantee": "agent-one",
+                "allowed_intents": ["code_edit"],
+                "path_prefixes": ["src"],
+                "maximum_risk": "Medium",
+                "expires_at": null,
+                "revision": 1,
+                "owner": "person:owner",
+                "scopes": {"principal": "person:owner", "team": null, "project": null},
+                "state": "Active"
+            })],
+            &authority,
+            "agentide-session-one",
+        )
+        .expect("grant projection");
+        let actor = ActorContext::new(ActorKind::Agent, "agent-one").expect("actor");
+        let (profile, implemented) = coding_intent_profile().expect("profile");
+        let edit = profile.find("code_edit").expect("edit intent");
+        assert!(
+            authorize_intent(
+                edit,
+                &actor,
+                &implemented,
+                &grants,
+                true,
+                chrono::Utc::now(),
+                Some("src/lib.rs")
+            )
+            .is_ok()
+        );
+        assert!(
+            authorize_intent(
+                edit,
+                &actor,
+                &implemented,
+                &grants,
+                true,
+                chrono::Utc::now(),
+                Some("tests/escape.rs")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4613,6 +5923,26 @@ mod tests {
         assert!(files_only.files.iter().all(|file| {
             file.additions.is_none() && file.deletions.is_none() && file.hunks.is_empty()
         }));
+
+        let changed = patch
+            .files
+            .iter()
+            .find(|file| file.new_path.as_deref() == Some("src/lib.rs"))
+            .expect("changed file");
+        let hunk = changed.hunks.first().expect("hunk");
+        let reference = format!("workspace-diff/{}/src/lib.rs/{}", patch.digest, hunk.id);
+        let content = diff_pin_content(&patch, &reference).expect("canonical hunk selection");
+        assert_eq!(
+            sha256_text(&content),
+            hex::encode(sha2::Sha256::digest(content.as_bytes()))
+        );
+        assert!(
+            diff_pin_content(
+                &patch,
+                &format!("workspace-diff/{}/src/lib.rs/{}", "0".repeat(64), hunk.id)
+            )
+            .is_none()
+        );
     }
 
     #[test]

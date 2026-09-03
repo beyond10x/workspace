@@ -51,8 +51,8 @@ dependencies = [
 
 [[package]]
 name = "agent-platform-client"
-version = "0.5.0"
-source = "git+https://github.com/beyond10x/agent-platform.git?tag=0.5.0#3be3b519292562f386d4f4471d904b8dd05cfecf"
+version = "0.6.3"
+source = "git+https://github.com/beyond10x/agent-platform.git?rev=782b553ba04e4c410c5033abb1a713b05dc148de#782b553ba04e4c410c5033abb1a713b05dc148de"
 dependencies = [
  "agent-platform-core",
  "reqwest 0.13.4",
@@ -64,12 +64,26 @@ dependencies = [
 
 [[package]]
 name = "agent-platform-core"
-version = "0.5.0"
-source = "git+https://github.com/beyond10x/agent-platform.git?tag=0.5.0#3be3b519292562f386d4f4471d904b8dd05cfecf"
+version = "0.6.3"
+source = "git+https://github.com/beyond10x/agent-platform.git?rev=782b553ba04e4c410c5033abb1a713b05dc148de#782b553ba04e4c410c5033abb1a713b05dc148de"
 dependencies = [
+ "agentide-contracts",
  "schemars 0.8.22",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "agentide-contracts"
+version = "0.1.1"
+source = "git+https://github.com/beyond10x/agentide.git?rev=ed6250bb1f1a3ff56f3c5a6acffe11cbd4f07e20#ed6250bb1f1a3ff56f3c5a6acffe11cbd4f07e20"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.0",
  "thiserror",
 ]
 
@@ -2826,6 +2840,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3231,7 +3258,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -3575,6 +3602,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
 
 [[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
+
+[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3789,7 +3822,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -4031,6 +4064,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 name = "workspace-client"
 version = "0.2.3"
 dependencies = [
+ "agentide-contracts",
  "reqwest 0.13.4",
  "serde",
  "thiserror",
@@ -4043,6 +4077,7 @@ name = "workspace-core"
 version = "0.2.3"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4053,6 +4088,7 @@ dependencies = [
  "aep-contract",
  "agent-platform-client",
  "agent-platform-core",
+ "agentide-contracts",
  "anyhow",
  "axum",
  "b10x-substrate-sdk",

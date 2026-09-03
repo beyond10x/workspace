@@ -9,7 +9,7 @@ members = [
 [workspace.package]
 version = "0.2.3"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.98"
 license = "LicenseRef-B10x-Proprietary"
 repository = "https://github.com/beyond10x/workspace"
 publish = false
@@ -19,8 +19,9 @@ workspace-core = { path = "crates/workspace-core" }
 workspace-client = { path = "crates/workspace-client" }
 identity-client = { git = "https://github.com/beyond10x/identity.git", tag = "0.4.0" }
 connectors-client = { git = "https://github.com/beyond10x/connectors.git", rev = "ea335281ef8029ca4cb375768d98db3dc3135feb" }
-agent-platform-client = { git = "https://github.com/beyond10x/agent-platform.git", tag = "0.5.0" }
-agent-platform-core = { git = "https://github.com/beyond10x/agent-platform.git", tag = "0.5.0" }
+agent-platform-client = { git = "https://github.com/beyond10x/agent-platform.git", rev = "782b553ba04e4c410c5033abb1a713b05dc148de" }
+agent-platform-core = { git = "https://github.com/beyond10x/agent-platform.git", rev = "782b553ba04e4c410c5033abb1a713b05dc148de" }
+agentide-contracts = { git = "https://github.com/beyond10x/agentide.git", rev = "ed6250bb1f1a3ff56f3c5a6acffe11cbd4f07e20" }
 aep-client = { git = "https://github.com/beyond10x/aep", tag = "0.40.3" }
 aep-contract = { git = "https://github.com/beyond10x/aep", tag = "0.40.3" }
 b10x-substrate-sdk = { git = "https://github.com/beyond10x/substrate.git", rev = "8d377f0ac0cd290df2c739fd6b0aee9db8936a8c" }
@@ -53,3 +54,5 @@ pedantic = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 must_use_candidate = "allow"
+result_large_err = "allow"
+unused_async_trait_impl = "allow"
