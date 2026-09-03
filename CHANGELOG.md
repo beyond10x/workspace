@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0 - 2026-09-03
+
 - Add owner-scoped, exact-revision coding sessions under the existing project API. Workspace now
   recursively materializes a Connector-authorized GitLab commit into complete base and working
   Substrate workspaces, preserves executable modes, records a source-manifest digest, and refuses
