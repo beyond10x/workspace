@@ -6,10 +6,11 @@ use reqwest::{Method, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use url::Url;
 use workspace_core::{
-    Branch, CodingSession, CodingTreeProjection, CreateCodingSession, CreateMessage, CreateThread,
-    DiffProjection, EngineeringArtifactPage, FileConflict, FileProjection, Message, OpenProject,
-    Project, RepositoryCandidate, RepositoryEntry, ResolveDiff, SelectBranch, StartWorkflow,
-    Thread, WorkflowDefinition, WorkflowRun, WriteFile,
+    Branch, CodingSession, CodingTreeProjection, CreateCodingSession, CreateMessage,
+    CreateTerminal, CreateThread, DiffProjection, EngineeringArtifactPage, FileConflict,
+    FileProjection, Message, OpenProject, Project, RepositoryCandidate, RepositoryEntry,
+    ResolveDiff, SelectBranch, StartWorkflow, TerminalProfile, TerminalSession, Thread,
+    WorkflowDefinition, WorkflowRun, WriteFile,
 };
 
 /// Workspace transport failure without response or credential bodies.
@@ -310,6 +311,116 @@ impl WorkspaceClient {
         .await
     }
 
+    /// List deployment-declared terminal profiles for one ready coding session.
+    pub async fn terminal_profiles(
+        &self,
+        authorization: &str,
+        session_id: &str,
+    ) -> Result<Vec<TerminalProfile>, ClientError> {
+        self.exchange(
+            Method::GET,
+            &format!("v1/sessions/{session_id}/terminal-profiles"),
+            authorization,
+            Option::<&()>::None,
+        )
+        .await
+    }
+
+    /// List durable terminal metadata without raw scrollback.
+    pub async fn terminals(
+        &self,
+        authorization: &str,
+        session_id: &str,
+    ) -> Result<Vec<TerminalSession>, ClientError> {
+        self.exchange(
+            Method::GET,
+            &format!("v1/sessions/{session_id}/terminals"),
+            authorization,
+            Option::<&()>::None,
+        )
+        .await
+    }
+
+    /// Create a terminal through an exact deployment profile and current `AgentIDE` grant.
+    pub async fn create_terminal(
+        &self,
+        authorization: &str,
+        session_id: &str,
+        input: &CreateTerminal,
+    ) -> Result<TerminalSession, ClientError> {
+        self.exchange(
+            Method::POST,
+            &format!("v1/sessions/{session_id}/terminals"),
+            authorization,
+            Some(input),
+        )
+        .await
+    }
+
+    /// Read one owned terminal's durable metadata.
+    pub async fn terminal(
+        &self,
+        authorization: &str,
+        terminal_id: &str,
+    ) -> Result<TerminalSession, ClientError> {
+        self.exchange(
+            Method::GET,
+            &format!("v1/terminals/{terminal_id}"),
+            authorization,
+            Option::<&()>::None,
+        )
+        .await
+    }
+
+    /// Explicitly kill and retire one Substrate PTY session.
+    pub async fn terminate_terminal(
+        &self,
+        authorization: &str,
+        terminal_id: &str,
+    ) -> Result<TerminalSession, ClientError> {
+        self.exchange(
+            Method::DELETE,
+            &format!("v1/terminals/{terminal_id}"),
+            authorization,
+            Option::<&()>::None,
+        )
+        .await
+    }
+
+    /// Build the credential-free WebSocket endpoint for a Devcenter same-origin proxy.
+    ///
+    /// The caller supplies its transient authorization only in the WebSocket handshake header;
+    /// Workspace never places it in this URL.
+    pub fn terminal_attachment_url(
+        &self,
+        terminal_id: &str,
+        from_sequence: Option<u64>,
+    ) -> Result<Url, ClientError> {
+        if terminal_id.is_empty() || terminal_id.len() > 256 {
+            return Err(ClientError::Configuration);
+        }
+        let encoded =
+            url::form_urlencoded::byte_serialize(terminal_id.as_bytes()).collect::<String>();
+        let mut endpoint = self
+            .base
+            .join(&format!("v1/terminals/{encoded}/attach"))
+            .map_err(|_| ClientError::Configuration)?;
+        let websocket_scheme = match endpoint.scheme() {
+            "https" => "wss",
+            "http" => "ws",
+            _ => return Err(ClientError::Configuration),
+        };
+        endpoint
+            .set_scheme(websocket_scheme)
+            .map_err(|()| ClientError::Configuration)?;
+        if let Some(sequence) = from_sequence {
+            endpoint
+                .query_pairs_mut()
+                .append_pair("from_sequence", &sequence.to_string());
+        }
+        Ok(endpoint)
+    }
+
     /// List the authenticated subject's personal threads.
     pub async fn threads(
         &self,
@@ -454,4 +565,23 @@ fn encode_workspace_path(path: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_attachment_url_is_websocket_and_never_carries_authority() {
+        let client = WorkspaceClient::new("https://workspace.example.test/base/").expect("client");
+        let endpoint = client
+            .terminal_attachment_url("terminal/one", Some(41))
+            .expect("endpoint");
+        assert_eq!(endpoint.scheme(), "wss");
+        assert_eq!(
+            endpoint.as_str(),
+            "wss://workspace.example.test/base/v1/terminals/terminal%2Fone/attach?from_sequence=41"
+        );
+        assert!(!endpoint.as_str().contains("Bearer"));
+    }
 }

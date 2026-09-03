@@ -7,12 +7,15 @@ use sqlx::any::{AnyPoolOptions, AnyRow};
 use sqlx::{AnyPool, Row as _};
 use tokio::sync::OnceCell;
 use workspace_core::{
-    CodingSession, CodingSessionState, CreateCodingSession, CreateMessage, CreateThread,
-    MaterializationLimits, Message, MessageRole, Project, StartWorkflow, Thread, WorkflowRun,
+    CodingSession, CodingSessionState, CreateCodingSession, CreateMessage, CreateTerminal,
+    CreateThread, MaterializationLimits, Message, MessageRole, Project, StartWorkflow,
+    TerminalExit, TerminalProfile, TerminalSession, TerminalState, Thread, WorkflowRun,
     WorkflowRunState,
 };
 
 use crate::Authority;
+
+const MAX_ACTIVE_TERMINALS_PER_SESSION: i64 = 8;
 
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS workspace_projects (project_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, forge_instance_ref TEXT NOT NULL, provider_project_ref TEXT NOT NULL, path_with_namespace TEXT NOT NULL, name TEXT NOT NULL, default_branch TEXT, web_url TEXT NOT NULL, created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL, UNIQUE (tenant_id, forge_instance_ref, provider_project_ref))",
@@ -23,6 +26,8 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS workspace_project_agents (tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, agent_id TEXT NOT NULL, created_at_ms BIGINT NOT NULL, PRIMARY KEY (tenant_id, project_id))",
     "CREATE TABLE IF NOT EXISTS workspace_coding_sessions (session_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, owner_subject TEXT NOT NULL, source_revision TEXT NOT NULL, idempotency_key TEXT NOT NULL, base_materialization_ref TEXT, working_materialization_ref TEXT, manifest_sha256 TEXT, state TEXT NOT NULL, failure_code TEXT, max_files BIGINT NOT NULL, max_total_bytes BIGINT NOT NULL, max_file_bytes BIGINT NOT NULL, created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL, UNIQUE (tenant_id, owner_subject, project_id, idempotency_key))",
     "CREATE INDEX IF NOT EXISTS workspace_coding_sessions_owner ON workspace_coding_sessions (tenant_id, project_id, owner_subject, created_at_ms)",
+    "CREATE TABLE IF NOT EXISTS workspace_terminals (terminal_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, coding_session_id TEXT NOT NULL, owner_subject TEXT NOT NULL, agentide_session_id TEXT NOT NULL, authority_grant_id TEXT NOT NULL, profile_json TEXT NOT NULL, initial_columns BIGINT NOT NULL, initial_rows BIGINT NOT NULL, idempotency_key TEXT NOT NULL, substrate_session_ref TEXT, process_id TEXT, state TEXT NOT NULL, exit_code BIGINT, exit_signal TEXT, failure_code TEXT, created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL, UNIQUE (tenant_id, owner_subject, coding_session_id, idempotency_key))",
+    "CREATE INDEX IF NOT EXISTS workspace_terminals_owner ON workspace_terminals (tenant_id, coding_session_id, owner_subject, created_at_ms)",
     "CREATE TABLE IF NOT EXISTS workspace_workflow_runs (run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, actor_subject TEXT NOT NULL, definition_id TEXT NOT NULL, branch TEXT NOT NULL, commit_ref TEXT NOT NULL, idempotency_key TEXT NOT NULL, state TEXT NOT NULL, failure_code TEXT, created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL, UNIQUE (tenant_id, actor_subject, project_id, idempotency_key))",
 ];
 
@@ -50,6 +55,21 @@ pub enum StoreError {
 pub enum SessionReservation {
     New(CodingSession),
     Existing(CodingSession),
+}
+
+/// Whether an idempotent terminal reservation was newly admitted.
+pub enum TerminalReservation {
+    New(StoredTerminal),
+    Existing(StoredTerminal),
+}
+
+/// Durable terminal row including the opaque Substrate reference used only by Workspace.
+#[derive(Clone)]
+pub struct StoredTerminal {
+    pub public: TerminalSession,
+    pub substrate_session_ref: Option<String>,
+    pub initial_columns: u16,
+    pub initial_rows: u16,
 }
 
 /// Tenant-scoped durable Workspace state.
@@ -544,6 +564,234 @@ impl Store {
         self.coding_session(authority, session_id).await
     }
 
+    /// Durably reserve one terminal before asking Substrate to create a PTY session.
+    pub async fn reserve_terminal(
+        &self,
+        authority: &Authority,
+        coding_session_id: &str,
+        input: &CreateTerminal,
+        profile: &TerminalProfile,
+    ) -> Result<TerminalReservation, StoreError> {
+        self.ensure_schema().await?;
+        if let Some(row) = sqlx::query("SELECT terminal_id, coding_session_id, owner_subject, agentide_session_id, authority_grant_id, profile_json, initial_columns, initial_rows, substrate_session_ref, process_id, state, exit_code, exit_signal, failure_code, created_at_ms, updated_at_ms FROM workspace_terminals WHERE tenant_id = ? AND owner_subject = ? AND coding_session_id = ? AND idempotency_key = ?")
+            .bind(&authority.tenant_id)
+            .bind(&authority.subject)
+            .bind(coding_session_id)
+            .bind(&input.idempotency_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(StoreError::Database)?
+        {
+            let terminal = terminal_from_row(&row)?;
+            if terminal.public.agentide_session_id != input.agentide_session_id
+                || terminal.public.authority_grant_id != input.authority_grant_id
+                || terminal.public.profile != *profile
+                || terminal.initial_columns != input.columns
+                || terminal.initial_rows != input.rows
+            {
+                return Err(StoreError::Conflict);
+            }
+            return Ok(TerminalReservation::Existing(terminal));
+        }
+        let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workspace_terminals WHERE tenant_id = ? AND owner_subject = ? AND coding_session_id = ? AND state IN ('preparing', 'running', 'unknown')")
+            .bind(&authority.tenant_id)
+            .bind(&authority.subject)
+            .bind(coding_session_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        if active >= MAX_ACTIVE_TERMINALS_PER_SESSION {
+            return Err(StoreError::Conflict);
+        }
+        let now = now_ms()?;
+        let terminal_id = random_id("terminal")?;
+        let profile_json = serde_json::to_string(profile).map_err(|_| StoreError::Corrupt)?;
+        let result = sqlx::query("INSERT INTO workspace_terminals (terminal_id, tenant_id, coding_session_id, owner_subject, agentide_session_id, authority_grant_id, profile_json, initial_columns, initial_rows, idempotency_key, substrate_session_ref, process_id, state, exit_code, exit_signal, failure_code, created_at_ms, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 'preparing', NULL, NULL, NULL, ?, ?) ON CONFLICT (tenant_id, owner_subject, coding_session_id, idempotency_key) DO NOTHING")
+            .bind(&terminal_id)
+            .bind(&authority.tenant_id)
+            .bind(coding_session_id)
+            .bind(&authority.subject)
+            .bind(&input.agentide_session_id)
+            .bind(&input.authority_grant_id)
+            .bind(profile_json)
+            .bind(i64::from(input.columns))
+            .bind(i64::from(input.rows))
+            .bind(&input.idempotency_key)
+            .bind(as_i64(now)?)
+            .bind(as_i64(now)?)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        if result.rows_affected() == 1 {
+            return self
+                .terminal(authority, &terminal_id)
+                .await
+                .map(TerminalReservation::New);
+        }
+        let row = sqlx::query("SELECT terminal_id, coding_session_id, owner_subject, agentide_session_id, authority_grant_id, profile_json, initial_columns, initial_rows, substrate_session_ref, process_id, state, exit_code, exit_signal, failure_code, created_at_ms, updated_at_ms FROM workspace_terminals WHERE tenant_id = ? AND owner_subject = ? AND coding_session_id = ? AND idempotency_key = ?")
+            .bind(&authority.tenant_id)
+            .bind(&authority.subject)
+            .bind(coding_session_id)
+            .bind(&input.idempotency_key)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        let terminal = terminal_from_row(&row)?;
+        if terminal.public.agentide_session_id != input.agentide_session_id
+            || terminal.public.authority_grant_id != input.authority_grant_id
+            || terminal.public.profile != *profile
+            || terminal.initial_columns != input.columns
+            || terminal.initial_rows != input.rows
+        {
+            return Err(StoreError::Conflict);
+        }
+        Ok(TerminalReservation::Existing(terminal))
+    }
+
+    /// List durable terminal metadata for one owned coding session.
+    pub async fn terminals(
+        &self,
+        authority: &Authority,
+        coding_session_id: &str,
+    ) -> Result<Vec<StoredTerminal>, StoreError> {
+        self.ensure_schema().await?;
+        let rows = sqlx::query("SELECT terminal_id, coding_session_id, owner_subject, agentide_session_id, authority_grant_id, profile_json, initial_columns, initial_rows, substrate_session_ref, process_id, state, exit_code, exit_signal, failure_code, created_at_ms, updated_at_ms FROM workspace_terminals WHERE tenant_id = ? AND owner_subject = ? AND coding_session_id = ? ORDER BY created_at_ms")
+            .bind(&authority.tenant_id)
+            .bind(&authority.subject)
+            .bind(coding_session_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        rows.iter().map(terminal_from_row).collect()
+    }
+
+    /// Read one terminal only through its tenant and owner coordinates.
+    pub async fn terminal(
+        &self,
+        authority: &Authority,
+        terminal_id: &str,
+    ) -> Result<StoredTerminal, StoreError> {
+        self.ensure_schema().await?;
+        let row = sqlx::query("SELECT terminal_id, coding_session_id, owner_subject, agentide_session_id, authority_grant_id, profile_json, initial_columns, initial_rows, substrate_session_ref, process_id, state, exit_code, exit_signal, failure_code, created_at_ms, updated_at_ms FROM workspace_terminals WHERE tenant_id = ? AND owner_subject = ? AND terminal_id = ?")
+            .bind(&authority.tenant_id)
+            .bind(&authority.subject)
+            .bind(terminal_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(StoreError::Database)?
+            .ok_or(StoreError::NotFound)?;
+        terminal_from_row(&row)
+    }
+
+    /// Publish the exact Substrate PTY and process identities after successful creation.
+    pub async fn complete_terminal(
+        &self,
+        authority: &Authority,
+        terminal_id: &str,
+        substrate_session_ref: &str,
+        process_id: &str,
+    ) -> Result<StoredTerminal, StoreError> {
+        let now = now_ms()?;
+        let result = sqlx::query("UPDATE workspace_terminals SET substrate_session_ref = ?, process_id = ?, state = 'running', failure_code = NULL, updated_at_ms = ? WHERE tenant_id = ? AND owner_subject = ? AND terminal_id = ? AND state = 'preparing' AND (substrate_session_ref IS NULL OR substrate_session_ref = ?)")
+            .bind(substrate_session_ref)
+            .bind(process_id)
+            .bind(as_i64(now)?)
+            .bind(&authority.tenant_id)
+            .bind(&authority.subject)
+            .bind(terminal_id)
+            .bind(substrate_session_ref)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::Conflict);
+        }
+        self.terminal(authority, terminal_id).await
+    }
+
+    /// Record a named creation refusal without publishing a partial live terminal.
+    pub async fn refuse_terminal(
+        &self,
+        authority: &Authority,
+        terminal_id: &str,
+        failure_code: &str,
+        unknown: bool,
+    ) -> Result<StoredTerminal, StoreError> {
+        let state = if unknown { "unknown" } else { "refused" };
+        let now = now_ms()?;
+        let result = sqlx::query("UPDATE workspace_terminals SET state = ?, failure_code = ?, substrate_session_ref = NULL, process_id = NULL, updated_at_ms = ? WHERE tenant_id = ? AND owner_subject = ? AND terminal_id = ? AND state = 'preparing'")
+            .bind(state)
+            .bind(failure_code)
+            .bind(as_i64(now)?)
+            .bind(&authority.tenant_id)
+            .bind(&authority.subject)
+            .bind(terminal_id)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::Conflict);
+        }
+        self.terminal(authority, terminal_id).await
+    }
+
+    /// Record an observed process state without retaining the request credential in a background task.
+    pub async fn observe_terminal(
+        &self,
+        tenant_id: &str,
+        owner_subject: &str,
+        terminal_id: &str,
+        state: TerminalState,
+        exit: Option<&TerminalExit>,
+    ) -> Result<(), StoreError> {
+        self.ensure_schema().await?;
+        let now = now_ms()?;
+        let exit_code = exit.and_then(|exit| exit.code).map(i64::from);
+        let exit_signal = exit.and_then(|exit| exit.signal.as_deref());
+        let result = sqlx::query("UPDATE workspace_terminals SET state = ?, exit_code = ?, exit_signal = ?, updated_at_ms = ? WHERE tenant_id = ? AND owner_subject = ? AND terminal_id = ? AND state IN ('running', 'unknown')")
+            .bind(terminal_state_name(state))
+            .bind(exit_code)
+            .bind(exit_signal)
+            .bind(as_i64(now)?)
+            .bind(tenant_id)
+            .bind(owner_subject)
+            .bind(terminal_id)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        if result.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::NotFound)
+        }
+    }
+
+    /// Mark an explicitly killed or session-cleaned terminal and forget its Substrate reference.
+    pub async fn complete_terminal_termination(
+        &self,
+        authority: &Authority,
+        terminal_id: &str,
+        exit: Option<&TerminalExit>,
+    ) -> Result<StoredTerminal, StoreError> {
+        let now = now_ms()?;
+        let exit_code = exit.and_then(|exit| exit.code).map(i64::from);
+        let exit_signal = exit.and_then(|exit| exit.signal.as_deref());
+        let result = sqlx::query("UPDATE workspace_terminals SET state = 'terminated', substrate_session_ref = NULL, exit_code = ?, exit_signal = ?, failure_code = NULL, updated_at_ms = ? WHERE tenant_id = ? AND owner_subject = ? AND terminal_id = ?")
+            .bind(exit_code)
+            .bind(exit_signal)
+            .bind(as_i64(now)?)
+            .bind(&authority.tenant_id)
+            .bind(&authority.subject)
+            .bind(terminal_id)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::NotFound);
+        }
+        self.terminal(authority, terminal_id).await
+    }
+
     /// List only the current subject's personal project threads.
     pub async fn threads(
         &self,
@@ -907,6 +1155,84 @@ fn coding_session_from_row(row: &AnyRow) -> Result<CodingSession, StoreError> {
     })
 }
 
+fn terminal_from_row(row: &AnyRow) -> Result<StoredTerminal, StoreError> {
+    let profile_json: String = row
+        .try_get("profile_json")
+        .map_err(|_| StoreError::Corrupt)?;
+    let profile =
+        serde_json::from_str::<TerminalProfile>(&profile_json).map_err(|_| StoreError::Corrupt)?;
+    let state: String = row.try_get("state").map_err(|_| StoreError::Corrupt)?;
+    let exit_code = row
+        .try_get::<Option<i64>, _>("exit_code")
+        .map_err(|_| StoreError::Corrupt)?
+        .map(|code| i32::try_from(code).map_err(|_| StoreError::Corrupt))
+        .transpose()?;
+    let exit_signal = row
+        .try_get::<Option<String>, _>("exit_signal")
+        .map_err(|_| StoreError::Corrupt)?;
+    let exit = (exit_code.is_some() || exit_signal.is_some()).then_some(TerminalExit {
+        code: exit_code,
+        signal: exit_signal,
+    });
+    let initial_columns = u16::try_from(
+        row.try_get::<i64, _>("initial_columns")
+            .map_err(|_| StoreError::Corrupt)?,
+    )
+    .map_err(|_| StoreError::Corrupt)?;
+    let initial_rows = u16::try_from(
+        row.try_get::<i64, _>("initial_rows")
+            .map_err(|_| StoreError::Corrupt)?,
+    )
+    .map_err(|_| StoreError::Corrupt)?;
+    Ok(StoredTerminal {
+        public: TerminalSession {
+            id: row
+                .try_get("terminal_id")
+                .map_err(|_| StoreError::Corrupt)?,
+            coding_session_id: row
+                .try_get("coding_session_id")
+                .map_err(|_| StoreError::Corrupt)?,
+            agentide_session_id: row
+                .try_get("agentide_session_id")
+                .map_err(|_| StoreError::Corrupt)?,
+            authority_grant_id: row
+                .try_get("authority_grant_id")
+                .map_err(|_| StoreError::Corrupt)?,
+            profile,
+            actor: row
+                .try_get("owner_subject")
+                .map_err(|_| StoreError::Corrupt)?,
+            process_id: row.try_get("process_id").map_err(|_| StoreError::Corrupt)?,
+            state: match state.as_str() {
+                "preparing" => TerminalState::Preparing,
+                "running" => TerminalState::Running,
+                "exited" => TerminalState::Exited,
+                "terminated" => TerminalState::Terminated,
+                "refused" => TerminalState::Refused,
+                "unknown" => TerminalState::Unknown,
+                _ => return Err(StoreError::Corrupt),
+            },
+            exit,
+            failure_code: row
+                .try_get("failure_code")
+                .map_err(|_| StoreError::Corrupt)?,
+            created_at_ms: from_i64(
+                row.try_get("created_at_ms")
+                    .map_err(|_| StoreError::Corrupt)?,
+            )?,
+            updated_at_ms: from_i64(
+                row.try_get("updated_at_ms")
+                    .map_err(|_| StoreError::Corrupt)?,
+            )?,
+        },
+        substrate_session_ref: row
+            .try_get("substrate_session_ref")
+            .map_err(|_| StoreError::Corrupt)?,
+        initial_columns,
+        initial_rows,
+    })
+}
+
 fn thread_from_row(row: &AnyRow) -> Result<Thread, StoreError> {
     Ok(Thread {
         id: row.try_get("thread_id").map_err(|_| StoreError::Corrupt)?,
@@ -998,6 +1324,17 @@ fn session_state_name(state: CodingSessionState) -> &'static str {
         CodingSessionState::Unknown => "unknown",
         CodingSessionState::Closing => "closing",
         CodingSessionState::Closed => "closed",
+    }
+}
+
+fn terminal_state_name(state: TerminalState) -> &'static str {
+    match state {
+        TerminalState::Preparing => "preparing",
+        TerminalState::Running => "running",
+        TerminalState::Exited => "exited",
+        TerminalState::Terminated => "terminated",
+        TerminalState::Refused => "refused",
+        TerminalState::Unknown => "unknown",
     }
 }
 
@@ -1188,6 +1525,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(closed.state, CodingSessionState::Closed);
+    }
+
+    fn terminal_profile(id: &str) -> TerminalProfile {
+        TerminalProfile {
+            id: id.to_owned(),
+            label: "Hosted Rust toolchain".to_owned(),
+            runtime_ref: "substrate:workspace-default@sha256:test".to_owned(),
+            shell: "/bin/sh".to_owned(),
+            arguments: vec!["-l".to_owned()],
+            working_directory: "/workspace".to_owned(),
+            environment: [("TERM".to_owned(), "xterm-256color".to_owned())]
+                .into_iter()
+                .collect(),
+            workspace_access: workspace_core::TerminalWorkspaceAccess::ReadWrite,
+            network: workspace_core::TerminalNetworkPosture::None,
+            limits: workspace_core::TerminalLimits {
+                timeout_ms: 60_000,
+                cpu_millis: 60_000,
+                memory_bytes: 128 * 1024 * 1024,
+                processes: 64,
+                output_bytes: 1024 * 1024,
+                input_bytes: 1024 * 1024,
+                frame_bytes: 64 * 1024,
+                queued_frames: 16,
+                lease_ttl_ms: 60_000,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_reservation_is_exact_idempotent_and_owner_scoped() {
+        let store = store().await;
+        let owner = authority("person:owner");
+        let other = authority("person:other");
+        store.open_project(&owner, &project()).await.unwrap();
+        let SessionReservation::New(session) = store
+            .reserve_coding_session(
+                &owner,
+                "project-one",
+                &CreateCodingSession {
+                    source_revision: "a".repeat(40),
+                    idempotency_key: "terminal-session".to_owned(),
+                },
+                MaterializationLimits {
+                    max_files: 4_096,
+                    max_total_bytes: 256 * 1024 * 1024,
+                    max_file_bytes: 180 * 1024,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("first coding-session reservation must be new");
+        };
+        let input = CreateTerminal {
+            agentide_session_id: "agentide-session-one".to_owned(),
+            authority_grant_id: "grant-one".to_owned(),
+            profile_id: "rust".to_owned(),
+            columns: 120,
+            rows: 36,
+            idempotency_key: "terminal-one".to_owned(),
+        };
+        let profile = terminal_profile("rust");
+        let TerminalReservation::New(reserved) = store
+            .reserve_terminal(&owner, &session.id, &input, &profile)
+            .await
+            .unwrap()
+        else {
+            panic!("first terminal reservation must be new");
+        };
+        let TerminalReservation::Existing(replayed) = store
+            .reserve_terminal(&owner, &session.id, &input, &profile)
+            .await
+            .unwrap()
+        else {
+            panic!("same terminal reservation must replay");
+        };
+        assert_eq!(replayed.public.id, reserved.public.id);
+        assert!(matches!(
+            store.terminal(&other, &reserved.public.id).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store
+                .reserve_terminal(&owner, &session.id, &input, &terminal_profile("other"))
+                .await,
+            Err(StoreError::Conflict)
+        ));
+
+        let running = store
+            .complete_terminal(&owner, &reserved.public.id, "pty-session", "process-one")
+            .await
+            .unwrap();
+        assert_eq!(running.public.state, TerminalState::Running);
+        assert_eq!(running.public.process_id.as_deref(), Some("process-one"));
+        assert_eq!(
+            running.substrate_session_ref.as_deref(),
+            Some("pty-session")
+        );
+
+        store
+            .observe_terminal(
+                &owner.tenant_id,
+                &owner.subject,
+                &reserved.public.id,
+                TerminalState::Exited,
+                Some(&TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let exited = store.terminal(&owner, &reserved.public.id).await.unwrap();
+        assert_eq!(exited.public.state, TerminalState::Exited);
+        assert_eq!(exited.public.exit.and_then(|exit| exit.code), Some(0));
     }
 
     #[tokio::test]

@@ -1,0 +1,28 @@
+[
+  {
+    "id": "rust-stable",
+    "label": "Rust stable",
+    "runtime_ref": "substrate:workspace-default@sha256:deployment-owned",
+    "shell": "/bin/sh",
+    "arguments": ["-l"],
+    "working_directory": "/workspace",
+    "environment": {
+      "COLORTERM": "truecolor",
+      "LANG": "C.UTF-8",
+      "TERM": "xterm-256color"
+    },
+    "workspace_access": "read_write",
+    "network": "none",
+    "limits": {
+      "timeout_ms": 3600000,
+      "cpu_millis": 3600000,
+      "memory_bytes": 536870912,
+      "processes": 256,
+      "output_bytes": 1048576,
+      "input_bytes": 16777216,
+      "frame_bytes": 65536,
+      "queued_frames": 16,
+      "lease_ttl_ms": 3600000
+    }
+  }
+]

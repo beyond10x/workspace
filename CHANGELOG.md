@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add deployment-declared interactive terminal profiles over the existing Substrate working
+  materialization. Workspace verifies the authenticated human's exact AgentIDE
+  `interactive_terminal` grant through generated Service SDK projections, persists lifecycle but
+  never scrollback, and exposes bounded sequenced WebSocket replay with detach, explicit kill, and
+  coding-session cleanup semantics.
+
 ## 0.2.2 - 2026-09-03
 
 - Request Substrate scopes in Identity's canonical lexical order so the access-token client

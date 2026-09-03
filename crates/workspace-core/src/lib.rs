@@ -2,6 +2,8 @@
 
 //! Provider-neutral repository project and conversation contracts.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// A repository visible through one current Connector grant.
@@ -135,6 +137,124 @@ pub struct CodingSession {
     pub state: CodingSessionState,
     pub failure_code: Option<String>,
     pub limits: MaterializationLimits,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// Deployment-owned description of one interactive Substrate environment.
+///
+/// The browser selects only `id`. Every executable, argument, environment value, resource bound,
+/// workspace posture and network posture is fixed by the deployment before a request arrives.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalProfile {
+    /// Stable deployment-local profile identity.
+    pub id: String,
+    /// Human-readable toolchain label.
+    pub label: String,
+    /// Visible immutable runtime or toolchain reference.
+    pub runtime_ref: String,
+    /// Executable launched inside Substrate confinement.
+    pub shell: String,
+    /// Fixed arguments supplied to the shell.
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    /// Fixed working directory. The first hosted release admits `/workspace` only.
+    pub working_directory: String,
+    /// Fixed environment values from a small, non-secret terminal allowlist.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    /// Workspace access applied by Substrate.
+    pub workspace_access: TerminalWorkspaceAccess,
+    /// Network posture applied by Substrate. The first hosted release admits `none` only.
+    pub network: TerminalNetworkPosture,
+    /// Exact process and output bounds.
+    pub limits: TerminalLimits,
+}
+
+/// Writable workspace posture of one deployment-declared terminal profile.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalWorkspaceAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+/// Network posture of a hosted terminal.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalNetworkPosture {
+    None,
+}
+
+/// Deployment-owned execution bounds for a hosted terminal.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalLimits {
+    pub timeout_ms: u64,
+    pub cpu_millis: u64,
+    pub memory_bytes: u64,
+    pub processes: u32,
+    pub output_bytes: u64,
+    pub input_bytes: u64,
+    pub frame_bytes: u64,
+    pub queued_frames: u32,
+    pub lease_ttl_ms: u64,
+}
+
+/// Request to create one confined interactive terminal.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CreateTerminal {
+    /// `AgentIDE` coordination session bound to this exact Workspace session.
+    pub agentide_session_id: String,
+    /// Current explicit `interactive_terminal` grant to the authenticated human.
+    pub authority_grant_id: String,
+    /// Deployment-declared profile identity.
+    pub profile_id: String,
+    /// Initial PTY columns.
+    pub columns: u16,
+    /// Initial PTY rows.
+    pub rows: u16,
+    /// Caller idempotency key. Reuse with different intent is a conflict.
+    pub idempotency_key: String,
+}
+
+/// Durable hosted-terminal lifecycle. Attachment is deliberately not a terminal state: closing a
+/// browser pane detaches and leaves a running process alive.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalState {
+    Preparing,
+    Running,
+    Exited,
+    Terminated,
+    Refused,
+    Unknown,
+}
+
+/// Exit details observed from Substrate.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalExit {
+    pub code: Option<i32>,
+    pub signal: Option<String>,
+}
+
+/// Durable terminal metadata. Raw PTY bytes and attachment credentials are never represented here.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalSession {
+    pub id: String,
+    pub coding_session_id: String,
+    pub agentide_session_id: String,
+    pub authority_grant_id: String,
+    pub profile: TerminalProfile,
+    pub actor: String,
+    pub process_id: Option<String>,
+    pub state: TerminalState,
+    pub exit: Option<TerminalExit>,
+    pub failure_code: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }

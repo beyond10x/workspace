@@ -61,6 +61,31 @@ release resolves the `workspace` selector; declared plan, agent-attempt, publica
 pair selectors fail explicitly until their owning services supply immutable references. Browsers do
 not compute authoritative diffs.
 
+Interactive terminals are another projection of the same ready coding session; they do not create
+a filesystem or shell beside Workspace. `WORKSPACE_TERMINAL_PROFILES_PATH` may name a bounded JSON
+array of deployment-declared profiles such as
+[`terminal-profiles.example.json`](terminal-profiles.example.json). With no profile file, terminal
+creation is explicitly unavailable. A profile fixes the visible runtime/toolchain reference,
+absolute shell and arguments, `/workspace` working directory, sanitized non-secret environment,
+read-only or read-write access to the existing working materialization, no-network posture, and
+Substrate resource/lease bounds. Request bodies can select a profile but cannot add a command,
+environment variable, network route, mount, or credential.
+
+Workspace admits `POST /v1/sessions/{session_id}/terminals` only after it uses Connectors to read
+the AgentIDE generated Service SDK projections and verifies an active `interactive_terminal` grant
+for the authenticated human, exact AgentIDE/Workspace session binding, project, source revision,
+and project-root path. Attach revalidates the grant so expiry or revocation takes effect before a
+reconnect. `GET /v1/terminals/{terminal_id}/attach` upgrades to WebSocket: browser binary frames
+are PTY input, server binary frames begin with an eight-byte big-endian monotonic sequence followed
+by output, and JSON frames carry resize, signal, replay, lifecycle, refusal, and exit details.
+Workspace retains only a 4 MiB process-local replay ring; durable storage contains lifecycle and
+opaque Substrate references, never scrollback. Closing a socket detaches. Only explicit terminal
+termination or coding-session close kills and retires the Substrate process.
+
+The PTY is always created through the configured remote Substrate client against the coding
+session's existing working materialization. It is never a Workspace, Devcenter, or host shell;
+terminal profiles cannot enable ambient credentials or undeclared network access.
+
 ## First contract
 
 - discover all GitLab projects visible through the subject's current Connections;
@@ -72,6 +97,8 @@ not compute authoritative diffs.
 - create/list/resume exact-revision coding sessions through the same project API used by Devcenter;
 - browse and edit the session's Substrate working materialization through exact, bounded Workspace
   file contracts, and resolve its diff only against the immutable base materialization;
+- open, reconnect to, detach from, and explicitly terminate profile-bound Substrate PTYs only under
+  a current human `interactive_terminal` grant;
 - provision one project agent and dispatch typed conversation turns containing the prior personal
   thread and a bounded exact-commit context pack;
 - query the official central AEP authority for entities whose indexed `space` is the canonical

@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use aep_client::AepClient;
@@ -13,17 +14,19 @@ use agent_platform_core::{
 };
 use anyhow::{Context, Result, bail};
 use axum::Router;
+use axum::extract::ws::{Message as WebSocketMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, serve};
 use b10x_substrate_sdk::{
-    AccessToken, Client as SubstrateClient, ExecutionPolicy, ExpectedFileState,
-    RefusalClass as SubstrateRefusalClass, SdkError as SubstrateError,
-    Workspace as SubstrateWorkspace,
+    AccessToken, Client as SubstrateClient, ExecutionPolicy, ExpectedFileState, PipeChannel,
+    PipeFrame, PipeSessionState, PtyWindow, RefusalClass as SubstrateRefusalClass,
+    SdkError as SubstrateError, Signal, Workspace as SubstrateWorkspace, WorkspaceAccess,
 };
 use base64::Engine as _;
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use connectors_client::HostedClient;
 use connectors_client::datasource::{
@@ -38,19 +41,25 @@ use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use workspace_core::{
     Branch, ChangeSelector, CodingSession, CodingSessionState, CodingTreeEntry,
-    CodingTreeProjection, CreateCodingSession, CreateMessage, CreateThread, DiffFile, DiffHunk,
-    DiffLine, DiffMode, DiffProjection, DiffRange, EngineeringArtifact, EngineeringArtifactPage,
-    FileConflict, FileExpectedState, FileModificationState, FileProjection, FileRevision,
-    MaterializationLimits, MessageRole, OpenProject, Problem, Project, RepositoryCandidate,
-    RepositoryEntry, RepositoryEntryKind, ResolveDiff, SelectBranch, StartWorkflow,
-    WorkflowDefinition, WriteFile,
+    CodingTreeProjection, CreateCodingSession, CreateMessage, CreateTerminal, CreateThread,
+    DiffFile, DiffHunk, DiffLine, DiffMode, DiffProjection, DiffRange, EngineeringArtifact,
+    EngineeringArtifactPage, FileConflict, FileExpectedState, FileModificationState,
+    FileProjection, FileRevision, MaterializationLimits, MessageRole, OpenProject, Problem,
+    Project, RepositoryCandidate, RepositoryEntry, RepositoryEntryKind, ResolveDiff, SelectBranch,
+    StartWorkflow, TerminalExit, TerminalProfile, TerminalSession, TerminalState,
+    TerminalWorkspaceAccess, WorkflowDefinition, WriteFile,
 };
 
 mod aep;
 mod store;
+mod terminal;
 
 use aep::{AepTransport, RequestCredential};
-use store::{SessionReservation, Store, StoreError};
+use store::{SessionReservation, Store, StoreError, StoredTerminal, TerminalReservation};
+use terminal::{
+    TerminalBroker, TerminalBrokerCommand, TerminalBrokerEvent, TerminalBrokers, TerminalProfiles,
+    TerminalReplayHub,
+};
 
 const CONNECTORS_AUDIENCE: &str = "urn:b10x:connectors";
 const CONNECTORS_SCOPE: &str = "connectors.catalog.read connectors.invoke";
@@ -109,6 +118,9 @@ struct Args {
     substrate_ca_bundle: Option<String>,
     #[arg(long, env = "WORKSPACE_SUBSTRATE_SERVER_IDENTITY")]
     substrate_server_identity: Option<String>,
+    /// Bounded JSON array of deployment-declared interactive terminal profiles.
+    #[arg(long, env = "WORKSPACE_TERMINAL_PROFILES_PATH")]
+    terminal_profiles_path: Option<PathBuf>,
     #[arg(
         long,
         env = "WORKSPACE_DATABASE_URL",
@@ -125,6 +137,9 @@ struct AppState {
     project_agent_model: Option<String>,
     aep: Option<AepConfiguration>,
     substrate: Option<SubstrateConfiguration>,
+    terminal_profiles: TerminalProfiles,
+    terminal_brokers: TerminalBrokers,
+    terminal_replay: TerminalReplayHub,
     store: Store,
 }
 
@@ -206,6 +221,8 @@ async fn main() -> Result<()> {
     };
     let store =
         Store::connect_lazy(&args.database_url).context("invalid database configuration")?;
+    let terminal_profiles = TerminalProfiles::load(args.terminal_profiles_path.as_deref())
+        .map_err(|error| anyhow::anyhow!(error))?;
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("cannot bind {}", args.listen))?;
@@ -218,6 +235,9 @@ async fn main() -> Result<()> {
             project_agent_model: args.project_agent_model,
             aep,
             substrate,
+            terminal_profiles,
+            terminal_brokers: TerminalBrokers::default(),
+            terminal_replay: TerminalReplayHub::default(),
             store,
         }),
     )
@@ -271,6 +291,19 @@ fn router(state: AppState) -> Router {
         )
         .route("/v1/sessions/{session_id}/tree", get(coding_tree))
         .route("/v1/sessions/{session_id}/diff", post(resolve_diff))
+        .route(
+            "/v1/sessions/{session_id}/terminals",
+            get(list_terminals).post(create_terminal),
+        )
+        .route(
+            "/v1/sessions/{session_id}/terminal-profiles",
+            get(list_terminal_profiles),
+        )
+        .route(
+            "/v1/terminals/{terminal_id}",
+            get(get_terminal).delete(terminate_terminal),
+        )
+        .route("/v1/terminals/{terminal_id}/attach", get(attach_terminal))
         .route(
             "/v1/sessions/{session_id}/files/{*path}",
             get(coding_file).put(write_coding_file),
@@ -795,6 +828,960 @@ async fn resolve_diff(
     confidential(Json(projection).into_response())
 }
 
+async fn list_terminal_profiles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Response {
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    if let Err(response) = ready_session_materializations(&state, &authority, &session_id).await {
+        return response;
+    }
+    confidential(Json(state.terminal_profiles.list()).into_response())
+}
+
+async fn list_terminals(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+) -> Response {
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    if let Err(response) = ready_session_materializations(&state, &authority, &session_id).await {
+        return response;
+    }
+    match state.store.terminals(&authority, &session_id).await {
+        Ok(terminals) => confidential(
+            Json(
+                terminals
+                    .into_iter()
+                    .map(|terminal| terminal.public)
+                    .collect::<Vec<_>>(),
+            )
+            .into_response(),
+        ),
+        Err(error) => store_problem(&error),
+    }
+}
+
+async fn get_terminal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(terminal_id): Path<String>,
+) -> Response {
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    let terminal = match state.store.terminal(&authority, &terminal_id).await {
+        Ok(terminal) => terminal,
+        Err(error) => return store_problem(&error),
+    };
+    let coding_session = match state
+        .store
+        .coding_session(&authority, &terminal.public.coding_session_id)
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => return store_problem(&error),
+    };
+    if let Err(response) = accessible_project(&state, &authority, &coding_session.project_id).await
+    {
+        return response;
+    }
+    confidential(Json(terminal.public).into_response())
+}
+
+#[allow(clippy::too_many_lines)] // Admission, durable reservation, Substrate start, and broker claim stay visibly ordered.
+async fn create_terminal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Json(input): Json<CreateTerminal>,
+) -> Response {
+    let window = PtyWindow {
+        columns: u64::from(input.columns),
+        rows: u64::from(input.rows),
+    };
+    if !window.within_bounds()
+        || !valid_ref(&input.agentide_session_id)
+        || !valid_ref(&input.authority_grant_id)
+        || !valid_ref(&input.profile_id)
+        || input.idempotency_key.trim().is_empty()
+        || input.idempotency_key.len() > MAX_MATERIALIZATION_KEY_BYTES
+    {
+        return problem(StatusCode::UNPROCESSABLE_ENTITY, "terminal_request_invalid");
+    }
+    let Some(profile) = state.terminal_profiles.get(&input.profile_id).cloned() else {
+        return problem(StatusCode::FORBIDDEN, "terminal_profile_not_declared");
+    };
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    let (coding_session, _, working) =
+        match ready_session_materializations(&state, &authority, &session_id).await {
+            Ok(materializations) => materializations,
+            Err(response) => return response,
+        };
+    if let Err(response) = verify_terminal_grant(&state, &authority, &coding_session, &input).await
+    {
+        return response;
+    }
+    let reservation = match state
+        .store
+        .reserve_terminal(&authority, &session_id, &input, &profile)
+        .await
+    {
+        Ok(reservation) => reservation,
+        Err(error) => return store_problem(&error),
+    };
+    let terminal = match reservation {
+        TerminalReservation::Existing(terminal)
+            if terminal.public.state != TerminalState::Preparing =>
+        {
+            if matches!(
+                terminal.public.state,
+                TerminalState::Running | TerminalState::Unknown
+            ) && let Err(response) = ensure_terminal_broker(&state, &authority, &terminal).await
+            {
+                return response;
+            }
+            return confidential(Json(terminal.public).into_response());
+        }
+        TerminalReservation::New(terminal) | TerminalReservation::Existing(terminal) => terminal,
+    };
+    let policy = match terminal_policy(&profile) {
+        Ok(policy) => policy,
+        Err(error) => {
+            let _ = state
+                .store
+                .refuse_terminal(
+                    &authority,
+                    &terminal.public.id,
+                    "terminal_profile_invalid",
+                    false,
+                )
+                .await;
+            return substrate_problem(&error);
+        }
+    };
+    let mut builder = working
+        .pty_session(&profile.shell, window)
+        .args(profile.arguments.clone())
+        .allow_environment(b10x_substrate_sdk::BaselineEnvironment::Path)
+        .workspace_access(match profile.workspace_access {
+            TerminalWorkspaceAccess::ReadOnly => WorkspaceAccess::ReadOnly,
+            TerminalWorkspaceAccess::ReadWrite => WorkspaceAccess::ReadWrite,
+        })
+        .policy(policy)
+        .lease(Duration::from_millis(profile.limits.lease_ttl_ms))
+        .input_limit_bytes(profile.limits.input_bytes)
+        .frame_limit_bytes(profile.limits.frame_bytes)
+        .queued_frames(profile.limits.queued_frames)
+        .operation_id(substrate_operation_id(
+            &session_id,
+            &["terminal", &terminal.public.id, "create"],
+        ));
+    for (name, value) in &profile.environment {
+        builder = builder.env(name, value);
+    }
+    match builder.start().await {
+        Ok(session) => {
+            let terminal = match state
+                .store
+                .complete_terminal(
+                    &authority,
+                    &terminal.public.id,
+                    session.id(),
+                    &session.observation().exec_id,
+                )
+                .await
+            {
+                Ok(terminal) => terminal,
+                Err(error) => return store_problem(&error),
+            };
+            let channel = match session.attach().await {
+                Ok(channel) => channel,
+                Err(error) => {
+                    let _ = state
+                        .store
+                        .observe_terminal(
+                            &authority.tenant_id,
+                            &authority.subject,
+                            &terminal.public.id,
+                            TerminalState::Unknown,
+                            None,
+                        )
+                        .await;
+                    return substrate_problem(&error);
+                }
+            };
+            let _broker = register_terminal_broker(&state, &authority, &terminal, channel).await;
+            confidential((StatusCode::CREATED, Json(terminal.public)).into_response())
+        }
+        Err(error) => {
+            let unknown = matches!(error, SubstrateError::UnknownOperation { .. });
+            let _ = state
+                .store
+                .refuse_terminal(
+                    &authority,
+                    &terminal.public.id,
+                    if unknown {
+                        "terminal_creation_unknown"
+                    } else {
+                        "terminal_creation_refused"
+                    },
+                    unknown,
+                )
+                .await;
+            substrate_problem(&error)
+        }
+    }
+}
+
+async fn terminate_terminal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(terminal_id): Path<String>,
+) -> Response {
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    let terminal = match state.store.terminal(&authority, &terminal_id).await {
+        Ok(terminal) => terminal,
+        Err(error) => return store_problem(&error),
+    };
+    let coding_session = match state
+        .store
+        .coding_session(&authority, &terminal.public.coding_session_id)
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => return store_problem(&error),
+    };
+    if let Err(response) = accessible_project(&state, &authority, &coding_session.project_id).await
+    {
+        return response;
+    }
+    if terminal.public.state == TerminalState::Terminated {
+        return confidential(Json(terminal.public).into_response());
+    }
+    let Some(substrate_ref) = terminal.substrate_session_ref.as_deref() else {
+        return problem(StatusCode::CONFLICT, "terminal_process_unavailable");
+    };
+    let client = match substrate_client(&state, &authority).await {
+        Ok(Some(client)) => client,
+        Ok(None) => return problem(StatusCode::SERVICE_UNAVAILABLE, "substrate_unavailable"),
+        Err(response) => return response,
+    };
+    let mut session = match client.get_pipe_session(substrate_ref).await {
+        Ok(session) => session,
+        Err(SubstrateError::Refusal(refusal)) if refusal.code == "resource.not-found" => {
+            let stored = state
+                .store
+                .complete_terminal_termination(&authority, &terminal_id, None)
+                .await;
+            state.terminal_replay.remove(&terminal_id).await;
+            return match stored {
+                Ok(terminal) => confidential(Json(terminal.public).into_response()),
+                Err(error) => store_problem(&error),
+            };
+        }
+        Err(error) => return substrate_problem(&error),
+    };
+    if let Err(error) = session
+        .signal_with_operation_id(
+            Signal::Kill,
+            Duration::from_millis(1),
+            Some(substrate_operation_id(
+                &terminal.public.coding_session_id,
+                &["terminal", &terminal_id, "kill"],
+            )),
+        )
+        .await
+    {
+        return substrate_problem(&error);
+    }
+    let exit = terminal_exit(session.observation().exit.as_ref());
+    if let Err(error) = session
+        .retire_with_operation_id(Some(substrate_operation_id(
+            &terminal.public.coding_session_id,
+            &["terminal", &terminal_id, "retire"],
+        )))
+        .await
+    {
+        return substrate_problem(&error);
+    }
+    state.terminal_replay.remove(&terminal_id).await;
+    match state
+        .store
+        .complete_terminal_termination(&authority, &terminal_id, exit.as_ref())
+        .await
+    {
+        Ok(terminal) => confidential(Json(terminal.public).into_response()),
+        Err(error) => store_problem(&error),
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct TerminalAttachQuery {
+    from_sequence: Option<u64>,
+}
+
+async fn attach_terminal(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(terminal_id): Path<String>,
+    query: Result<Query<TerminalAttachQuery>, axum::extract::rejection::QueryRejection>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let Ok(Query(query)) = query else {
+        return problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "terminal_replay_cursor_invalid",
+        );
+    };
+    let authority = match authenticate(&state, &headers).await {
+        Ok(authority) => authority,
+        Err(response) => return response,
+    };
+    let terminal = match state.store.terminal(&authority, &terminal_id).await {
+        Ok(terminal) => terminal,
+        Err(error) => return store_problem(&error),
+    };
+    if !matches!(
+        terminal.public.state,
+        TerminalState::Running | TerminalState::Unknown
+    ) {
+        return problem(StatusCode::CONFLICT, "terminal_not_running");
+    }
+    let coding_session = match state
+        .store
+        .coding_session(&authority, &terminal.public.coding_session_id)
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => return store_problem(&error),
+    };
+    if let Err(response) = accessible_project(&state, &authority, &coding_session.project_id).await
+    {
+        return response;
+    }
+    let grant_input = CreateTerminal {
+        agentide_session_id: terminal.public.agentide_session_id.clone(),
+        authority_grant_id: terminal.public.authority_grant_id.clone(),
+        profile_id: terminal.public.profile.id.clone(),
+        columns: terminal.initial_columns,
+        rows: terminal.initial_rows,
+        idempotency_key: "attachment-revalidation".to_owned(),
+    };
+    if let Err(response) =
+        verify_terminal_grant(&state, &authority, &coding_session, &grant_input).await
+    {
+        return response;
+    }
+    let broker = match ensure_terminal_broker(&state, &authority, &terminal).await {
+        Ok(broker) => broker,
+        Err(response) => return response,
+    };
+    let maximum_frame_bytes =
+        usize::try_from(b10x_substrate_sdk::MAX_SESSION_FRAME_BYTES).unwrap_or(usize::MAX);
+    upgrade
+        .max_frame_size(maximum_frame_bytes)
+        .max_message_size(maximum_frame_bytes)
+        .on_upgrade(move |socket| {
+            terminal_websocket(socket, state, terminal.public, query.from_sequence, broker)
+        })
+        .into_response()
+}
+
+async fn ensure_terminal_broker(
+    state: &AppState,
+    authority: &Authority,
+    terminal: &StoredTerminal,
+) -> Result<TerminalBroker, Response> {
+    if let Some(broker) = state.terminal_brokers.get(&terminal.public.id).await {
+        return Ok(broker);
+    }
+    let Some(substrate_ref) = terminal.substrate_session_ref.as_deref() else {
+        return Err(problem(
+            StatusCode::CONFLICT,
+            "terminal_process_unavailable",
+        ));
+    };
+    let client = match substrate_client(state, authority).await {
+        Ok(Some(client)) => client,
+        Ok(None) => {
+            return Err(problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "substrate_unavailable",
+            ));
+        }
+        Err(response) => return Err(response),
+    };
+    let session = client
+        .get_pipe_session(substrate_ref)
+        .await
+        .map_err(|error| substrate_problem(&error))?;
+    if matches!(
+        session.observation().state,
+        PipeSessionState::Exited | PipeSessionState::Cancelled | PipeSessionState::Expired
+    ) {
+        let exit = terminal_exit(session.observation().exit.as_ref());
+        let _ = state
+            .store
+            .observe_terminal(
+                &authority.tenant_id,
+                &authority.subject,
+                &terminal.public.id,
+                TerminalState::Exited,
+                exit.as_ref(),
+            )
+            .await;
+        return Err(problem(StatusCode::CONFLICT, "terminal_not_running"));
+    }
+    if matches!(
+        session.observation().attachment,
+        b10x_substrate_sdk::SessionAttachmentState::Attached
+            | b10x_substrate_sdk::SessionAttachmentState::Consumed
+            | b10x_substrate_sdk::SessionAttachmentState::Uncertain
+    ) {
+        if let Some(broker) = state.terminal_brokers.get(&terminal.public.id).await {
+            return Ok(broker);
+        }
+        let _ = state
+            .store
+            .observe_terminal(
+                &authority.tenant_id,
+                &authority.subject,
+                &terminal.public.id,
+                TerminalState::Unknown,
+                None,
+            )
+            .await;
+        return Err(problem(
+            StatusCode::CONFLICT,
+            "terminal_attachment_unrecoverable",
+        ));
+    }
+    let channel = match session.attach().await {
+        Ok(channel) => channel,
+        Err(error) => {
+            if let Some(broker) = state.terminal_brokers.get(&terminal.public.id).await {
+                return Ok(broker);
+            }
+            return Err(substrate_problem(&error));
+        }
+    };
+    Ok(register_terminal_broker(state, authority, terminal, channel).await)
+}
+
+async fn register_terminal_broker(
+    state: &AppState,
+    authority: &Authority,
+    terminal: &StoredTerminal,
+    channel: PipeChannel,
+) -> TerminalBroker {
+    let (candidate, commands) = TerminalBroker::pair();
+    if let Err(existing) = state
+        .terminal_brokers
+        .insert(&terminal.public.id, candidate.clone())
+        .await
+    {
+        return existing;
+    }
+    let state = state.clone();
+    let terminal = terminal.public.clone();
+    let tenant_id = authority.tenant_id.clone();
+    let owner_subject = authority.subject.clone();
+    let broker = candidate.clone();
+    tokio::spawn(async move {
+        run_terminal_broker(
+            state,
+            terminal,
+            tenant_id,
+            owner_subject,
+            broker,
+            commands,
+            channel,
+        )
+        .await;
+    });
+    candidate
+}
+
+#[allow(clippy::too_many_lines)] // The select loop keeps every terminal event and terminal transition adjacent.
+async fn run_terminal_broker(
+    state: AppState,
+    terminal: TerminalSession,
+    tenant_id: String,
+    owner_subject: String,
+    broker: TerminalBroker,
+    mut commands: tokio::sync::mpsc::Receiver<TerminalBrokerCommand>,
+    mut channel: PipeChannel,
+) {
+    loop {
+        tokio::select! {
+            command = commands.recv() => {
+                let Some(command) = command else { break };
+                let result = match command {
+                    TerminalBrokerCommand::Input(bytes) => channel.write(bytes).await,
+                    TerminalBrokerCommand::Resize { columns, rows } => {
+                        channel.resize(PtyWindow { columns, rows }).await
+                    }
+                    TerminalBrokerCommand::Signal { signal, grace_ms } => {
+                        let signal = match signal.as_str() {
+                            "INT" => Signal::Interrupt,
+                            "TERM" => Signal::Terminate,
+                            "KILL" => Signal::Kill,
+                            _ => unreachable!("browser controls are validated before the broker"),
+                        };
+                        channel.signal(signal, Duration::from_millis(grace_ms)).await
+                    }
+                };
+                if result.is_err() {
+                    let _ = state.store.observe_terminal(
+                        &tenant_id,
+                        &owner_subject,
+                        &terminal.id,
+                        TerminalState::Unknown,
+                        None,
+                    ).await;
+                    broker.publish(TerminalBrokerEvent::Detached {
+                        code: "terminal_transport_unavailable".to_owned(),
+                    });
+                    break;
+                }
+            }
+            substrate = channel.next_frame() => {
+                match substrate {
+                    Ok(Some(PipeFrame::Output { bytes, .. })) => {
+                        let frame = state.terminal_replay.push(&terminal.id, &bytes).await;
+                        broker.publish(TerminalBrokerEvent::Output(frame));
+                    }
+                    Ok(Some(PipeFrame::Exit { state: observed, exit, .. })) => {
+                        let exit = terminal_exit(exit.as_ref());
+                        let _ = state.store.observe_terminal(
+                            &tenant_id,
+                            &owner_subject,
+                            &terminal.id,
+                            TerminalState::Exited,
+                            exit.as_ref(),
+                        ).await;
+                        broker.publish(TerminalBrokerEvent::Exit {
+                            observed_state: format!("{observed:?}").to_ascii_lowercase(),
+                            exit,
+                        });
+                        break;
+                    }
+                    Ok(Some(PipeFrame::ProtocolError { code, .. })) => {
+                        let _ = state.store.observe_terminal(
+                            &tenant_id,
+                            &owner_subject,
+                            &terminal.id,
+                            TerminalState::Unknown,
+                            None,
+                        ).await;
+                        broker.publish(TerminalBrokerEvent::Refused {
+                            code: "terminal_protocol_refused".to_owned(),
+                            substrate_code: Some(code),
+                        });
+                        break;
+                    }
+                    Ok(Some(_)) => {
+                        let _ = state.store.observe_terminal(
+                            &tenant_id,
+                            &owner_subject,
+                            &terminal.id,
+                            TerminalState::Unknown,
+                            None,
+                        ).await;
+                        broker.publish(TerminalBrokerEvent::Refused {
+                            code: "terminal_frame_unsupported".to_owned(),
+                            substrate_code: None,
+                        });
+                        break;
+                    }
+                    Ok(None) | Err(_) => {
+                        let _ = state.store.observe_terminal(
+                            &tenant_id,
+                            &owner_subject,
+                            &terminal.id,
+                            TerminalState::Unknown,
+                            None,
+                        ).await;
+                        broker.publish(TerminalBrokerEvent::Detached {
+                            code: "terminal_transport_unavailable".to_owned(),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let _ = channel.close().await;
+    state.terminal_brokers.remove(&terminal.id).await;
+    state.terminal_replay.remove(&terminal.id).await;
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum TerminalControl {
+    Resize { columns: u64, rows: u64 },
+    Signal { signal: String, grace_ms: u64 },
+}
+
+#[allow(clippy::too_many_lines)] // The closed browser and broker frame vocabularies remain one auditable loop.
+async fn terminal_websocket(
+    mut socket: WebSocket,
+    state: AppState,
+    terminal: TerminalSession,
+    from_sequence: Option<u64>,
+    broker: TerminalBroker,
+) {
+    let mut events = broker.subscribe();
+    let replay = state
+        .terminal_replay
+        .replay(&terminal.id, from_sequence)
+        .await;
+    if !send_terminal_json(
+        &mut socket,
+        serde_json::json!({
+            "kind": "attached",
+            "terminal": terminal,
+            "replay": {
+                "earliest_sequence": replay.earliest_sequence,
+                "latest_sequence": replay.latest_sequence,
+                "complete": replay.complete,
+            }
+        }),
+    )
+    .await
+    {
+        return;
+    }
+    for frame in replay.frames {
+        if !send_terminal_output(&mut socket, frame.sequence, &frame.bytes).await {
+            return;
+        }
+    }
+    loop {
+        tokio::select! {
+            browser = socket.recv() => {
+                let Some(browser) = browser else { break };
+                let Ok(browser) = browser else { break };
+                match browser {
+                    WebSocketMessage::Binary(bytes) => {
+                        if bytes.is_empty()
+                            || u64::try_from(bytes.len()).map_or(
+                                true,
+                                |length| length > terminal.profile.limits.frame_bytes,
+                            )
+                            || broker.command(TerminalBrokerCommand::Input(bytes)).await.is_err()
+                        {
+                            let _ = send_terminal_json(&mut socket, serde_json::json!({
+                                "kind": "refused",
+                                "code": "terminal_input_refused"
+                            })).await;
+                            break;
+                        }
+                    }
+                    WebSocketMessage::Text(text) => {
+                        let control = serde_json::from_str::<TerminalControl>(&text);
+                        let result = match control {
+                            Ok(TerminalControl::Resize { columns, rows }) => {
+                                let window = PtyWindow { columns, rows };
+                                if window.within_bounds() {
+                                    broker.command(TerminalBrokerCommand::Resize { columns, rows }).await
+                                } else {
+                                    Err(())
+                                }
+                            }
+                            Ok(TerminalControl::Signal { signal, grace_ms }) if grace_ms <= 30_000 => {
+                                if matches!(signal.as_str(), "INT" | "TERM" | "KILL") {
+                                    broker.command(TerminalBrokerCommand::Signal { signal, grace_ms }).await
+                                } else {
+                                    Err(())
+                                }
+                            }
+                            _ => Err(()),
+                        };
+                        if result.is_err() {
+                            let _ = send_terminal_json(&mut socket, serde_json::json!({
+                                "kind": "refused",
+                                "code": "terminal_control_refused"
+                            })).await;
+                        }
+                    }
+                    WebSocketMessage::Close(_) => break,
+                    WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_) => {}
+                }
+            }
+            event = events.recv() => {
+                match event {
+                    Ok(TerminalBrokerEvent::Output(frame)) => {
+                        if !send_terminal_output(&mut socket, frame.sequence, &frame.bytes).await {
+                            break;
+                        }
+                    }
+                    Ok(TerminalBrokerEvent::Exit { observed_state, exit }) => {
+                        let _ = send_terminal_json(&mut socket, serde_json::json!({
+                            "kind": "exit",
+                            "state": observed_state,
+                            "exit": exit,
+                        })).await;
+                        break;
+                    }
+                    Ok(TerminalBrokerEvent::Refused { code, substrate_code }) => {
+                        if !send_terminal_json(&mut socket, serde_json::json!({
+                            "kind": "refused",
+                            "code": code,
+                            "substrate_code": substrate_code
+                        })).await {
+                            break;
+                        }
+                        break;
+                    }
+                    Ok(TerminalBrokerEvent::Detached { code }) => {
+                        let _ = send_terminal_json(&mut socket, serde_json::json!({
+                            "kind": "detached",
+                            "code": code
+                        })).await;
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let _ = send_terminal_json(&mut socket, serde_json::json!({
+                            "kind": "refused",
+                            "code": "terminal_slow_reader"
+                        })).await;
+                        break;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+    // Dropping this browser's broker clone never signals or retires the Substrate process.
+}
+
+async fn send_terminal_output(socket: &mut WebSocket, sequence: u64, bytes: &[u8]) -> bool {
+    let mut framed = Vec::with_capacity(8 + bytes.len());
+    framed.extend_from_slice(&sequence.to_be_bytes());
+    framed.extend_from_slice(bytes);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        socket.send(WebSocketMessage::Binary(framed.into())),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+async fn send_terminal_json(socket: &mut WebSocket, value: Value) -> bool {
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        socket.send(WebSocketMessage::Text(value.to_string().into())),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok())
+}
+
+fn terminal_policy(profile: &TerminalProfile) -> Result<ExecutionPolicy, SubstrateError> {
+    ExecutionPolicy::builder()
+        .timeout(Duration::from_millis(profile.limits.timeout_ms))
+        .cpu_time(Duration::from_millis(profile.limits.cpu_millis))
+        .memory_bytes(profile.limits.memory_bytes)
+        .processes(profile.limits.processes)
+        .output_bytes(profile.limits.output_bytes)
+        .build()
+}
+
+fn terminal_exit(exit: Option<&b10x_substrate_sdk::ExecExit>) -> Option<TerminalExit> {
+    exit.map(|exit| TerminalExit {
+        code: exit.code.map(i32::from),
+        signal: exit.signal.map(|signal| match signal {
+            Signal::Interrupt => "INT".to_owned(),
+            Signal::Terminate => "TERM".to_owned(),
+            Signal::Kill => "KILL".to_owned(),
+        }),
+    })
+}
+
+async fn verify_terminal_grant(
+    state: &AppState,
+    authority: &Authority,
+    coding_session: &CodingSession,
+    input: &CreateTerminal,
+) -> Result<(), Response> {
+    let session_output = invoke_unique_operation(
+        state,
+        authority,
+        "agentide.get_session",
+        serde_json::json!({
+            "session_id": input.agentide_session_id,
+            "$page": {"limit": 2}
+        }),
+    )
+    .await
+    .map_err(|_| {
+        problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "terminal_authority_unavailable",
+        )
+    })?;
+    let session_rows = service_rows(&session_output)
+        .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "terminal_authority_invalid"))?;
+    let session_matches = session_rows.iter().any(|row| {
+        terminal_session_row_matches(row, authority, coding_session, &input.agentide_session_id)
+    });
+    if !session_matches {
+        return Err(problem(
+            StatusCode::FORBIDDEN,
+            "terminal_session_binding_refused",
+        ));
+    }
+    let grants_output = invoke_unique_operation(
+        state,
+        authority,
+        "agentide.list_grants",
+        serde_json::json!({
+            "session_id": input.agentide_session_id,
+            "$page": {"limit": 1000}
+        }),
+    )
+    .await
+    .map_err(|_| {
+        problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "terminal_authority_unavailable",
+        )
+    })?;
+    let grant_rows = service_rows(&grants_output)
+        .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "terminal_authority_invalid"))?;
+    let now = Utc::now();
+    let granted = grant_rows.iter().any(|row| {
+        terminal_grant_row_matches(
+            row,
+            authority,
+            &input.agentide_session_id,
+            &input.authority_grant_id,
+            now,
+        )
+    });
+    if granted {
+        Ok(())
+    } else {
+        Err(problem(
+            StatusCode::FORBIDDEN,
+            "interactive_terminal_grant_required",
+        ))
+    }
+}
+
+fn terminal_session_row_matches(
+    row: &Value,
+    authority: &Authority,
+    coding_session: &CodingSession,
+    agentide_session_id: &str,
+) -> bool {
+    row.get("session_id").and_then(Value::as_str) == Some(agentide_session_id)
+        && row.get("workspace_session_id").and_then(Value::as_str)
+            == Some(coding_session.id.as_str())
+        && row.get("project_id").and_then(Value::as_str) == Some(coding_session.project_id.as_str())
+        && row.get("source_revision").and_then(Value::as_str)
+            == Some(coding_session.source_revision.as_str())
+        && row.get("owner").and_then(Value::as_str) == Some(authority.subject.as_str())
+        && row.get("state").and_then(Value::as_str) == Some("Active")
+}
+
+fn terminal_grant_row_matches(
+    row: &Value,
+    authority: &Authority,
+    agentide_session_id: &str,
+    grant_id: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    row.get("grant_id").and_then(Value::as_str) == Some(grant_id)
+        && row.get("session_id").and_then(Value::as_str) == Some(agentide_session_id)
+        && row.get("grantee").and_then(Value::as_str) == Some(authority.subject.as_str())
+        && row.get("state").and_then(Value::as_str) == Some("Active")
+        && row.get("maximum_risk").and_then(Value::as_str) == Some("Medium")
+        && row
+            .get("allowed_intents")
+            .and_then(Value::as_array)
+            .is_some_and(|intents| {
+                intents
+                    .iter()
+                    .any(|intent| intent.as_str() == Some("interactive_terminal"))
+            })
+        && row
+            .get("path_prefixes")
+            .and_then(Value::as_array)
+            .is_some_and(|prefixes| prefixes.iter().any(|prefix| prefix.as_str() == Some("")))
+        && match row.get("expires_at") {
+            None | Some(Value::Null) => true,
+            Some(Value::String(expires_at)) => {
+                DateTime::parse_from_rfc3339(expires_at).is_ok_and(|expires_at| expires_at > now)
+            }
+            Some(_) => false,
+        }
+}
+
+fn service_rows(output: &Value) -> Option<Vec<&Value>> {
+    output
+        .as_array()
+        .or_else(|| output.get("items").and_then(Value::as_array))
+        .or_else(|| output.get("rows").and_then(Value::as_array))
+        .map(|rows| rows.iter().collect())
+}
+
+async fn invoke_unique_operation(
+    state: &AppState,
+    authority: &Authority,
+    operation_ref: &str,
+    input: Value,
+) -> Result<Value, Response> {
+    let described = connector_operation(
+        state,
+        authority,
+        operation::OperationRequest::Describe(operation::DescribeRequest {
+            operation_ref: operation_ref.to_owned(),
+        }),
+    )
+    .await?;
+    let operation::OperationResult::Describe(description) = described else {
+        return Err(problem(
+            StatusCode::BAD_GATEWAY,
+            "connector_protocol_invalid",
+        ));
+    };
+    let [connection] = description.connections.as_slice() else {
+        return Err(problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_operation_binding_invalid",
+        ));
+    };
+    invoke_operation(
+        state,
+        authority,
+        operation::InvokeRequest {
+            operation_ref: operation_ref.to_owned(),
+            connection_ref: connection.connection_ref.clone(),
+            description_ref: description.description_ref,
+            input,
+            approval_evidence_ref: None,
+        },
+    )
+    .await
+}
+
 async fn close_coding_session(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -822,7 +1809,9 @@ async fn close_coding_session(
         }
         Err(response) => return response,
     };
-    let cleanup_unknown = cleanup_materializations(&client, &session).await;
+    let terminal_cleanup_unknown = cleanup_terminals(&state, &authority, &client, &session).await;
+    let cleanup_unknown =
+        terminal_cleanup_unknown || cleanup_materializations(&client, &session).await;
     let stored = if cleanup_unknown {
         state
             .store
@@ -2557,6 +3546,85 @@ fn append_digest_part(digest: &mut Sha256, part: &[u8]) {
     digest.update(part);
 }
 
+async fn cleanup_terminals(
+    state: &AppState,
+    authority: &Authority,
+    client: &SubstrateClient,
+    coding_session: &CodingSession,
+) -> bool {
+    let Ok(terminals) = state.store.terminals(authority, &coding_session.id).await else {
+        return true;
+    };
+    let mut unknown = false;
+    for terminal in terminals {
+        let Some(reference) = terminal.substrate_session_ref.as_deref() else {
+            if matches!(
+                terminal.public.state,
+                TerminalState::Preparing | TerminalState::Running | TerminalState::Unknown
+            ) {
+                unknown = true;
+            }
+            continue;
+        };
+        let mut process = match client.get_pipe_session(reference).await {
+            Ok(process) => process,
+            Err(SubstrateError::Refusal(refusal)) if refusal.code == "resource.not-found" => {
+                if state
+                    .store
+                    .complete_terminal_termination(authority, &terminal.public.id, None)
+                    .await
+                    .is_err()
+                {
+                    unknown = true;
+                }
+                state.terminal_replay.remove(&terminal.public.id).await;
+                continue;
+            }
+            Err(_) => {
+                unknown = true;
+                continue;
+            }
+        };
+        if matches!(
+            process.observation().state,
+            PipeSessionState::Accepted | PipeSessionState::Ready | PipeSessionState::Attached
+        ) && process
+            .signal_with_operation_id(
+                Signal::Kill,
+                Duration::from_millis(1),
+                Some(substrate_operation_id(
+                    &coding_session.id,
+                    &["terminal", &terminal.public.id, "session-close-kill"],
+                )),
+            )
+            .await
+            .is_err()
+        {
+            unknown = true;
+            continue;
+        }
+        let exit = terminal_exit(process.observation().exit.as_ref());
+        if process
+            .retire_with_operation_id(Some(substrate_operation_id(
+                &coding_session.id,
+                &["terminal", &terminal.public.id, "session-close-retire"],
+            )))
+            .await
+            .is_err()
+            || state
+                .store
+                .complete_terminal_termination(authority, &terminal.public.id, exit.as_ref())
+                .await
+                .is_err()
+        {
+            unknown = true;
+            continue;
+        }
+        state.terminal_replay.remove(&terminal.public.id).await;
+    }
+    unknown
+}
+
 async fn cleanup_materializations(client: &SubstrateClient, session: &CodingSession) -> bool {
     let mut unknown = false;
     for (role, reference) in [
@@ -3040,15 +4108,19 @@ async fn shutdown() {
 
 #[cfg(test)]
 mod tests {
+    use connectors_client::operation::OwnerContext;
     use sha2::Digest as _;
 
     use super::{
-        CompleteWorkspaceFile, MaterializedFile, SUBSTRATE_SCOPE, canonical_diff,
+        Authority, CompleteWorkspaceFile, MaterializedFile, SUBSTRATE_SCOPE, canonical_diff,
         file_operation_id, install_crypto_provider, language_for_path, repository_candidate,
-        source_manifest_sha256, strict_repository_entry, valid_repository_path,
-        validate_identity_transport,
+        source_manifest_sha256, strict_repository_entry, terminal_grant_row_matches,
+        terminal_session_row_matches, valid_repository_path, validate_identity_transport,
     };
-    use workspace_core::{ChangeSelector, DiffMode, FileExpectedState, WriteFile};
+    use workspace_core::{
+        ChangeSelector, CodingSession, CodingSessionState, DiffMode, FileExpectedState,
+        MaterializationLimits, WriteFile,
+    };
 
     #[test]
     fn installs_the_process_crypto_provider_before_tls_clients_are_built() {
@@ -3105,6 +4177,102 @@ mod tests {
                 .split_ascii_whitespace()
                 .any(|scope| scope == "session")
         );
+    }
+
+    #[test]
+    fn terminal_authority_refuses_actor_session_risk_scope_and_expiry_spoofing() {
+        let authority = Authority {
+            tenant_id: "tenant-one".to_owned(),
+            subject: "person:owner".to_owned(),
+            connector_bearer: "not-retained".to_owned(),
+            agent_platform_bearer: None,
+            session_authorization: "Bearer synthetic-session".to_owned(),
+            context: OwnerContext {
+                tenant_id: "tenant-one".to_owned(),
+                agent_id: "workspace:test".to_owned(),
+                agent_revision: 1,
+                authority_snapshot_id: "identity:test".to_owned(),
+                authority_snapshot_sha256: "a".repeat(64),
+            },
+        };
+        let session = CodingSession {
+            id: "workspace-session-one".to_owned(),
+            project_id: "project-one".to_owned(),
+            source_revision: "b".repeat(40),
+            base_materialization_ref: Some("base-one".to_owned()),
+            working_materialization_ref: Some("working-one".to_owned()),
+            manifest_sha256: Some("c".repeat(64)),
+            state: CodingSessionState::Ready,
+            failure_code: None,
+            limits: MaterializationLimits {
+                max_files: 1_000,
+                max_total_bytes: 256 * 1024 * 1024,
+                max_file_bytes: 180 * 1024,
+            },
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let session_row = serde_json::json!({
+            "session_id": "agentide-session-one",
+            "workspace_session_id": "workspace-session-one",
+            "project_id": "project-one",
+            "source_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "owner": "person:owner",
+            "state": "Active"
+        });
+        assert!(terminal_session_row_matches(
+            &session_row,
+            &authority,
+            &session,
+            "agentide-session-one"
+        ));
+        let mut spoofed_session = session_row;
+        spoofed_session["owner"] = serde_json::json!("person:other");
+        assert!(!terminal_session_row_matches(
+            &spoofed_session,
+            &authority,
+            &session,
+            "agentide-session-one"
+        ));
+
+        let now = "2026-09-03T10:00:00Z".parse().expect("time");
+        let grant = serde_json::json!({
+            "grant_id": "grant-one",
+            "session_id": "agentide-session-one",
+            "grantee": "person:owner",
+            "state": "Active",
+            "maximum_risk": "Medium",
+            "allowed_intents": ["interactive_terminal"],
+            "path_prefixes": [""],
+            "expires_at": "2026-09-03T11:00:00Z"
+        });
+        assert!(terminal_grant_row_matches(
+            &grant,
+            &authority,
+            "agentide-session-one",
+            "grant-one",
+            now
+        ));
+        for (field, value) in [
+            ("grantee", serde_json::json!("person:other")),
+            ("state", serde_json::json!("Revoked")),
+            ("maximum_risk", serde_json::json!("Low")),
+            ("path_prefixes", serde_json::json!(["src"])),
+            ("expires_at", serde_json::json!("2026-09-03T09:00:00Z")),
+        ] {
+            let mut refused = grant.clone();
+            refused[field] = value;
+            assert!(
+                !terminal_grant_row_matches(
+                    &refused,
+                    &authority,
+                    "agentide-session-one",
+                    "grant-one",
+                    now
+                ),
+                "{field} must be receiver-verified"
+            );
+        }
     }
 
     #[test]
