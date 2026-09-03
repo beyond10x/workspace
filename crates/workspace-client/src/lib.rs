@@ -515,6 +515,32 @@ impl WorkspaceClient {
         .await
     }
 
+    /// Stream ordered Agent Platform events for one owned user turn without buffering them.
+    pub async fn message_events(
+        &self,
+        authorization: &str,
+        thread_id: &str,
+        message_sequence: u64,
+    ) -> Result<reqwest::Response, ClientError> {
+        let endpoint = self
+            .base
+            .join(&format!(
+                "v1/threads/{thread_id}/messages/{message_sequence}/events"
+            ))
+            .map_err(|_| ClientError::Configuration)?;
+        let response = self
+            .http
+            .get(endpoint)
+            .header("authorization", authorization)
+            .send()
+            .await
+            .map_err(|_| ClientError::Transport)?;
+        if !response.status().is_success() {
+            return Err(ClientError::Refused(response.status().as_u16()));
+        }
+        Ok(response)
+    }
+
     /// List the pre-built workflow definitions.
     pub async fn workflows(
         &self,

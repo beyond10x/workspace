@@ -23,6 +23,7 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS workspace_threads (thread_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, owner_subject TEXT NOT NULL, branch TEXT NOT NULL, pinned_commit TEXT NOT NULL, title TEXT NOT NULL, created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS workspace_threads_owner ON workspace_threads (tenant_id, project_id, owner_subject, created_at_ms)",
     "CREATE TABLE IF NOT EXISTS workspace_messages (thread_id TEXT NOT NULL, sequence BIGINT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, branch TEXT NOT NULL, commit_ref TEXT NOT NULL, created_at_ms BIGINT NOT NULL, PRIMARY KEY (thread_id, sequence))",
+    "CREATE TABLE IF NOT EXISTS workspace_message_tasks (thread_id TEXT NOT NULL, message_sequence BIGINT NOT NULL, tenant_id TEXT NOT NULL, actor_subject TEXT NOT NULL, task_id TEXT NOT NULL, created_at_ms BIGINT NOT NULL, PRIMARY KEY (thread_id, message_sequence), UNIQUE (task_id))",
     "CREATE TABLE IF NOT EXISTS workspace_project_agents (tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, agent_id TEXT NOT NULL, created_at_ms BIGINT NOT NULL, PRIMARY KEY (tenant_id, project_id))",
     "CREATE TABLE IF NOT EXISTS workspace_coding_sessions (session_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, owner_subject TEXT NOT NULL, source_revision TEXT NOT NULL, idempotency_key TEXT NOT NULL, base_materialization_ref TEXT, working_materialization_ref TEXT, manifest_sha256 TEXT, state TEXT NOT NULL, failure_code TEXT, max_files BIGINT NOT NULL, max_total_bytes BIGINT NOT NULL, max_file_bytes BIGINT NOT NULL, created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL, UNIQUE (tenant_id, owner_subject, project_id, idempotency_key))",
     "CREATE INDEX IF NOT EXISTS workspace_coding_sessions_owner ON workspace_coding_sessions (tenant_id, project_id, owner_subject, created_at_ms)",
@@ -878,6 +879,61 @@ impl Store {
             input.content.trim(),
         )
         .await
+    }
+
+    /// Associate one admitted user turn with its exact Agent Platform task.
+    pub async fn record_message_task(
+        &self,
+        authority: &Authority,
+        thread_id: &str,
+        message_sequence: u64,
+        task_id: &str,
+    ) -> Result<(), StoreError> {
+        self.ensure_schema().await?;
+        self.owned_thread(authority, thread_id).await?;
+        let message_sequence = as_i64(message_sequence)?;
+        let user_message: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workspace_messages WHERE thread_id = ? AND sequence = ? AND role = 'user'",
+        )
+        .bind(thread_id)
+        .bind(message_sequence)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(StoreError::Database)?;
+        if user_message != 1 {
+            return Err(StoreError::NotFound);
+        }
+        sqlx::query("INSERT INTO workspace_message_tasks (thread_id, message_sequence, tenant_id, actor_subject, task_id, created_at_ms) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(thread_id)
+            .bind(message_sequence)
+            .bind(&authority.tenant_id)
+            .bind(&authority.subject)
+            .bind(task_id)
+            .bind(as_i64(now_ms()?)?)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        Ok(())
+    }
+
+    /// Resolve an owned user turn to its exact Agent Platform task without exposing other threads.
+    pub async fn message_task(
+        &self,
+        authority: &Authority,
+        thread_id: &str,
+        message_sequence: u64,
+    ) -> Result<String, StoreError> {
+        self.ensure_schema().await?;
+        self.owned_thread(authority, thread_id).await?;
+        sqlx::query_scalar("SELECT task_id FROM workspace_message_tasks WHERE tenant_id = ? AND actor_subject = ? AND thread_id = ? AND message_sequence = ?")
+            .bind(&authority.tenant_id)
+            .bind(&authority.subject)
+            .bind(thread_id)
+            .bind(as_i64(message_sequence)?)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(StoreError::Database)?
+            .ok_or(StoreError::NotFound)
     }
 
     /// Append agent output after a task completes without retaining request credentials.
@@ -1857,6 +1913,58 @@ mod tests {
         assert_eq!(messages[0].commit, "b".repeat(40));
         assert!(matches!(
             store.messages(&other, &thread.id).await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn message_task_stream_association_is_exact_and_owner_scoped() {
+        let store = store().await;
+        let owner = authority("person:owner");
+        let other = authority("person:other");
+        let opened = store.open_project(&owner, &project()).await.unwrap();
+        let pinned = store
+            .select_branch(&owner, &opened, "trunk", &"a".repeat(40))
+            .await
+            .unwrap();
+        let thread = store
+            .create_thread(
+                &owner,
+                &pinned.id,
+                &CreateThread {
+                    branch: "trunk".to_owned(),
+                    pinned_commit: "a".repeat(40),
+                    title: "Stream one turn".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let message = store
+            .create_message(
+                &owner,
+                &thread.id,
+                &CreateMessage {
+                    content: "Explain this snapshot".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+
+        store
+            .record_message_task(&owner, &thread.id, message.sequence, "task-one")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .message_task(&owner, &thread.id, message.sequence)
+                .await
+                .unwrap(),
+            "task-one"
+        );
+        assert!(matches!(
+            store
+                .message_task(&other, &thread.id, message.sequence)
+                .await,
             Err(StoreError::NotFound)
         ));
     }
