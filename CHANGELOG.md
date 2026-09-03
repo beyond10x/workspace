@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.2.8 - 2026-09-03
+
+- Consume AgentIDE 0.2.0's sealed v2 actor, context, grant, diff, file, tree, and terminal contracts
+  while keeping Workspace authoritative for materialization, source bytes, canonical diffs,
+  processes, and PTYs.
+
 ## 0.2.7 - 2026-09-03
 
 - Align the actor-view and hosted terminal boundary with the released AgentIDE 0.1.3 contracts.

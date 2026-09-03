@@ -14,11 +14,11 @@ use agent_platform_core::{
     TaskStatus,
 };
 use agentide_contracts::{
-    ActorContext, ActorKind, ActorView, ActorWorkbench, AuthorityGrant,
-    ChangeSelector as AgentIdeChangeSelector, ContextPack, ContextSelection, IntentProfile,
-    OpenFileReference, Risk as AgentIdeRisk, SelectionKind,
+    ActorContext, ActorKind, ActorView, ActorWorkbench, AttachmentProvenance, AuthorityGrant,
+    ChangeSelector as AgentIdeChangeSelector, ContextPack, ContextRecord, ContextSelection,
+    CoordinationRevision, IntentProfile, OpenFileReference, Risk as AgentIdeRisk, SelectionKind,
     TerminalSession as AgentIdeTerminalSession, TerminalState as AgentIdeTerminalState,
-    authorize_intent, resolve_intent_inventory,
+    authorize_intent, canonical_json_sha256, resolve_intent_inventory,
 };
 use anyhow::{Context, Result, bail};
 use axum::Router;
@@ -411,6 +411,7 @@ struct AgentIdePinRow {
     start_line: Option<i64>,
     end_line: Option<i64>,
     sha256: String,
+    owner: String,
     state: String,
 }
 
@@ -655,7 +656,7 @@ fn agentide_grants(
                     problem(StatusCode::BAD_GATEWAY, "coding_context_authority_invalid")
                 })?;
             let grant = AuthorityGrant {
-                format: "agentide.authority-grant/1".into(),
+                format: "agentide.authority-grant/2".into(),
                 id: row.grant_id,
                 session_id: row.session_id,
                 grantee: row.grantee,
@@ -692,12 +693,20 @@ fn sha256_text(content: &str) -> String {
     hex::encode(Sha256::digest(content.as_bytes()))
 }
 
-fn context_activity(code: &str, reference: &str) -> Value {
-    serde_json::json!({"code": code, "reference": reference})
+fn context_activity(code: &str, reference: &str) -> ContextRecord {
+    ContextRecord {
+        id: format!("{code}:{}", sha256_text(reference)),
+        kind: code.to_owned(),
+        state: None,
+        summary: reference.to_owned(),
+        sha256: None,
+        observed_at: None,
+    }
 }
 
 fn valid_context_selection(selection: &ContextSelection) -> bool {
-    !selection.id.trim().is_empty()
+    selection.validate().is_ok()
+        && !selection.id.trim().is_empty()
         && selection.id.len() <= MAX_MATERIALIZATION_KEY_BYTES
         && !selection.reference.trim().is_empty()
         && selection.reference.len() <= 4 * 1024
@@ -825,17 +834,26 @@ async fn hydrate_context_pin(
             return Err("context_pin_content_unavailable");
         }
     };
-    let selection = ContextSelection {
-        id: row.pin_id,
+    let actor =
+        ActorContext::new(ActorKind::Human, row.owner).map_err(|_| "context_pin_invalid")?;
+    let expected_sha256 = row.sha256;
+    let selection = ContextSelection::new(
+        row.pin_id,
         kind,
-        reference: row.reference,
+        row.reference,
         start_line,
         end_line,
-        sha256: row.sha256,
         content,
-        truncated: false,
-    };
-    if valid_context_selection(&selection) {
+        AttachmentProvenance {
+            format: "agentide.attachment-provenance/1".into(),
+            actor,
+            source: "agentide.context-pin".into(),
+            source_revision: expected_sha256.clone(),
+            observed_at: Utc::now().to_rfc3339(),
+        },
+    )
+    .map_err(|_| "context_pin_stale")?;
+    if selection.sha256 == expected_sha256 && valid_context_selection(&selection) {
         Ok(selection)
     } else {
         Err("context_pin_stale")
@@ -846,7 +864,7 @@ async fn current_open_files(
     requested: Vec<OpenFileReference>,
     working: &SubstrateWorkspace,
     max_file_bytes: u64,
-    recent_activity: &mut Vec<Value>,
+    recent_activity: &mut Vec<ContextRecord>,
 ) -> Vec<OpenFileReference> {
     let mut current = Vec::new();
     for requested in requested.into_iter().take(MAX_CONTEXT_OPEN_FILES) {
@@ -881,7 +899,7 @@ async fn current_open_files(
 fn agentide_terminals(
     terminals: Vec<StoredTerminal>,
     agentide_session_id: &str,
-    recent_activity: &mut Vec<Value>,
+    recent_activity: &mut Vec<ContextRecord>,
 ) -> Vec<AgentIdeTerminalSession> {
     let mut projected = Vec::new();
     for terminal in terminals {
@@ -910,7 +928,7 @@ fn agentide_terminals(
             continue;
         };
         projected.push(AgentIdeTerminalSession {
-            format: "agentide.terminal-session/1".into(),
+            format: "agentide.terminal-session/2".into(),
             id: terminal.id,
             session_id: terminal.agentide_session_id,
             profile: terminal.profile.id,
@@ -926,7 +944,11 @@ fn agentide_terminals(
     projected
 }
 
-fn pending_approvals(rows: Vec<Value>, agentide_session_id: &str, attempt_id: &str) -> Vec<Value> {
+fn pending_approvals(
+    rows: Vec<Value>,
+    agentide_session_id: &str,
+    attempt_id: &str,
+) -> Vec<ContextRecord> {
     rows.into_iter()
         .filter(|row| {
             row.get("session_id").and_then(Value::as_str) == Some(agentide_session_id)
@@ -934,13 +956,14 @@ fn pending_approvals(rows: Vec<Value>, agentide_session_id: &str, attempt_id: &s
                 && row.get("state").and_then(Value::as_str) == Some("Pending")
         })
         .filter_map(|row| {
-            Some(serde_json::json!({
-                "checkpoint_id": row.get("checkpoint_id")?.as_str()?,
-                "attempt_ref": row.get("attempt_ref")?.as_str()?,
-                "plan_digest": row.get("plan_digest")?.as_str()?,
-                "checkpoint_ref": row.get("checkpoint_ref")?.as_str()?,
-                "state": "Pending"
-            }))
+            Some(ContextRecord {
+                id: row.get("checkpoint_id")?.as_str()?.to_owned(),
+                kind: "approval_checkpoint".into(),
+                state: Some("pending".into()),
+                summary: row.get("checkpoint_ref")?.as_str()?.to_owned(),
+                sha256: Some(row.get("plan_digest")?.as_str()?.to_owned()),
+                observed_at: None,
+            })
         })
         .collect()
 }
@@ -995,6 +1018,7 @@ async fn coding_actor_view(
         Ok(rows) => rows,
         Err(response) => return response,
     };
+    let coordination_grants = grant_rows.clone();
     let grants = match agentide_grants(grant_rows, &authority, &input.agentide_session_id) {
         Ok(grants) => grants,
         Err(response) => return response,
@@ -1005,6 +1029,7 @@ async fn coding_actor_view(
     };
     let Ok((inventory, withheld)) = resolve_intent_inventory(
         &profile,
+        &input.agentide_session_id,
         &verified.actor,
         &implemented,
         &grants,
@@ -1058,6 +1083,7 @@ async fn coding_actor_view(
         Ok(rows) => rows,
         Err(response) => return response,
     };
+    let coordination_pins = pin_rows.clone();
     let mut pins = Vec::new();
     for row in pin_rows {
         let reference = row
@@ -1121,6 +1147,7 @@ async fn coding_actor_view(
         Ok(rows) => rows,
         Err(response) => return response,
     };
+    let coordination_approvals = approval_rows.clone();
     let approvals = pending_approvals(approval_rows, &input.agentide_session_id, &input.attempt_id);
     let active_diff = match verified.active_diff {
         None => None,
@@ -1154,30 +1181,55 @@ async fn coding_actor_view(
                 .clone()
                 .map(|cursor| (file.path.clone(), cursor))
         }));
+    let Ok(coordination_digest) = canonical_json_sha256(&serde_json::json!({
+        "session_id": input.agentide_session_id,
+        "workspace_session_id": session.id,
+        "source_revision": session.source_revision,
+        "grants": coordination_grants,
+        "pins": coordination_pins,
+        "approvals": coordination_approvals,
+    })) else {
+        return problem(
+            StatusCode::BAD_GATEWAY,
+            "coding_coordination_revision_invalid",
+        );
+    };
+    let mut context = ContextPack {
+        format: "agentide.context-pack/2".into(),
+        objective: verified.objective,
+        source_revision: session.source_revision,
+        working_changes: Some(diff.digest),
+        pins,
+        focused_selections,
+        open_files,
+        active_diff,
+        terminals,
+        processes: Vec::new(),
+        agent_lanes: Vec::new(),
+        approvals,
+        evidence: Vec::new(),
+        recent_activity,
+        revision: input.turn,
+        digest: String::new(),
+    };
+    if context.seal().is_err() {
+        return problem(StatusCode::BAD_GATEWAY, "coding_context_pack_invalid");
+    }
     let view = ActorView {
-        format: "agentide.actor-view/1".into(),
+        format: "agentide.actor-view/2".into(),
         actor: verified.actor,
         workbench,
-        context: ContextPack {
-            format: "agentide.context-pack/1".into(),
-            objective: verified.objective,
-            source_revision: session.source_revision,
-            working_changes: Some(diff.digest),
-            pins,
-            focused_selections,
-            open_files,
-            active_diff,
-            terminals,
-            processes: Vec::new(),
-            agent_lanes: Vec::new(),
-            approvals,
-            evidence: Vec::new(),
-            recent_activity,
+        coordination: CoordinationRevision {
             revision: input.turn,
+            digest: coordination_digest,
         },
+        context,
         inventory,
         withheld,
     };
+    if view.validate().is_err() {
+        return problem(StatusCode::BAD_GATEWAY, "coding_actor_view_invalid");
+    }
     confidential(Json(view).into_response())
 }
 
@@ -1291,6 +1343,7 @@ async fn invoke_coding_intent(
     };
     if let Err(reason) = authorize_intent(
         definition,
+        &input.agentide_session_id,
         &verified.actor,
         &implemented,
         &grants,
@@ -5862,6 +5915,7 @@ mod tests {
         assert!(
             authorize_intent(
                 edit,
+                "agentide-session-one",
                 &actor,
                 &implemented,
                 &grants,
@@ -5874,6 +5928,7 @@ mod tests {
         assert!(
             authorize_intent(
                 edit,
+                "agentide-session-one",
                 &actor,
                 &implemented,
                 &grants,

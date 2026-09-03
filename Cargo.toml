@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 rust-version = "1.98"
 license = "LicenseRef-B10x-Proprietary"
@@ -21,7 +21,7 @@ identity-client = { git = "https://github.com/beyond10x/identity.git", tag = "0.
 connectors-client = { git = "https://github.com/beyond10x/connectors.git", rev = "ea335281ef8029ca4cb375768d98db3dc3135feb" }
 agent-platform-client = { git = "https://github.com/beyond10x/agent-platform.git", rev = "782b553ba04e4c410c5033abb1a713b05dc148de" }
 agent-platform-core = { git = "https://github.com/beyond10x/agent-platform.git", rev = "782b553ba04e4c410c5033abb1a713b05dc148de" }
-agentide-contracts = { git = "https://github.com/beyond10x/agentide.git", rev = "4ee2826eaec8a048e61ec205d81960627952c766" }
+agentide-contracts = { git = "https://github.com/beyond10x/agentide.git", rev = "a90cb6cbe5a5cf6dd91bade6071df13b376947e3" }
 aep-client = { git = "https://github.com/beyond10x/aep", tag = "0.40.3" }
 aep-contract = { git = "https://github.com/beyond10x/aep", tag = "0.40.3" }
 b10x-substrate-sdk = { git = "https://github.com/beyond10x/substrate.git", rev = "8d377f0ac0cd290df2c739fd6b0aee9db8936a8c" }
