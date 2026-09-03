@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.2.12 - 2026-09-03
+
+- Consume Connectors 0.5.6's canonical Identity source so Workspace resolves exactly one Identity
+  0.5.6 client crate across its complete dependency graph.
+
 ## 0.2.11 - 2026-09-03
 
 - Align every first-party client with the current released Identity, Connectors, Agent Platform,
