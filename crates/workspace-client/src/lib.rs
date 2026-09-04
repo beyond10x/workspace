@@ -2,6 +2,8 @@
 
 //! Bounded official HTTP client for Workspace's user-facing contract.
 
+use std::time::Duration;
+
 use reqwest::{Method, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use url::Url;
@@ -12,6 +14,8 @@ use workspace_core::{
     Project, RepositoryCandidate, RepositoryEntry, ResolveDiff, SelectBranch, StartWorkflow,
     TerminalProfile, TerminalSession, Thread, WorkflowDefinition, WorkflowRun, WriteFile,
 };
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Workspace transport failure without response or credential bodies.
 #[derive(Debug, thiserror::Error)]
@@ -311,6 +315,7 @@ impl WorkspaceClient {
             .put(endpoint)
             .header("authorization", authorization)
             .json(input)
+            .timeout(REQUEST_TIMEOUT)
             .send()
             .await
             .map_err(|_| ClientError::Transport)?;
@@ -620,7 +625,11 @@ impl WorkspaceClient {
         if let Some(body) = body {
             request = request.json(body);
         }
-        let response = request.send().await.map_err(|_| ClientError::Transport)?;
+        let response = request
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|_| ClientError::Transport)?;
         if !response.status().is_success() {
             return Err(ClientError::Refused(response.status().as_u16()));
         }
