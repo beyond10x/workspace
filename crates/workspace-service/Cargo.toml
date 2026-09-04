@@ -23,6 +23,7 @@ base64.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 clap.workspace = true
+futures-util.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 reqwest.workspace = true

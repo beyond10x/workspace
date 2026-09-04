@@ -44,6 +44,7 @@ use connectors_client::datasource::{
     ReadRequest,
 };
 use connectors_client::operation::{self, OwnerContext};
+use futures_util::{StreamExt as _, TryStreamExt as _, stream};
 use identity_client::{IdentityClient, SessionAuthority};
 use serde::Deserialize;
 use serde_json::Value;
@@ -86,6 +87,8 @@ const SOURCE_MATERIALIZATION_LIMITS: MaterializationLimits = MaterializationLimi
     max_file_bytes: 180 * 1024,
 };
 const MAX_SOURCE_DIRECTORIES: usize = 4_096;
+const SOURCE_FETCH_CONCURRENCY: usize = 16;
+const MATERIALIZATION_UPLOAD_CONCURRENCY: usize = 8;
 const MAX_MATERIALIZATION_KEY_BYTES: usize = 256;
 const MAX_CONTEXT_SELECTIONS: usize = 8;
 const MAX_CONTEXT_SELECTION_BYTES: usize = 32 * 1024;
@@ -163,8 +166,28 @@ struct AppState {
     terminal_profiles: TerminalProfiles,
     terminal_brokers: TerminalBrokers,
     terminal_replay: TerminalReplayHub,
+    materialization_workers: MaterializationWorkers,
     workflow_observers: WorkflowObservers,
     store: Store,
+}
+
+#[derive(Clone, Default)]
+struct MaterializationWorkers {
+    active: Arc<Mutex<BTreeSet<String>>>,
+}
+
+impl MaterializationWorkers {
+    async fn is_active(&self, session_id: &str) -> bool {
+        self.active.lock().await.contains(session_id)
+    }
+
+    async fn begin(&self, session_id: &str) -> bool {
+        self.active.lock().await.insert(session_id.to_owned())
+    }
+
+    async fn finish(&self, session_id: &str) {
+        self.active.lock().await.remove(session_id);
+    }
 }
 
 #[derive(Clone, Default)]
@@ -277,6 +300,7 @@ async fn main() -> Result<()> {
             terminal_profiles,
             terminal_brokers: TerminalBrokers::default(),
             terminal_replay: TerminalReplayHub::default(),
+            materialization_workers: MaterializationWorkers::default(),
             workflow_observers: WorkflowObservers::default(),
             store,
         }),
@@ -1862,8 +1886,22 @@ async fn coding_session(
         Ok(session) => session,
         Err(error) => return store_problem(&error),
     };
-    if let Err(response) = accessible_project(&state, &authority, &session.project_id).await {
-        return response;
+    let project = match accessible_project(&state, &authority, &session.project_id).await {
+        Ok(project) => project,
+        Err(response) => return response,
+    };
+    if session.state == CodingSessionState::Preparing
+        && !state.materialization_workers.is_active(&session.id).await
+        && let Ok(Some(client)) = substrate_client(&state, &authority).await
+    {
+        spawn_coding_session_materialization(
+            state.clone(),
+            authority,
+            project,
+            client,
+            session.clone(),
+        )
+        .await;
     }
     confidential(Json(public_session(session)).into_response())
 }
@@ -3163,57 +3201,89 @@ async fn create_coding_session(
         SessionReservation::New(session) | SessionReservation::Existing(session) => session,
     };
 
-    let files = match collect_source_files(&state, &authority, &project).await {
-        Ok(files) => files,
-        Err(response) => {
-            let cleanup_unknown = cleanup_materializations(&client, &session).await;
-            let stored = state
-                .store
-                .refuse_coding_session(
-                    &authority,
-                    &session.id,
-                    if cleanup_unknown {
-                        "materialization_cleanup_unknown"
-                    } else {
-                        "source_materialization_refused"
-                    },
-                    cleanup_unknown,
-                )
-                .await;
-            return match stored {
-                Ok(session) if cleanup_unknown => {
-                    confidential(Json(public_session(session)).into_response())
-                }
-                Ok(_) => response,
-                Err(error) => store_problem(&error),
-            };
-        }
-    };
-    match provision_materializations(&state, &authority, &client, session, &files).await {
-        Ok(ready) => confidential(Json(public_session(ready)).into_response()),
-        Err((failed, error)) => {
-            let cleanup_unknown = cleanup_materializations(&client, &failed).await;
-            let stored = state
-                .store
-                .refuse_coding_session(
-                    &authority,
-                    &failed.id,
-                    if cleanup_unknown {
-                        "materialization_cleanup_unknown"
-                    } else {
-                        "substrate_materialization_refused"
-                    },
-                    cleanup_unknown,
-                )
-                .await;
-            match stored {
-                Ok(session) if cleanup_unknown => {
-                    confidential(Json(public_session(session)).into_response())
-                }
-                _ => substrate_problem(&error),
-            }
-        }
+    spawn_coding_session_materialization(state, authority, project, client, session.clone()).await;
+    confidential((StatusCode::ACCEPTED, Json(public_session(session))).into_response())
+}
+
+async fn spawn_coding_session_materialization(
+    state: AppState,
+    authority: Authority,
+    project: Project,
+    client: SubstrateClient,
+    session: CodingSession,
+) {
+    if !state.materialization_workers.begin(&session.id).await {
+        return;
     }
+    tokio::spawn(async move {
+        Box::pin(prepare_coding_session_materialization(
+            state, authority, project, client, session,
+        ))
+        .await;
+    });
+}
+
+async fn prepare_coding_session_materialization(
+    state: AppState,
+    authority: Authority,
+    project: Project,
+    client: SubstrateClient,
+    session: CodingSession,
+) {
+    let session_id = session.id.clone();
+    if let Ok(files) = collect_source_files(&state, &authority, &project).await {
+        if let Err((failed, _)) = Box::pin(provision_materializations(
+            state.clone(),
+            authority.clone(),
+            client.clone(),
+            session,
+            files,
+        ))
+        .await
+        {
+            let cleanup_unknown =
+                cleanup_materializations_owned(client.clone(), failed.clone()).await;
+            record_materialization_refusal(
+                state.store.clone(),
+                authority.clone(),
+                failed.id,
+                if cleanup_unknown {
+                    "materialization_cleanup_unknown"
+                } else {
+                    "substrate_materialization_refused"
+                },
+                cleanup_unknown,
+            )
+            .await;
+        }
+    } else {
+        let cleanup_unknown = cleanup_materializations_owned(client, session.clone()).await;
+        record_materialization_refusal(
+            state.store.clone(),
+            authority,
+            session.id,
+            if cleanup_unknown {
+                "materialization_cleanup_unknown"
+            } else {
+                "source_materialization_refused"
+            },
+            cleanup_unknown,
+        )
+        .await;
+    }
+    state.materialization_workers.finish(&session_id).await;
+}
+
+async fn record_materialization_refusal(
+    store: Store,
+    authority: Authority,
+    session_id: String,
+    failure_code: &'static str,
+    cleanup_unknown: bool,
+) {
+    let _ = store
+        .refuse_coding_session(&authority, &session_id, failure_code, cleanup_unknown)
+        .await;
 }
 
 async fn threads(
@@ -3744,6 +3814,7 @@ async fn accessible_project(
     Ok(project)
 }
 
+#[derive(Clone)]
 struct Authority {
     tenant_id: String,
     subject: String,
@@ -4287,11 +4358,19 @@ async fn collect_source_files(
         commit,
     )
     .await?;
+    let mut files = stream::iter(blobs)
+        .map(|entry| {
+            let file_description = file_description.clone();
+            async move {
+                read_source_file(state, authority, project, &file_description, &entry, commit).await
+            }
+        })
+        .buffer_unordered(SOURCE_FETCH_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
     let mut total_bytes = 0_u64;
-    let mut files = Vec::with_capacity(blobs.len());
-    for entry in blobs {
-        let file =
-            read_source_file(state, authority, project, &file_description, &entry, commit).await?;
+    for file in &files {
         total_bytes = total_bytes
             .checked_add(file.bytes.len() as u64)
             .ok_or_else(|| {
@@ -4306,7 +4385,6 @@ async fn collect_source_files(
                 "repository_total_limit_exceeded",
             ));
         }
-        files.push(file);
     }
     Ok(files)
 }
@@ -4555,24 +4633,24 @@ fn source_file_input(project_id: u64, path: &str, commit: &str) -> Value {
 }
 
 async fn provision_materializations(
-    state: &AppState,
-    authority: &Authority,
-    client: &SubstrateClient,
+    state: AppState,
+    authority: Authority,
+    client: SubstrateClient,
     mut session: CodingSession,
-    files: &[MaterializedFile],
+    files: Vec<MaterializedFile>,
 ) -> Result<CodingSession, (CodingSession, SubstrateError)> {
-    let base = ensure_materialization(state, authority, client, &mut session, true).await?;
-    let working = ensure_materialization(state, authority, client, &mut session, false).await?;
-    upload_materialization(&base, &session.id, "base", files)
-        .await
-        .map_err(|error| (session.clone(), error))?;
-    upload_materialization(&working, &session.id, "working", files)
-        .await
-        .map_err(|error| (session.clone(), error))?;
-    let manifest_sha256 = source_manifest_sha256(&session.source_revision, files);
+    let base = ensure_materialization(&state, &authority, &client, &mut session, true).await?;
+    let working = ensure_materialization(&state, &authority, &client, &mut session, false).await?;
+    let files = Arc::new(files);
+    tokio::try_join!(
+        upload_materialization(base, session.id.clone(), "base", Arc::clone(&files)),
+        upload_materialization(working, session.id.clone(), "working", Arc::clone(&files)),
+    )
+    .map_err(|error| (session.clone(), error))?;
+    let manifest_sha256 = source_manifest_sha256(&session.source_revision, &files);
     state
         .store
-        .complete_coding_session(authority, &session.id, &manifest_sha256)
+        .complete_coding_session(&authority, &session.id, &manifest_sha256)
         .await
         .map_err(|error| {
             (
@@ -4627,25 +4705,35 @@ async fn ensure_materialization(
 }
 
 async fn upload_materialization(
-    workspace: &SubstrateWorkspace,
-    session_id: &str,
-    role: &str,
-    files: &[MaterializedFile],
+    workspace: SubstrateWorkspace,
+    session_id: String,
+    role: &'static str,
+    files: Arc<Vec<MaterializedFile>>,
 ) -> Result<(), SubstrateError> {
-    for file in files {
-        workspace
-            .replace_file(
-                &file.path,
-                &file.bytes,
-                ExpectedFileState::Absent,
-                true,
-                Some(substrate_operation_id(
-                    session_id,
-                    &["file", role, &file.path, &file.sha256],
-                )),
-            )
-            .await?;
-    }
+    stream::iter(0..files.len())
+        .map(|index| {
+            let workspace = workspace.clone();
+            let session_id = session_id.clone();
+            let files = Arc::clone(&files);
+            async move {
+                let file = &files[index];
+                workspace
+                    .replace_file(
+                        &file.path,
+                        &file.bytes,
+                        ExpectedFileState::Absent,
+                        true,
+                        Some(substrate_operation_id(
+                            &session_id,
+                            &["file", role, &file.path, &file.sha256],
+                        )),
+                    )
+                    .await
+            }
+        })
+        .buffer_unordered(MATERIALIZATION_UPLOAD_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
     let executable = files
         .iter()
         .filter(|file| file.executable)
@@ -4668,7 +4756,7 @@ async fn upload_materialization(
             .args(arguments)
             .policy(policy)
             .operation_id(substrate_operation_id(
-                session_id,
+                &session_id,
                 &["chmod", role, &index.to_string()],
             ))
             .run()
@@ -5128,6 +5216,10 @@ async fn cleanup_materializations(client: &SubstrateClient, session: &CodingSess
         }
     }
     unknown
+}
+
+async fn cleanup_materializations_owned(client: SubstrateClient, session: CodingSession) -> bool {
+    cleanup_materializations(&client, &session).await
 }
 
 fn public_session(mut session: CodingSession) -> CodingSession {
@@ -5796,14 +5888,14 @@ mod tests {
     use sha2::Digest as _;
 
     use super::{
-        AppState, Authority, CompleteWorkspaceFile, MaterializedFile, SUBSTRATE_SCOPE,
-        WorkflowObservation, WorkflowObservers, WorkflowTaskOutcome, agentide_grants,
-        agentide_session_row, canonical_diff, coding_intent_profile, diff_pin_content,
-        file_operation_id, install_crypto_provider, language_for_path, repository_candidate,
-        resume_workflow_completions, sha256_text, source_file_input, source_manifest_sha256,
-        spawn_workflow_completion, strict_repository_entry, submit_workflow_task,
-        terminal_grant_row_matches, terminal_session_row_matches, valid_repository_path,
-        validate_identity_transport, workflow_task_outcome,
+        AppState, Authority, CompleteWorkspaceFile, MaterializationWorkers, MaterializedFile,
+        SUBSTRATE_SCOPE, WorkflowObservation, WorkflowObservers, WorkflowTaskOutcome,
+        agentide_grants, agentide_session_row, canonical_diff, coding_intent_profile,
+        diff_pin_content, file_operation_id, install_crypto_provider, language_for_path,
+        repository_candidate, resume_workflow_completions, sha256_text, source_file_input,
+        source_manifest_sha256, spawn_workflow_completion, strict_repository_entry,
+        submit_workflow_task, terminal_grant_row_matches, terminal_session_row_matches,
+        valid_repository_path, validate_identity_transport, workflow_task_outcome,
     };
     use crate::store::Store;
     use agent_platform_client::AgentPlatformClient;
@@ -5824,6 +5916,17 @@ mod tests {
     fn installs_the_process_crypto_provider_before_tls_clients_are_built() {
         install_crypto_provider().expect("AWS-LC provider should install");
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[tokio::test]
+    async fn materialization_workers_are_single_flight_and_recoverable() {
+        let workers = MaterializationWorkers::default();
+        assert!(!workers.is_active("session-one").await);
+        assert!(workers.begin("session-one").await);
+        assert!(workers.is_active("session-one").await);
+        assert!(!workers.begin("session-one").await);
+        workers.finish("session-one").await;
+        assert!(workers.begin("session-one").await);
     }
 
     #[test]
@@ -6057,6 +6160,7 @@ mod tests {
             terminal_profiles: TerminalProfiles::load(None).expect("terminal profiles"),
             terminal_brokers: TerminalBrokers::default(),
             terminal_replay: TerminalReplayHub::default(),
+            materialization_workers: MaterializationWorkers::default(),
             workflow_observers: WorkflowObservers::default(),
             store: store.clone(),
         };
