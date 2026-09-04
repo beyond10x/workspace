@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.2.14 - 2026-09-04
+
+- Consume AEP 0.51.0 so Workspace compiles against the current released AEP contract graph. AEP
+  moved its crates under area directories and renamed three others, but `aep-client` and
+  `aep-contract` kept their names and their sources are byte-identical to 0.45.0, so no Workspace
+  call site changed.
+- Hold the declared AEP pins and every lockfile entry resolved from the AEP repository at one
+  release, so a partial re-pin cannot leave Workspace compiling two AEP contract graphs.
 
 ## 0.2.13 - 2026-09-03
 

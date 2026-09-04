@@ -132,3 +132,96 @@ impl CredentialProvider for RequestCredential {
             .map_err(|_| CredentialError::unauthenticated("the Identity session is malformed"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    /// The released AEP contract graph this repository compiles against. Both declared pins and
+    /// every crate the lockfile resolves out of the AEP repository state exactly this release, so
+    /// a partial re-pin cannot leave Workspace compiling two AEP contract graphs at once.
+    const AEP_RELEASE: &str = "0.51.0";
+    const AEP_REPOSITORY: &str = "https://github.com/beyond10x/aep";
+
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("the service crate sits two directories below the workspace root")
+            .to_path_buf()
+    }
+
+    fn workspace_file(name: &str) -> String {
+        let path = workspace_root().join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("{} is readable: {error}", path.display()))
+    }
+
+    /// The first `<key> = "<value>"` in `text`, wherever it sits: `Cargo.lock` writes one field
+    /// per line and `Cargo.toml` writes a dependency's keys inline in one table.
+    fn quoted_value(text: &str, key: &str) -> Option<String> {
+        text.split_once(&format!("{key} = \""))?
+            .1
+            .split('"')
+            .next()
+            .map(str::to_owned)
+    }
+
+    fn declared_tag(manifest: &str, crate_name: &str) -> String {
+        let prefix = format!("{crate_name} = ");
+        let line = manifest
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("{crate_name} is declared in [workspace.dependencies]"));
+        assert!(
+            line.contains(&format!("git = \"{AEP_REPOSITORY}\"")),
+            "{crate_name} is pinned to the AEP repository: {line}"
+        );
+        quoted_value(line, "tag").unwrap_or_else(|| panic!("{crate_name} pins a tag: {line}"))
+    }
+
+    #[test]
+    fn declared_aep_pins_name_the_released_contract_graph() {
+        let manifest = workspace_file("Cargo.toml");
+        for crate_name in ["aep-client", "aep-contract"] {
+            assert_eq!(
+                declared_tag(&manifest, crate_name),
+                AEP_RELEASE,
+                "{crate_name} declares the released AEP tag"
+            );
+        }
+    }
+
+    #[test]
+    fn every_locked_aep_crate_resolves_from_that_one_release() {
+        let lock = workspace_file("Cargo.lock");
+        let source_prefix = format!("git+{AEP_REPOSITORY}?");
+        let mut resolved = Vec::new();
+        for block in lock.split("[[package]]").skip(1) {
+            let Some(source) = quoted_value(block, "source") else {
+                continue;
+            };
+            if !source.starts_with(&source_prefix) {
+                continue;
+            }
+            let name = quoted_value(block, "name").expect("a locked package states its name");
+            assert!(
+                source.contains(&format!("?tag={AEP_RELEASE}#")),
+                "{name} resolves from the released AEP tag: {source}"
+            );
+            assert_eq!(
+                quoted_value(block, "version").expect("a locked package states its version"),
+                AEP_RELEASE,
+                "{name} resolves at the released AEP version"
+            );
+            resolved.push(name);
+        }
+        for crate_name in ["aep-client", "aep-contract"] {
+            assert_eq!(
+                resolved.iter().filter(|name| *name == crate_name).count(),
+                1,
+                "the lockfile resolves exactly one {crate_name} from the AEP repository: {resolved:?}"
+            );
+        }
+    }
+}
