@@ -3,11 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aep_client::AepClient;
 use aep_contract::query::{EntityQuery, QueryService};
-use agent_platform_client::AgentPlatformClient;
+use agent_platform_client::{AgentPlatformClient, ClientError as AgentPlatformClientError};
 use agent_platform_core::{
     ActivateRevision, AgentId, ConversationInput, ConversationMessage, ConversationRole,
     CreateAgent, ProjectContext, ProjectContextFile, RevisionSpec, SubmitTask, Task, TaskId,
@@ -48,6 +49,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
+use tokio::sync::Mutex;
 use workspace_core::{
     Branch, ChangeSelector, CodingActorViewRequest, CodingIntentInvocation, CodingIntentResult,
     CodingSession, CodingSessionState, CodingTreeEntry, CodingTreeProjection, CreateCodingSession,
@@ -161,7 +163,23 @@ struct AppState {
     terminal_profiles: TerminalProfiles,
     terminal_brokers: TerminalBrokers,
     terminal_replay: TerminalReplayHub,
+    workflow_observers: WorkflowObservers,
     store: Store,
+}
+
+#[derive(Clone, Default)]
+struct WorkflowObservers {
+    active: Arc<Mutex<BTreeSet<String>>>,
+}
+
+impl WorkflowObservers {
+    async fn begin(&self, run_id: &str) -> bool {
+        self.active.lock().await.insert(run_id.to_owned())
+    }
+
+    async fn finish(&self, run_id: &str) {
+        self.active.lock().await.remove(run_id);
+    }
 }
 
 #[derive(Clone)]
@@ -259,6 +277,7 @@ async fn main() -> Result<()> {
             terminal_profiles,
             terminal_brokers: TerminalBrokers::default(),
             terminal_replay: TerminalReplayHub::default(),
+            workflow_observers: WorkflowObservers::default(),
             store,
         }),
     )
@@ -3606,6 +3625,38 @@ async fn start_workflow(
     ) {
         return confidential(Json(run).into_response());
     }
+    match state.store.workflow_task(&authority, &run.id).await {
+        Ok(Some(task_id)) => {
+            let Ok(task_id) = TaskId::new(task_id) else {
+                let _ = state
+                    .store
+                    .update_workflow_run(
+                        &authority.tenant_id,
+                        &authority.subject,
+                        &run.id,
+                        WorkflowRunState::Failed,
+                        Some("workflow_task_invalid"),
+                        None,
+                    )
+                    .await;
+                return problem(StatusCode::SERVICE_UNAVAILABLE, "workflow_task_invalid");
+            };
+            spawn_workflow_completion(WorkflowObservation {
+                store: state.store.clone(),
+                client: agent_platform.clone(),
+                observers: state.workflow_observers.clone(),
+                bearer: agent_platform_bearer.to_owned(),
+                tenant_id: authority.tenant_id,
+                subject: authority.subject,
+                run_id: run.id.clone(),
+                task_id,
+            })
+            .await;
+            return confidential(Json(run).into_response());
+        }
+        Ok(None) => {}
+        Err(error) => return store_problem(&error),
+    }
     let task = SubmitTask {
         agent_id,
         idempotency_key: format!("workspace-workflow:{}", run.id),
@@ -3623,21 +3674,7 @@ async fn start_workflow(
             }
         },
     };
-    let Ok(task) = agent_platform
-        .submit_task(agent_platform_bearer, &task)
-        .await
-    else {
-        let _ = state
-            .store
-            .update_workflow_run(
-                &authority.tenant_id,
-                &authority.subject,
-                &run.id,
-                WorkflowRunState::Failed,
-                Some("workflow_dispatch_refused"),
-                None,
-            )
-            .await;
+    let Ok(task) = submit_workflow_task(agent_platform, agent_platform_bearer, &task).await else {
         return problem(StatusCode::BAD_GATEWAY, "workflow_dispatch_refused");
     };
     if let Err(error) = state
@@ -3647,15 +3684,17 @@ async fn start_workflow(
     {
         return store_problem(&error);
     }
-    spawn_workflow_completion(
-        state.store.clone(),
-        agent_platform.clone(),
-        agent_platform_bearer.to_owned(),
-        authority.tenant_id,
-        authority.subject,
-        run.id.clone(),
-        task.id,
-    );
+    spawn_workflow_completion(WorkflowObservation {
+        store: state.store.clone(),
+        client: agent_platform.clone(),
+        observers: state.workflow_observers.clone(),
+        bearer: agent_platform_bearer.to_owned(),
+        tenant_id: authority.tenant_id,
+        subject: authority.subject,
+        run_id: run.id.clone(),
+        task_id: task.id,
+    })
+    .await;
     confidential(Json(run).into_response())
 }
 
@@ -3670,6 +3709,9 @@ async fn workflow_runs(
     };
     if let Err(response) = accessible_project(&state, &authority, &project_id).await {
         return response;
+    }
+    if let Err(error) = resume_workflow_completions(&state, &authority, &project_id).await {
+        return store_problem(&error);
     }
     match state.store.workflow_runs(&authority, &project_id).await {
         Ok(runs) => confidential(Json(runs).into_response()),
@@ -5405,99 +5447,191 @@ fn spawn_task_completion(
     });
 }
 
-fn spawn_workflow_completion(
+async fn resume_workflow_completions(
+    state: &AppState,
+    authority: &Authority,
+    project_id: &str,
+) -> Result<(), StoreError> {
+    let (Some(client), Some(bearer)) = (
+        state.agent_platform.as_ref(),
+        authority.agent_platform_bearer.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    let tasks = state
+        .store
+        .recoverable_workflow_tasks(authority, project_id)
+        .await?;
+    for task in tasks {
+        let Ok(task_id) = TaskId::new(task.task_id) else {
+            let _ = state
+                .store
+                .update_workflow_run(
+                    &authority.tenant_id,
+                    &authority.subject,
+                    &task.run_id,
+                    WorkflowRunState::Failed,
+                    Some("workflow_task_invalid"),
+                    None,
+                )
+                .await?;
+            continue;
+        };
+        spawn_workflow_completion(WorkflowObservation {
+            store: state.store.clone(),
+            client: client.clone(),
+            observers: state.workflow_observers.clone(),
+            bearer: bearer.to_owned(),
+            tenant_id: authority.tenant_id.clone(),
+            subject: authority.subject.clone(),
+            run_id: task.run_id,
+            task_id,
+        })
+        .await;
+    }
+    Ok(())
+}
+
+struct WorkflowObservation {
     store: Store,
     client: AgentPlatformClient,
+    observers: WorkflowObservers,
     bearer: String,
     tenant_id: String,
     subject: String,
     run_id: String,
     task_id: agent_platform_core::TaskId,
-) {
-    tokio::spawn(async move {
-        for _ in 0..300 {
-            let Ok(task) = client.get_task(&bearer, &task_id).await else {
-                let _ = store
-                    .update_workflow_run(
-                        &tenant_id,
-                        &subject,
-                        &run_id,
-                        WorkflowRunState::Failed,
-                        Some("workflow_observation_refused"),
-                        None,
-                    )
-                    .await;
-                return;
-            };
-            match task.status {
-                TaskStatus::Succeeded => {
-                    let output = task.output.unwrap_or_else(|| {
-                        "The workflow completed without a Markdown result.".to_owned()
-                    });
-                    let _ = store
-                        .update_workflow_run(
-                            &tenant_id,
-                            &subject,
-                            &run_id,
-                            WorkflowRunState::Succeeded,
-                            None,
-                            Some(&output),
-                        )
-                        .await;
-                    return;
-                }
-                TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::OutcomeUnknown => {
-                    let _ = store
-                        .update_workflow_run(
-                            &tenant_id,
-                            &subject,
-                            &run_id,
-                            WorkflowRunState::Failed,
-                            Some("workflow_execution_failed"),
-                            None,
-                        )
-                        .await;
-                    return;
-                }
-                TaskStatus::Refused => {
-                    let _ = store
-                        .update_workflow_run(
-                            &tenant_id,
-                            &subject,
-                            &run_id,
-                            WorkflowRunState::Refused,
-                            Some("workflow_execution_refused"),
-                            None,
-                        )
-                        .await;
-                    return;
-                }
-                TaskStatus::Running | TaskStatus::AwaitingApproval => {
-                    let _ = store
-                        .update_workflow_run(
-                            &tenant_id,
-                            &subject,
-                            &run_id,
-                            WorkflowRunState::Running,
-                            None,
-                            None,
-                        )
-                        .await;
-                }
-                TaskStatus::Accepted => {}
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        let _ = store
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WorkflowTaskOutcome {
+    Accepted,
+    Running,
+    Succeeded(String),
+    Failed(&'static str),
+}
+
+impl WorkflowObservation {
+    fn owns(&self, task: &Task) -> bool {
+        task.id == self.task_id
+            && task.tenant_id.as_str() == self.tenant_id
+            && task.actor.as_str() == self.subject
+            && task.idempotency_key == format!("workspace-workflow:{}", self.run_id)
+    }
+
+    async fn transition(
+        &self,
+        state: WorkflowRunState,
+        failure_code: Option<&str>,
+        output: Option<&str>,
+    ) {
+        let _ = self
+            .store
             .update_workflow_run(
-                &tenant_id,
-                &subject,
-                &run_id,
-                WorkflowRunState::Failed,
-                Some("workflow_observation_timed_out"),
-                None,
+                &self.tenant_id,
+                &self.subject,
+                &self.run_id,
+                state,
+                failure_code,
+                output,
             )
             .await;
+    }
+
+    async fn observe(&self) {
+        self.observe_window(300, Duration::from_millis(500)).await;
+    }
+
+    async fn observe_window(&self, attempts: usize, interval: Duration) {
+        for attempt in 0..attempts {
+            let task = match self.client.get_task(&self.bearer, &self.task_id).await {
+                Ok(task) => task,
+                Err(error) if retryable_workflow_observation(&error) => {
+                    if attempt + 1 < attempts {
+                        tokio::time::sleep(interval).await;
+                    }
+                    continue;
+                }
+                Err(_) => return,
+            };
+            if !self.owns(&task) {
+                self.transition(
+                    WorkflowRunState::Failed,
+                    Some("workflow_task_binding_refused"),
+                    None,
+                )
+                .await;
+                return;
+            }
+            match workflow_task_outcome(task.status, task.output) {
+                WorkflowTaskOutcome::Accepted => {}
+                WorkflowTaskOutcome::Running => {
+                    self.transition(WorkflowRunState::Running, None, None).await;
+                }
+                WorkflowTaskOutcome::Succeeded(output) => {
+                    self.transition(WorkflowRunState::Succeeded, None, Some(&output))
+                        .await;
+                    return;
+                }
+                WorkflowTaskOutcome::Failed(code) => {
+                    self.transition(WorkflowRunState::Failed, Some(code), None)
+                        .await;
+                    return;
+                }
+            }
+            if attempt + 1 < attempts {
+                tokio::time::sleep(interval).await;
+            }
+        }
+    }
+}
+
+fn retryable_workflow_observation(error: &AgentPlatformClientError) -> bool {
+    match error {
+        AgentPlatformClientError::Transport(_) => true,
+        AgentPlatformClientError::Refused(status) => {
+            matches!(*status, 408 | 425 | 429 | 500..=599)
+        }
+        AgentPlatformClientError::Configuration => false,
+    }
+}
+
+async fn submit_workflow_task(
+    client: &AgentPlatformClient,
+    bearer: &str,
+    task: &SubmitTask,
+) -> Result<Task, AgentPlatformClientError> {
+    client.submit_task(bearer, task).await
+}
+
+fn workflow_task_outcome(status: TaskStatus, output: Option<String>) -> WorkflowTaskOutcome {
+    match status {
+        TaskStatus::Accepted => WorkflowTaskOutcome::Accepted,
+        TaskStatus::Running | TaskStatus::AwaitingApproval => WorkflowTaskOutcome::Running,
+        TaskStatus::Succeeded => WorkflowTaskOutcome::Succeeded(
+            output
+                .filter(|output| !output.trim().is_empty())
+                .unwrap_or_else(|| {
+                    "# Workflow result\n\nThe workflow completed without a Markdown result."
+                        .to_owned()
+                }),
+        ),
+        TaskStatus::Failed => WorkflowTaskOutcome::Failed("workflow_execution_failed"),
+        TaskStatus::Cancelled => WorkflowTaskOutcome::Failed("workflow_execution_cancelled"),
+        TaskStatus::Refused => WorkflowTaskOutcome::Failed("workflow_execution_refused"),
+        TaskStatus::OutcomeUnknown => WorkflowTaskOutcome::Failed("workflow_outcome_unknown"),
+    }
+}
+
+async fn spawn_workflow_completion(observation: WorkflowObservation) {
+    if !observation.observers.begin(&observation.run_id).await {
+        return;
+    }
+    let observers = observation.observers.clone();
+    let run_id = observation.run_id.clone();
+    tokio::spawn(async move {
+        observation.observe().await;
+        observers.finish(&run_id).await;
     });
 }
 
@@ -5655,27 +5789,669 @@ async fn shutdown() {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use connectors_client::operation::OwnerContext;
     use sha2::Digest as _;
 
     use super::{
-        Authority, CompleteWorkspaceFile, MaterializedFile, SUBSTRATE_SCOPE, agentide_grants,
+        AppState, Authority, CompleteWorkspaceFile, MaterializedFile, SUBSTRATE_SCOPE,
+        WorkflowObservation, WorkflowObservers, WorkflowTaskOutcome, agentide_grants,
         agentide_session_row, canonical_diff, coding_intent_profile, diff_pin_content,
         file_operation_id, install_crypto_provider, language_for_path, repository_candidate,
-        sha256_text, source_file_input, source_manifest_sha256, strict_repository_entry,
+        resume_workflow_completions, sha256_text, source_file_input, source_manifest_sha256,
+        spawn_workflow_completion, strict_repository_entry, submit_workflow_task,
         terminal_grant_row_matches, terminal_session_row_matches, valid_repository_path,
-        validate_identity_transport,
+        validate_identity_transport, workflow_task_outcome,
     };
+    use crate::store::Store;
+    use agent_platform_client::AgentPlatformClient;
+    use agent_platform_core::{AgentId, SubmitTask, TaskId, TaskStatus};
     use agentide_contracts::{ActorContext, ActorKind, authorize_intent};
+    use axum::Json;
+    use axum::Router;
+    use axum::http::{HeaderMap, header};
+    use axum::response::IntoResponse as _;
+    use axum::routing::{get, post};
     use workspace_core::{
         ChangeSelector, CodingSession, CodingSessionState, DiffMode, FileExpectedState,
-        MaterializationLimits, WriteFile,
+        MaterializationLimits, Project, StartWorkflow, WorkflowRunState, WriteFile,
     };
+    use workspace_service::terminal::{TerminalBrokers, TerminalProfiles, TerminalReplayHub};
 
     #[test]
     fn installs_the_process_crypto_provider_before_tls_clients_are_built() {
         install_crypto_provider().expect("AWS-LC provider should install");
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[test]
+    fn workflow_task_terminal_states_project_to_named_safe_results() {
+        assert_eq!(
+            workflow_task_outcome(TaskStatus::Succeeded, None),
+            WorkflowTaskOutcome::Succeeded(
+                "# Workflow result\n\nThe workflow completed without a Markdown result.".to_owned()
+            )
+        );
+        for (status, code) in [
+            (TaskStatus::Failed, "workflow_execution_failed"),
+            (TaskStatus::Cancelled, "workflow_execution_cancelled"),
+            (TaskStatus::Refused, "workflow_execution_refused"),
+            (TaskStatus::OutcomeUnknown, "workflow_outcome_unknown"),
+        ] {
+            assert_eq!(
+                workflow_task_outcome(status, None),
+                WorkflowTaskOutcome::Failed(code)
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Full restart seam includes durable store and HTTP task recovery.
+    async fn persisted_workflow_task_resumes_with_fresh_observer_and_session() {
+        let database_url = "sqlite:file:workflow-observer-restart?mode=memory&cache=shared";
+        let original = Store::connect_lazy(database_url).expect("original store");
+        original.ready().await.expect("original schema");
+        let authority = Authority {
+            tenant_id: "tenant-one".to_owned(),
+            subject: "person:owner".to_owned(),
+            connector_bearer: "not-retained".to_owned(),
+            agent_platform_bearer: None,
+            session_authorization: "Bearer expired-session".to_owned(),
+            context: OwnerContext {
+                tenant_id: "tenant-one".to_owned(),
+                agent_id: "workspace:test".to_owned(),
+                agent_revision: 1,
+                authority_snapshot_id: "identity:test".to_owned(),
+                authority_snapshot_sha256: "a".repeat(64),
+            },
+        };
+        original
+            .open_project(
+                &authority,
+                &Project {
+                    id: "project-workflow-recovery".to_owned(),
+                    forge_instance_ref: "connection:git:one".to_owned(),
+                    project_ref: "project-workflow-recovery".to_owned(),
+                    path_with_namespace: "group/project".to_owned(),
+                    name: "project".to_owned(),
+                    default_branch: Some("trunk".to_owned()),
+                    selected_branch: "trunk".to_owned(),
+                    pinned_commit: Some("c".repeat(40)),
+                    web_url: "https://git.example.test/group/project".to_owned(),
+                },
+            )
+            .await
+            .expect("project");
+        let run = original
+            .start_workflow(
+                &authority,
+                "project-workflow-recovery",
+                &StartWorkflow {
+                    definition_id: "review.code/v1".to_owned(),
+                    branch: "trunk".to_owned(),
+                    commit: "c".repeat(40),
+                    idempotency_key: "restart-observation".to_owned(),
+                },
+            )
+            .await
+            .expect("run");
+        original
+            .record_workflow_task(&authority, &run.id, "task-one")
+            .await
+            .expect("task reference");
+
+        let restarted = Store::connect_lazy(database_url).expect("restarted store");
+        restarted.ready().await.expect("restarted schema");
+        let recoverable = restarted
+            .recoverable_workflow_tasks(&authority, "project-workflow-recovery")
+            .await
+            .expect("recoverable task");
+        assert_eq!(recoverable.len(), 1);
+
+        let task = serde_json::json!({
+            "id": "task-one",
+            "tenant_id": "tenant-one",
+            "agent_id": "agent-one",
+            "agent_revision": 1,
+            "capability_profile_id": null,
+            "idempotency_key": format!("workspace-workflow:{}", run.id),
+            "input": {},
+            "status": "succeeded",
+            "attempt_id": "attempt-one",
+            "output": "# Durable review\n\nNo findings.",
+            "actor": "person:owner",
+            "executor": null,
+            "delegation_id": null,
+            "request_id": "request-one",
+            "accepted_at_ms": 1,
+            "completed_at_ms": 2
+        });
+        let app = Router::new().route(
+            "/v1/tasks/{task_id}",
+            get(move |headers: HeaderMap| {
+                let task = task.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Bearer fresh-session")
+                    );
+                    Json(task)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+        let client =
+            AgentPlatformClient::new(&format!("http://{address}")).expect("Agent Platform client");
+        spawn_workflow_completion(WorkflowObservation {
+            store: restarted.clone(),
+            client,
+            observers: WorkflowObservers::default(),
+            bearer: "Bearer fresh-session".to_owned(),
+            tenant_id: authority.tenant_id.clone(),
+            subject: authority.subject.clone(),
+            run_id: recoverable[0].run_id.clone(),
+            task_id: TaskId::new(recoverable[0].task_id.clone()).expect("task id"),
+        })
+        .await;
+
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let observed = restarted
+                    .workflow_runs(&authority, "project-workflow-recovery")
+                    .await
+                    .expect("workflow runs")
+                    .remove(0);
+                if observed.state == WorkflowRunState::Succeeded {
+                    break observed;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovered observer completed");
+        assert_eq!(completed.failure_code, None);
+        assert_eq!(
+            completed.output.as_deref(),
+            Some("# Durable review\n\nNo findings.")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn recoverable_workflow_survives_a_session_without_agent_platform_authority() {
+        let store = Store::connect_lazy("sqlite::memory:").expect("store");
+        store.ready().await.expect("schema");
+        let authority = Authority {
+            tenant_id: "tenant-one".to_owned(),
+            subject: "person:owner".to_owned(),
+            connector_bearer: "not-retained".to_owned(),
+            agent_platform_bearer: None,
+            session_authorization: "Bearer session-without-agent-platform".to_owned(),
+            context: OwnerContext {
+                tenant_id: "tenant-one".to_owned(),
+                agent_id: "workspace:test".to_owned(),
+                agent_revision: 1,
+                authority_snapshot_id: "identity:test".to_owned(),
+                authority_snapshot_sha256: "a".repeat(64),
+            },
+        };
+        store
+            .open_project(
+                &authority,
+                &Project {
+                    id: "project-workflow-recovery".to_owned(),
+                    forge_instance_ref: "connection:git:one".to_owned(),
+                    project_ref: "project-workflow-recovery".to_owned(),
+                    path_with_namespace: "group/project".to_owned(),
+                    name: "project".to_owned(),
+                    default_branch: Some("trunk".to_owned()),
+                    selected_branch: "trunk".to_owned(),
+                    pinned_commit: Some("c".repeat(40)),
+                    web_url: "https://git.example.test/group/project".to_owned(),
+                },
+            )
+            .await
+            .expect("project");
+        let run = store
+            .start_workflow(
+                &authority,
+                "project-workflow-recovery",
+                &StartWorkflow {
+                    definition_id: "review.code/v1".to_owned(),
+                    branch: "trunk".to_owned(),
+                    commit: "c".repeat(40),
+                    idempotency_key: "missing-authority".to_owned(),
+                },
+            )
+            .await
+            .expect("run");
+        store
+            .record_workflow_task(&authority, &run.id, "task-one")
+            .await
+            .expect("task reference");
+
+        let state = AppState {
+            identity: identity_client::IdentityClient::new(
+                "http://127.0.0.1:1",
+                "urn:b10x:workspace",
+            )
+            .expect("identity client"),
+            connectors: connectors_client::HostedClient::new("http://127.0.0.1:1")
+                .expect("connectors client"),
+            agent_platform: Some(
+                AgentPlatformClient::new("http://127.0.0.1:1").expect("Agent Platform client"),
+            ),
+            project_agent_model: Some("model:test".to_owned()),
+            aep: None,
+            substrate: None,
+            terminal_profiles: TerminalProfiles::load(None).expect("terminal profiles"),
+            terminal_brokers: TerminalBrokers::default(),
+            terminal_replay: TerminalReplayHub::default(),
+            workflow_observers: WorkflowObservers::default(),
+            store: store.clone(),
+        };
+
+        resume_workflow_completions(&state, &authority, "project-workflow-recovery")
+            .await
+            .expect("missing authority is not a durable failure");
+
+        let observed = store
+            .workflow_runs(&authority, "project-workflow-recovery")
+            .await
+            .expect("workflow runs")
+            .remove(0);
+        assert_eq!(observed.state, WorkflowRunState::Accepted);
+        assert_eq!(observed.failure_code, None);
+        assert_eq!(observed.output, None);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Exercises one complete retryable observation boundary.
+    async fn transient_workflow_observation_failure_remains_recoverable() {
+        let store = Store::connect_lazy("sqlite::memory:").expect("store");
+        store.ready().await.expect("schema");
+        let authority = Authority {
+            tenant_id: "tenant-one".to_owned(),
+            subject: "person:owner".to_owned(),
+            connector_bearer: "not-retained".to_owned(),
+            agent_platform_bearer: Some("Bearer current-session".to_owned()),
+            session_authorization: "Bearer current-session".to_owned(),
+            context: OwnerContext {
+                tenant_id: "tenant-one".to_owned(),
+                agent_id: "workspace:test".to_owned(),
+                agent_revision: 1,
+                authority_snapshot_id: "identity:test".to_owned(),
+                authority_snapshot_sha256: "a".repeat(64),
+            },
+        };
+        store
+            .open_project(
+                &authority,
+                &Project {
+                    id: "project-workflow-retry".to_owned(),
+                    forge_instance_ref: "connection:git:one".to_owned(),
+                    project_ref: "project-workflow-retry".to_owned(),
+                    path_with_namespace: "group/project".to_owned(),
+                    name: "project".to_owned(),
+                    default_branch: Some("trunk".to_owned()),
+                    selected_branch: "trunk".to_owned(),
+                    pinned_commit: Some("c".repeat(40)),
+                    web_url: "https://git.example.test/group/project".to_owned(),
+                },
+            )
+            .await
+            .expect("project");
+        let run = store
+            .start_workflow(
+                &authority,
+                "project-workflow-retry",
+                &StartWorkflow {
+                    definition_id: "review.code/v1".to_owned(),
+                    branch: "trunk".to_owned(),
+                    commit: "c".repeat(40),
+                    idempotency_key: "transient-observation".to_owned(),
+                },
+            )
+            .await
+            .expect("run");
+        store
+            .record_workflow_task(&authority, &run.id, "task-one")
+            .await
+            .expect("task reference");
+
+        let task = serde_json::json!({
+            "id": "task-one",
+            "tenant_id": "tenant-one",
+            "agent_id": "agent-one",
+            "agent_revision": 1,
+            "capability_profile_id": null,
+            "idempotency_key": format!("workspace-workflow:{}", run.id),
+            "input": {},
+            "status": "succeeded",
+            "attempt_id": "attempt-one",
+            "output": "# Recovered after a transient read failure",
+            "actor": "person:owner",
+            "executor": null,
+            "delegation_id": null,
+            "request_id": "request-one",
+            "accepted_at_ms": 1,
+            "completed_at_ms": 2
+        });
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/v1/tasks/{task_id}",
+            get({
+                let attempts = attempts.clone();
+                move || {
+                    let attempts = attempts.clone();
+                    let task = task.clone();
+                    async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        } else {
+                            Json(task).into_response()
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+        let client =
+            AgentPlatformClient::new(&format!("http://{address}")).expect("Agent Platform client");
+        spawn_workflow_completion(WorkflowObservation {
+            store: store.clone(),
+            client,
+            observers: WorkflowObservers::default(),
+            bearer: "Bearer current-session".to_owned(),
+            tenant_id: authority.tenant_id.clone(),
+            subject: authority.subject.clone(),
+            run_id: run.id.clone(),
+            task_id: TaskId::new("task-one").expect("task id"),
+        })
+        .await;
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let observed = store
+                    .workflow_runs(&authority, "project-workflow-retry")
+                    .await
+                    .expect("workflow runs")
+                    .remove(0);
+                if matches!(
+                    observed.state,
+                    WorkflowRunState::Succeeded
+                        | WorkflowRunState::Failed
+                        | WorkflowRunState::Refused
+                ) {
+                    break observed;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("observer reached a terminal state");
+        assert_eq!(terminal.state, WorkflowRunState::Succeeded);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn long_running_workflow_remains_recoverable_when_observation_window_ends() {
+        let store = Store::connect_lazy("sqlite::memory:").expect("store");
+        store.ready().await.expect("schema");
+        let authority = workflow_test_authority();
+        let run =
+            admitted_workflow_test_run(&store, &authority, "project-long-workflow", "long-running")
+                .await;
+        store
+            .record_workflow_task(&authority, &run.id, "task-long")
+            .await
+            .expect("task reference");
+
+        let task = workflow_test_task(&run, "task-long", "awaiting_approval", None);
+        let app = Router::new().route(
+            "/v1/tasks/{task_id}",
+            get(move || {
+                let task = task.clone();
+                async move { Json(task) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+        let observation = WorkflowObservation {
+            store: store.clone(),
+            client: AgentPlatformClient::new(&format!("http://{address}"))
+                .expect("Agent Platform client"),
+            observers: WorkflowObservers::default(),
+            bearer: "Bearer current-session".to_owned(),
+            tenant_id: authority.tenant_id.clone(),
+            subject: authority.subject.clone(),
+            run_id: run.id,
+            task_id: TaskId::new("task-long").expect("task id"),
+        };
+        observation
+            .observe_window(1, std::time::Duration::ZERO)
+            .await;
+
+        let observed = store
+            .workflow_runs(&authority, "project-long-workflow")
+            .await
+            .expect("workflow runs")
+            .remove(0);
+        assert_eq!(observed.state, WorkflowRunState::Running);
+        assert_eq!(observed.failure_code, None);
+        assert_eq!(observed.output, None);
+        assert_eq!(
+            store
+                .recoverable_workflow_tasks(&authority, "project-long-workflow")
+                .await
+                .expect("recoverable workflow")
+                .len(),
+            1
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Covers the ambiguous submit and same-key replay boundary.
+    async fn ambiguous_workflow_submit_failure_remains_idempotently_retryable() {
+        let store = Store::connect_lazy("sqlite::memory:").expect("store");
+        store.ready().await.expect("schema");
+        let authority = workflow_test_authority();
+        let input = StartWorkflow {
+            definition_id: "review.code/v1".to_owned(),
+            branch: "trunk".to_owned(),
+            commit: "c".repeat(40),
+            idempotency_key: "ambiguous-submit".to_owned(),
+        };
+        store
+            .open_project(
+                &authority,
+                &workflow_test_project("project-ambiguous-submit"),
+            )
+            .await
+            .expect("project");
+        let run = store
+            .start_workflow(&authority, "project-ambiguous-submit", &input)
+            .await
+            .expect("run");
+        let task = workflow_test_task(&run, "task-submit", "accepted", None);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let expected_key = format!("workspace-workflow:{}", run.id);
+        let app = Router::new().route(
+            "/v1/tasks",
+            post({
+                let attempts = attempts.clone();
+                move |Json(request): Json<serde_json::Value>| {
+                    let attempts = attempts.clone();
+                    let expected_key = expected_key.clone();
+                    let task = task.clone();
+                    async move {
+                        assert_eq!(
+                            request
+                                .get("idempotency_key")
+                                .and_then(serde_json::Value::as_str),
+                            Some(expected_key.as_str())
+                        );
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        } else {
+                            Json(task).into_response()
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+        let client =
+            AgentPlatformClient::new(&format!("http://{address}")).expect("Agent Platform client");
+        let request = SubmitTask {
+            agent_id: AgentId::new("agent-one").expect("agent id"),
+            idempotency_key: format!("workspace-workflow:{}", run.id),
+            input: serde_json::json!({"kind": "project_conversation"}),
+        };
+
+        assert!(
+            submit_workflow_task(&client, "Bearer current-session", &request)
+                .await
+                .is_err()
+        );
+        let accepted = store
+            .workflow_runs(&authority, "project-ambiguous-submit")
+            .await
+            .expect("workflow runs")
+            .remove(0);
+        assert_eq!(accepted.state, WorkflowRunState::Accepted);
+        assert_eq!(accepted.failure_code, None);
+        assert_eq!(accepted.output, None);
+
+        let replay = store
+            .start_workflow(&authority, "project-ambiguous-submit", &input)
+            .await
+            .expect("replayed run");
+        assert_eq!(replay.id, run.id);
+        let task = submit_workflow_task(&client, "Bearer current-session", &request)
+            .await
+            .expect("idempotent retry");
+        store
+            .record_workflow_task(&authority, &run.id, task.id.as_str())
+            .await
+            .expect("task reference");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            store.workflow_task(&authority, &run.id).await.unwrap(),
+            Some("task-submit".to_owned())
+        );
+        server.abort();
+    }
+
+    fn workflow_test_authority() -> Authority {
+        Authority {
+            tenant_id: "tenant-one".to_owned(),
+            subject: "person:owner".to_owned(),
+            connector_bearer: "not-retained".to_owned(),
+            agent_platform_bearer: Some("Bearer current-session".to_owned()),
+            session_authorization: "Bearer current-session".to_owned(),
+            context: OwnerContext {
+                tenant_id: "tenant-one".to_owned(),
+                agent_id: "workspace:test".to_owned(),
+                agent_revision: 1,
+                authority_snapshot_id: "identity:test".to_owned(),
+                authority_snapshot_sha256: "a".repeat(64),
+            },
+        }
+    }
+
+    fn workflow_test_project(id: &str) -> Project {
+        Project {
+            id: id.to_owned(),
+            forge_instance_ref: "connection:git:one".to_owned(),
+            project_ref: id.to_owned(),
+            path_with_namespace: "group/project".to_owned(),
+            name: "project".to_owned(),
+            default_branch: Some("trunk".to_owned()),
+            selected_branch: "trunk".to_owned(),
+            pinned_commit: Some("c".repeat(40)),
+            web_url: "https://git.example.test/group/project".to_owned(),
+        }
+    }
+
+    async fn admitted_workflow_test_run(
+        store: &Store,
+        authority: &Authority,
+        project_id: &str,
+        idempotency_key: &str,
+    ) -> workspace_core::WorkflowRun {
+        store
+            .open_project(authority, &workflow_test_project(project_id))
+            .await
+            .expect("project");
+        store
+            .start_workflow(
+                authority,
+                project_id,
+                &StartWorkflow {
+                    definition_id: "review.code/v1".to_owned(),
+                    branch: "trunk".to_owned(),
+                    commit: "c".repeat(40),
+                    idempotency_key: idempotency_key.to_owned(),
+                },
+            )
+            .await
+            .expect("run")
+    }
+
+    fn workflow_test_task(
+        run: &workspace_core::WorkflowRun,
+        task_id: &str,
+        status: &str,
+        output: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": task_id,
+            "tenant_id": "tenant-one",
+            "agent_id": "agent-one",
+            "agent_revision": 1,
+            "capability_profile_id": null,
+            "idempotency_key": format!("workspace-workflow:{}", run.id),
+            "input": {},
+            "status": status,
+            "attempt_id": "attempt-one",
+            "output": output,
+            "actor": "person:owner",
+            "executor": null,
+            "delegation_id": null,
+            "request_id": "request-one",
+            "accepted_at_ms": 1,
+            "completed_at_ms": null
+        })
     }
 
     #[test]

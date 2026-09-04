@@ -76,6 +76,13 @@ pub struct StoredTerminal {
     pub initial_rows: u16,
 }
 
+/// Durable Agent Platform task reference for one non-terminal workflow run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoverableWorkflowTask {
+    pub run_id: String,
+    pub task_id: String,
+}
+
 /// Tenant-scoped durable Workspace state.
 #[derive(Clone)]
 pub struct Store {
@@ -90,7 +97,7 @@ impl Store {
             return Err(StoreError::Configuration);
         }
         sqlx::any::install_default_drivers();
-        let maximum = if database_url.contains(":memory:") {
+        let maximum = if database_url.contains(":memory:") || database_url.contains("mode=memory") {
             1
         } else {
             8
@@ -1175,6 +1182,46 @@ impl Store {
         Ok(recorded)
     }
 
+    /// Read the durable Agent Platform task reference for one owned workflow run.
+    pub async fn workflow_task(
+        &self,
+        authority: &Authority,
+        run_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        self.ensure_schema().await?;
+        sqlx::query_scalar("SELECT t.task_id FROM workspace_workflow_tasks t JOIN workspace_workflow_runs r ON r.run_id = t.run_id AND r.tenant_id = t.tenant_id AND r.actor_subject = t.actor_subject WHERE r.tenant_id = ? AND r.actor_subject = ? AND r.run_id = ?")
+            .bind(&authority.tenant_id)
+            .bind(&authority.subject)
+            .bind(run_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(StoreError::Database)
+    }
+
+    /// List durable task references whose workflow projections still need terminal observation.
+    pub async fn recoverable_workflow_tasks(
+        &self,
+        authority: &Authority,
+        project_id: &str,
+    ) -> Result<Vec<RecoverableWorkflowTask>, StoreError> {
+        self.ensure_schema().await?;
+        let rows = sqlx::query("SELECT r.run_id, t.task_id FROM workspace_workflow_runs r JOIN workspace_workflow_tasks t ON t.run_id = r.run_id AND t.tenant_id = r.tenant_id AND t.actor_subject = r.actor_subject WHERE r.tenant_id = ? AND r.actor_subject = ? AND r.project_id = ? AND r.state IN ('accepted', 'running') ORDER BY r.created_at_ms")
+            .bind(&authority.tenant_id)
+            .bind(&authority.subject)
+            .bind(project_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(StoreError::Database)?;
+        rows.iter()
+            .map(|row| {
+                Ok(RecoverableWorkflowTask {
+                    run_id: row.try_get("run_id").map_err(|_| StoreError::Corrupt)?,
+                    task_id: row.try_get("task_id").map_err(|_| StoreError::Corrupt)?,
+                })
+            })
+            .collect()
+    }
+
     /// Persist a monotonic workflow state transition and optional final Markdown output.
     pub async fn update_workflow_run(
         &self,
@@ -1184,15 +1231,26 @@ impl Store {
         state: WorkflowRunState,
         failure_code: Option<&str>,
         output: Option<&str>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         self.ensure_schema().await?;
         let state_name = match state {
-            WorkflowRunState::Accepted => "accepted",
+            WorkflowRunState::Accepted => return Err(StoreError::Conflict),
             WorkflowRunState::Running => "running",
             WorkflowRunState::Succeeded => "succeeded",
             WorkflowRunState::Failed => "failed",
             WorkflowRunState::Refused => "refused",
         };
+        let valid_projection = match state {
+            WorkflowRunState::Running => failure_code.is_none() && output.is_none(),
+            WorkflowRunState::Succeeded => failure_code.is_none() && output.is_some(),
+            WorkflowRunState::Failed | WorkflowRunState::Refused => {
+                failure_code.is_some_and(|code| !code.is_empty()) && output.is_none()
+            }
+            WorkflowRunState::Accepted => false,
+        };
+        if !valid_projection {
+            return Err(StoreError::Conflict);
+        }
         let mut transaction = self.pool.begin().await.map_err(StoreError::Database)?;
         let updated = sqlx::query("UPDATE workspace_workflow_runs SET state = ?, failure_code = ?, updated_at_ms = ? WHERE tenant_id = ? AND actor_subject = ? AND run_id = ? AND state NOT IN ('succeeded', 'failed', 'refused')")
             .bind(state_name)
@@ -1215,9 +1273,11 @@ impl Store {
             if exists.is_none() {
                 return Err(StoreError::NotFound);
             }
+            transaction.commit().await.map_err(StoreError::Database)?;
+            return Ok(false);
         }
         if let Some(output) = output {
-            sqlx::query("INSERT INTO workspace_workflow_results (run_id, output, created_at_ms) VALUES (?, ?, ?) ON CONFLICT (run_id) DO NOTHING")
+            sqlx::query("INSERT INTO workspace_workflow_results (run_id, output, created_at_ms) VALUES (?, ?, ?)")
                 .bind(run_id)
                 .bind(output)
                 .bind(as_i64(now_ms()?)?)
@@ -1225,7 +1285,8 @@ impl Store {
                 .await
                 .map_err(StoreError::Database)?;
         }
-        transaction.commit().await.map_err(StoreError::Database)
+        transaction.commit().await.map_err(StoreError::Database)?;
+        Ok(true)
     }
 
     async fn owned_thread(
@@ -2029,5 +2090,137 @@ mod tests {
             store.start_workflow(&actor, "project-one", &changed).await,
             Err(StoreError::Conflict)
         ));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Exercises durable recovery, terminal CAS, and task assignment.
+    async fn workflow_task_recovery_and_terminal_completion_are_durable_and_single_assignment() {
+        let store = store().await;
+        let actor = authority("person:actor");
+        store.open_project(&actor, &project()).await.unwrap();
+        let run = store
+            .start_workflow(
+                &actor,
+                "project-one",
+                &StartWorkflow {
+                    definition_id: "review.code/v1".to_owned(),
+                    branch: "trunk".to_owned(),
+                    commit: "c".repeat(40),
+                    idempotency_key: "recover-after-restart".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .record_workflow_task(&actor, &run.id, "task-one")
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .record_workflow_task(&actor, &run.id, "task-two")
+                .await,
+            Err(StoreError::Conflict)
+        ));
+        assert_eq!(
+            store.workflow_task(&actor, &run.id).await.unwrap(),
+            Some("task-one".to_owned())
+        );
+        assert_eq!(
+            store
+                .workflow_task(&authority("person:other"), &run.id)
+                .await
+                .unwrap(),
+            None
+        );
+
+        let recoverable = store
+            .recoverable_workflow_tasks(&actor, "project-one")
+            .await
+            .unwrap();
+        assert_eq!(recoverable.len(), 1);
+        assert_eq!(recoverable[0].run_id, run.id);
+        assert_eq!(recoverable[0].task_id, "task-one");
+
+        assert!(
+            store
+                .update_workflow_run(
+                    &actor.tenant_id,
+                    &actor.subject,
+                    &run.id,
+                    WorkflowRunState::Succeeded,
+                    None,
+                    Some("# Recovered result"),
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .update_workflow_run(
+                    &actor.tenant_id,
+                    &actor.subject,
+                    &run.id,
+                    WorkflowRunState::Failed,
+                    Some("workflow_execution_failed"),
+                    None,
+                )
+                .await
+                .unwrap()
+        );
+
+        assert!(
+            store
+                .recoverable_workflow_tasks(&actor, "project-one")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let completed = store.workflow_runs(&actor, "project-one").await.unwrap();
+        assert_eq!(completed[0].state, WorkflowRunState::Succeeded);
+        assert_eq!(completed[0].failure_code, None);
+        assert_eq!(completed[0].output.as_deref(), Some("# Recovered result"));
+
+        let second = store
+            .start_workflow(
+                &actor,
+                "project-one",
+                &StartWorkflow {
+                    definition_id: "review.security/v1".to_owned(),
+                    branch: "trunk".to_owned(),
+                    commit: "c".repeat(40),
+                    idempotency_key: "second-run".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .record_workflow_task(&actor, &second.id, "task-one")
+                .await
+                .unwrap(),
+            "task-one"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_upgrade_accepts_legacy_workflow_task_rows() {
+        let store =
+            Store::connect_lazy("sqlite:file:legacy-workflow-task-schema?mode=memory&cache=shared")
+                .expect("store");
+        sqlx::query(
+            "CREATE TABLE workspace_workflow_tasks (run_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, actor_subject TEXT NOT NULL, task_id TEXT NOT NULL, created_at_ms BIGINT NOT NULL)",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("legacy task table");
+        for run_id in ["run-one", "run-two"] {
+            sqlx::query("INSERT INTO workspace_workflow_tasks (run_id, tenant_id, actor_subject, task_id, created_at_ms) VALUES (?, 'tenant-one', 'person:owner', 'legacy-task', 1)")
+                .bind(run_id)
+                .execute(&store.pool)
+                .await
+                .expect("legacy task row");
+        }
+
+        store.ready().await.expect("compatible schema upgrade");
     }
 }
