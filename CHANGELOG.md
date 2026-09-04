@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.16 - 2026-09-04
+
+- Acknowledge coding-session creation with a durable `preparing` session, resume interrupted
+  preparation under fresh user authority, and expose the existing terminal states without holding
+  an HTTP request open for repository materialization.
+- Fetch repository files and populate both Substrate materializations with bounded concurrency,
+  while retaining exact-revision checks, idempotent Substrate operation identities, and
+  credential-free durable state.
+- Bound ordinary Workspace client requests to 30 seconds while leaving explicit streaming
+  transports independent of that unary timeout.
+
 ## 0.2.15 - 2026-09-04
 
 - Persist the Agent Platform task reference before accepting a project Workflow run, resume
