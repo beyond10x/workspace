@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.15 - 2026-09-04
+
+- Persist the Agent Platform task reference before accepting a project Workflow run, resume
+  authenticated observation after process restart, and suppress duplicate observers.
+- Bind recovered tasks to their tenant, actor, run, and idempotency identity and commit exactly one
+  succeeded or named failed terminal result while leaving transient failures recoverable.
+
 ## 0.2.14 - 2026-09-04
 
 - Consume AEP 0.51.0 so Workspace compiles against the current released AEP contract graph. AEP
