@@ -255,7 +255,7 @@ impl WorkspaceClient {
         .await
     }
 
-    /// Search and list a bounded working-materialization tree with explicit truncation state.
+    /// Search and list a bounded working-materialization tree using the predecessor wire shape.
     pub async fn coding_tree(
         &self,
         authorization: &str,
@@ -267,6 +267,37 @@ impl WorkspaceClient {
             .append_pair("query", query)
             .append_pair("limit", &limit.to_string())
             .finish();
+        self.exchange(
+            Method::GET,
+            &format!("v1/sessions/{session_id}/tree?{suffix}"),
+            authorization,
+            Option::<&()>::None,
+        )
+        .await
+    }
+
+    /// Read one bounded page of a materialized directory without walking the repository.
+    pub async fn coding_tree_page(
+        &self,
+        authorization: &str,
+        session_id: &str,
+        path: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<CodingTreeProjection, ClientError> {
+        // `form_urlencoded::Serializer` contains a non-`Sync` callback slot. Keep it out of the
+        // future state that crosses the network await so callers may use this client from Axum
+        // handlers, whose futures must be `Send`.
+        let suffix = {
+            let mut query = url::form_urlencoded::Serializer::new(String::new());
+            query
+                .append_pair("path", path)
+                .append_pair("limit", &limit.to_string());
+            if let Some(cursor) = cursor {
+                query.append_pair("cursor", cursor);
+            }
+            query.finish()
+        };
         self.exchange(
             Method::GET,
             &format!("v1/sessions/{session_id}/tree?{suffix}"),

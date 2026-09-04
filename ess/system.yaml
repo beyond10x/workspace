@@ -1,0 +1,10 @@
+format: ess/1
+system: workspace
+version: v1
+
+summary: >-
+  Actor-owned repository projects and exact-revision coding sessions whose immutable source intent
+  is reserved before any external Git or Substrate mutation.
+
+domains:
+  - workspace.coding

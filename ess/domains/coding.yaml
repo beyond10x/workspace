@@ -1,0 +1,218 @@
+domain: workspace.coding
+summary: Durable, actor-owned intent and lifecycle for one exact Git-backed coding materialization.
+naming: {wire: coding-sessions, display: Coding sessions}
+
+types:
+  - {name: workspace.coding.SessionId, kind: newtype, of: String}
+  - {name: workspace.coding.ProjectId, kind: newtype, of: String}
+  - {name: workspace.coding.OwnerRef, kind: newtype, of: String}
+  - {name: workspace.coding.SourceRevision, kind: newtype, of: String}
+  - {name: workspace.coding.ForgeInstanceRef, kind: newtype, of: String}
+  - {name: workspace.coding.ProviderProjectRef, kind: newtype, of: String}
+  - {name: workspace.coding.BranchRef, kind: newtype, of: String}
+  - {name: workspace.coding.MaterializationRef, kind: newtype, of: String}
+  - {name: workspace.coding.ManifestDigest, kind: newtype, of: String}
+  - {name: workspace.coding.FailureCode, kind: newtype, of: String}
+  - name: workspace.coding.GitSourceIntent
+    kind: struct
+    fields:
+      - {name: forge_instance_ref, type: workspace.coding.ForgeInstanceRef}
+      - {name: provider_project_ref, type: workspace.coding.ProviderProjectRef}
+      - {name: branch, type: workspace.coding.BranchRef}
+
+entities:
+  - name: workspace.coding.CodingSession
+    identity: {name: session_id, type: workspace.coding.SessionId}
+    fields:
+      - {name: project_id, type: workspace.coding.ProjectId}
+      # The runtime derives owner from the authenticated Identity session; requests never supply it.
+      - {name: owner, type: workspace.coding.OwnerRef}
+      - {name: source_revision, type: workspace.coding.SourceRevision}
+      # This value is written atomically with reservation and is immutable thereafter. Recovery
+      # reads it directly instead of reconstructing it from the mutable current Project snapshot.
+      - {name: source, type: workspace.coding.GitSourceIntent}
+      - {name: materialization_ref, type: Optional<workspace.coding.MaterializationRef>}
+      - {name: manifest_digest, type: Optional<workspace.coding.ManifestDigest>}
+      - {name: failure_code, type: Optional<workspace.coding.FailureCode>}
+    lifecycle:
+      initial: Preparing
+      states: [Preparing, Ready, Refused, Closing, Closed, Unknown]
+      # Closed may be reopened as Unknown when a create response arrives after close inventory.
+      # Refused may still be closed idempotently, so neither is terminal in the state-machine sense.
+      terminal: []
+      transitions:
+        - {name: publish, from: [Preparing], to: Ready}
+        - {name: refuse, from: [Preparing], to: Refused}
+        - {name: begin-close, from: [Preparing, Ready, Unknown], to: Closing}
+        - {name: close, from: [Closing, Refused], to: Closed}
+        - {name: retain-uncertain-cleanup, from: [Preparing, Closing, Closed, Unknown], to: Unknown}
+
+actors:
+  - name: workspace.coding.Engineer
+    may: [workspace.coding.ReserveSession, workspace.coding.CloseSession]
+    naming: {display: Engineer}
+  - name: workspace.coding.MaterializationWorker
+    may:
+      - workspace.coding.PublishSession
+      - workspace.coding.RefuseSession
+      - workspace.coding.CompleteClose
+      - workspace.coding.RetainUncertainCleanup
+    naming: {display: Materialization worker}
+
+errors:
+  - name: workspace.coding.SessionFailure
+    summary: The exact owned session could not be reserved, materialized, recovered, or cleaned.
+    fields:
+      - {name: code, type: workspace.coding.FailureCode}
+      - {name: retryable, type: Boolean}
+  - name: workspace.coding.SessionStateConflict
+    summary: The session is not in a state from which this transition is admitted.
+    fields:
+      - {name: state, type: workspace.coding.CodingSession.State}
+
+commands:
+  - name: workspace.coding.ReserveSession
+    naming: {wire: reserve, display: Reserve coding session}
+    input:
+      - {name: project_id, type: workspace.coding.ProjectId}
+      - {name: source_revision, type: workspace.coding.SourceRevision}
+      - {name: source, type: workspace.coding.GitSourceIntent}
+    outcomes:
+      - name: reserved
+        creates: workspace.coding.CodingSession
+        instance: session_id
+        emits: [workspace.coding.SessionReserved]
+        payload:
+          workspace.coding.SessionReserved:
+            project_id: input.project_id
+            source_revision: input.source_revision
+            source: input.source
+      - {name: refused, external: current Connector authority does not admit the exact source, error: workspace.coding.SessionFailure}
+
+  - name: workspace.coding.PublishSession
+    naming: {wire: publish, display: Publish materialized session}
+    input:
+      - {name: session_id, type: workspace.coding.SessionId}
+      - {name: materialization_ref, type: workspace.coding.MaterializationRef}
+      - {name: manifest_digest, type: workspace.coding.ManifestDigest}
+    outcomes:
+      - name: published
+        moves: workspace.coding.CodingSession.publish
+        instance: session_id
+        emits: [workspace.coding.SessionPublished]
+        payload:
+          workspace.coding.SessionPublished:
+            session_id: input.session_id
+            materialization_ref: input.materialization_ref
+            manifest_digest: input.manifest_digest
+      - {name: wrong-state, wrong_state: true, error: workspace.coding.SessionStateConflict}
+      - {name: refused, external: durable publication is unavailable, error: workspace.coding.SessionFailure}
+
+  - name: workspace.coding.RefuseSession
+    naming: {wire: refuse, display: Refuse coding session}
+    input:
+      - {name: session_id, type: workspace.coding.SessionId}
+      - {name: failure_code, type: workspace.coding.FailureCode}
+    outcomes:
+      - name: refused
+        moves: workspace.coding.CodingSession.refuse
+        instance: session_id
+        emits: [workspace.coding.SessionRefused]
+        payload:
+          workspace.coding.SessionRefused:
+            session_id: input.session_id
+            failure_code: input.failure_code
+      - {name: wrong-state, wrong_state: true, error: workspace.coding.SessionStateConflict}
+
+  - name: workspace.coding.CloseSession
+    naming: {wire: close, display: Close coding session}
+    input:
+      - {name: session_id, type: workspace.coding.SessionId}
+    outcomes:
+      - name: closing
+        moves: workspace.coding.CodingSession.begin-close
+        instance: session_id
+        emits: [workspace.coding.SessionCloseBegan]
+        payload:
+          workspace.coding.SessionCloseBegan:
+            session_id: input.session_id
+      - {name: wrong-state, wrong_state: true, error: workspace.coding.SessionStateConflict}
+      - {name: refused, external: Substrate cleanup is unavailable, error: workspace.coding.SessionFailure}
+
+  - name: workspace.coding.RetainUncertainCleanup
+    naming: {wire: cleanup-uncertain, display: Retain uncertain cleanup}
+    input:
+      - {name: session_id, type: workspace.coding.SessionId}
+      - {name: materialization_ref, type: workspace.coding.MaterializationRef}
+      - {name: failure_code, type: workspace.coding.FailureCode}
+    outcomes:
+      - name: retained
+        moves: workspace.coding.CodingSession.retain-uncertain-cleanup
+        instance: session_id
+        emits: [workspace.coding.SessionCleanupBecameUnknown]
+        payload:
+          workspace.coding.SessionCleanupBecameUnknown:
+            session_id: input.session_id
+            materialization_ref: input.materialization_ref
+            failure_code: input.failure_code
+      - {name: wrong-state, wrong_state: true, error: workspace.coding.SessionStateConflict}
+
+  - name: workspace.coding.CompleteClose
+    naming: {wire: close-complete, display: Complete coding-session close}
+    input:
+      - {name: session_id, type: workspace.coding.SessionId}
+    outcomes:
+      - name: closed
+        moves: workspace.coding.CodingSession.close
+        instance: session_id
+        emits: [workspace.coding.SessionClosed]
+        payload:
+          workspace.coding.SessionClosed:
+            session_id: input.session_id
+      - {name: wrong-state, wrong_state: true, error: workspace.coding.SessionStateConflict}
+      - {name: refused, external: durable cleanup completion is unavailable, error: workspace.coding.SessionFailure}
+
+events:
+  - name: workspace.coding.SessionReserved
+    fields:
+      - {name: session_id, type: workspace.coding.SessionId}
+      - {name: project_id, type: workspace.coding.ProjectId}
+      - {name: owner, type: workspace.coding.OwnerRef}
+      - {name: source_revision, type: workspace.coding.SourceRevision}
+      - {name: source, type: workspace.coding.GitSourceIntent}
+  - name: workspace.coding.SessionPublished
+    fields:
+      - {name: session_id, type: workspace.coding.SessionId}
+      - {name: materialization_ref, type: workspace.coding.MaterializationRef}
+      - {name: manifest_digest, type: workspace.coding.ManifestDigest}
+  - name: workspace.coding.SessionRefused
+    fields:
+      - {name: session_id, type: workspace.coding.SessionId}
+      - {name: failure_code, type: workspace.coding.FailureCode}
+  - name: workspace.coding.SessionCloseBegan
+    fields:
+      - {name: session_id, type: workspace.coding.SessionId}
+  - name: workspace.coding.SessionCleanupBecameUnknown
+    fields:
+      - {name: session_id, type: workspace.coding.SessionId}
+      - {name: materialization_ref, type: workspace.coding.MaterializationRef}
+      - {name: failure_code, type: workspace.coding.FailureCode}
+  - name: workspace.coding.SessionClosed
+    fields:
+      - {name: session_id, type: workspace.coding.SessionId}
+
+views:
+  - name: workspace.coding.SessionSnapshot
+    source: workspace.coding.CodingSession
+    consistency: read_your_writes
+    fields:
+      - {name: session_id, type: workspace.coding.SessionId}
+      - {name: project_id, type: workspace.coding.ProjectId}
+      - {name: owner, type: workspace.coding.OwnerRef}
+      - {name: source_revision, type: workspace.coding.SourceRevision}
+      - {name: source, type: workspace.coding.GitSourceIntent}
+      - {name: materialization_ref, type: Optional<workspace.coding.MaterializationRef>}
+      - {name: manifest_digest, type: Optional<workspace.coding.ManifestDigest>}
+      - {name: failure_code, type: Optional<workspace.coding.FailureCode>}
+      - {name: state, type: workspace.coding.CodingSession.State}
+    naming: {wire: snapshot, display: Coding session snapshot}

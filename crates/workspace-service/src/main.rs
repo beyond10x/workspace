@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aep_client::AepClient;
@@ -31,26 +31,25 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, serve};
 use b10x_substrate_sdk::{
-    AccessToken, Client as SubstrateClient, ExecutionPolicy, ExpectedFileState, PipeChannel,
-    PipeFrame, PipeSessionState, PtyWindow, RefusalClass as SubstrateRefusalClass,
-    SdkError as SubstrateError, Signal, Workspace as SubstrateWorkspace, WorkspaceAccess,
+    AccessToken, Client as SubstrateClient, DirectoryEntryKind, ExecutionPolicy, ExpectedFileState,
+    PipeChannel, PipeFrame, PipeSessionState, PtyWindow, RefusalClass as SubstrateRefusalClass,
+    SdkError as SubstrateError, Signal, StorageLimit, Workspace as SubstrateWorkspace,
+    WorkspaceAccess,
 };
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use connectors_client::HostedClient;
 use connectors_client::datasource::{
     BindingSearchRequest, DatasourceRead, DatasourceRequest, DatasourceResult, DescribeRequest,
     ReadRequest,
 };
 use connectors_client::operation::{self, OwnerContext};
-use futures_util::{StreamExt as _, TryStreamExt as _, stream};
+use connectors_client::{ClientError as ConnectorsError, HostedClient};
 use identity_client::{IdentityClient, SessionAuthority};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use similar::{ChangeTag, TextDiff};
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 use workspace_core::{
     Branch, ChangeSelector, CodingActorViewRequest, CodingIntentInvocation, CodingIntentResult,
     CodingSession, CodingSessionState, CodingTreeEntry, CodingTreeProjection, CreateCodingSession,
@@ -62,12 +61,15 @@ use workspace_core::{
     TerminalSession, TerminalState, TerminalWorkspaceAccess, WorkflowDefinition, WorkflowRunState,
     WriteFile,
 };
+use zeroize::Zeroizing;
 
 mod aep;
 mod store;
 
 use aep::{AepTransport, RequestCredential};
-use store::{SessionReservation, Store, StoreError, StoredTerminal, TerminalReservation};
+use store::{
+    CodingSessionSource, SessionReservation, Store, StoreError, StoredTerminal, TerminalReservation,
+};
 use workspace_service::terminal::{
     TerminalBroker, TerminalBrokerCommand, TerminalBrokerEvent, TerminalBrokers, TerminalProfiles,
     TerminalReplayHub,
@@ -82,13 +84,20 @@ const SUBSTRATE_AUDIENCE: &str = "urn:b10x:substrate";
 const SUBSTRATE_SCOPE: &str = "exec observe workspaces";
 const SOURCE_MATERIALIZATION_LIMITS: MaterializationLimits = MaterializationLimits {
     max_files: b10x_substrate_sdk::MAX_LIST_ITEMS,
-    max_total_bytes: 256 * 1024 * 1024,
-    // Connector operation results are capped at 256 KiB and file bytes are base64 plus JSON.
-    max_file_bytes: 180 * 1024,
+    // Connectors' bounded Smart Git session and Substrate's storage quota share this ceiling.
+    max_total_bytes: 1024 * 1024 * 1024,
+    max_file_bytes: b10x_substrate_sdk::MAX_FILE_BYTES,
 };
-const MAX_SOURCE_DIRECTORIES: usize = 4_096;
-const SOURCE_FETCH_CONCURRENCY: usize = 16;
-const MATERIALIZATION_UPLOAD_CONCURRENCY: usize = 8;
+// One inode is the enforceable upper bound for one materialized filesystem entry. Keeping this
+// equal to `max_files` prevents the storage plane from admitting a repository shape the API can
+// never fully enumerate or diff.
+const SOURCE_MATERIALIZATION_INODES: u64 = 1_000;
+const SUBSTRATE_TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
+const SUBSTRATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const GIT_FETCH_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_MATERIALIZATION_TIMEOUT: Duration = Duration::from_secs(120);
+const GIT_MATERIALIZATION_RECOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+const MATERIALIZATION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_MATERIALIZATION_KEY_BYTES: usize = 256;
 const MAX_CONTEXT_SELECTIONS: usize = 8;
 const MAX_CONTEXT_SELECTION_BYTES: usize = 32 * 1024;
@@ -177,22 +186,47 @@ struct MaterializationWorkers {
 }
 
 impl MaterializationWorkers {
-    async fn is_active(&self, session_id: &str) -> bool {
-        self.active.lock().await.contains(session_id)
+    fn is_active(&self, session_id: &str) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(session_id)
     }
 
-    async fn begin(&self, session_id: &str) -> bool {
-        self.active.lock().await.insert(session_id.to_owned())
+    fn begin(&self, session_id: &str) -> Option<MaterializationWorkerGuard> {
+        if !self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.to_owned())
+        {
+            return None;
+        }
+        Some(MaterializationWorkerGuard {
+            workers: self.clone(),
+            session_id: session_id.to_owned(),
+        })
     }
+}
 
-    async fn finish(&self, session_id: &str) {
-        self.active.lock().await.remove(session_id);
+struct MaterializationWorkerGuard {
+    workers: MaterializationWorkers,
+    session_id: String,
+}
+
+impl Drop for MaterializationWorkerGuard {
+    fn drop(&mut self) {
+        self.workers
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.session_id);
     }
 }
 
 #[derive(Clone, Default)]
 struct WorkflowObservers {
-    active: Arc<Mutex<BTreeSet<String>>>,
+    active: Arc<AsyncMutex<BTreeSet<String>>>,
 }
 
 impl WorkflowObservers {
@@ -556,7 +590,7 @@ fn agentide_session_row(
     if matching.next().is_some()
         || row.state != "Active"
         || row.owner != authority.subject
-        || Some(row.workspace_root.as_str()) != session.working_materialization_ref.as_deref()
+        || Some(row.workspace_root.as_str()) != session.materialization_ref.as_deref()
         || row.workspace_session_id.as_deref() != Some(session.id.as_str())
         || row.project_id.as_deref() != Some(session.project_id.as_str())
         || row.source_revision.as_deref() != Some(session.source_revision.as_str())
@@ -1032,7 +1066,7 @@ async fn coding_actor_view(
         Ok(authority) => authority,
         Err(response) => return response,
     };
-    let (session, base, working) =
+    let (session, working) =
         match ready_session_materializations(&state, &authority, &session_id).await {
             Ok(materializations) => materializations,
             Err(response) => return response,
@@ -1085,22 +1119,13 @@ async fn coding_actor_view(
             "coding_intent_inventory_invalid",
         );
     };
-    let base_files = match materialization_files(&base, &session).await {
-        Ok(files) => files,
-        Err(response) => return response,
-    };
-    let working_files = match materialization_files(&working, &session).await {
-        Ok(files) => files,
-        Err(response) => return response,
-    };
-    let diff = canonical_diff(
-        &ChangeSelector::Workspace,
-        DiffMode::Patch,
-        &session.source_revision,
-        &base_files,
-        &working_files,
-        &verified.actor.subject,
-    );
+    let diff =
+        match git_diff_projection(&working, &session, DiffMode::Patch, &verified.actor.subject)
+            .await
+        {
+            Ok(diff) => diff,
+            Err(response) => return response,
+        };
     let mut recent_activity = Vec::new();
     let mut focused_selections = Vec::new();
     let mut selection_count = 0;
@@ -1340,7 +1365,7 @@ async fn invoke_coding_intent(
         Ok(authority) => authority,
         Err(response) => return response,
     };
-    let (session, base, working) =
+    let (session, working) =
         match ready_session_materializations(&state, &authority, &session_id).await {
             Ok(materializations) => materializations,
             Err(response) => return response,
@@ -1448,22 +1473,18 @@ async fn invoke_coding_intent(
                     "coding_intent_arguments_invalid",
                 );
             }
-            let base_files = match materialization_files(&base, &session).await {
-                Ok(files) => files,
-                Err(response) => return response,
-            };
-            let working_files = match materialization_files(&working, &session).await {
-                Ok(files) => files,
-                Err(response) => return response,
-            };
-            match serde_json::to_value(canonical_diff(
-                &ChangeSelector::Workspace,
+            let diff = match git_diff_projection(
+                &working,
+                &session,
                 DiffMode::Patch,
-                &session.source_revision,
-                &base_files,
-                &working_files,
                 &verified.actor.subject,
-            )) {
+            )
+            .await
+            {
+                Ok(diff) => diff,
+                Err(response) => return response,
+            };
+            match serde_json::to_value(diff) {
                 Ok(value) => value,
                 Err(_) => {
                     return problem(StatusCode::BAD_GATEWAY, "coding_intent_result_invalid");
@@ -1527,13 +1548,8 @@ async fn invoke_coding_intent(
                 }
                 Err(error) => return substrate_problem(&error),
             }
-            let file = match project_file(
-                &arguments.path,
-                &base,
-                &working,
-                session.limits.max_file_bytes,
-            )
-            .await
+            let file = match project_file(&arguments.path, &working, session.limits.max_file_bytes)
+                .await
             {
                 Ok(Some(file)) => file,
                 Ok(None) => {
@@ -1595,13 +1611,8 @@ async fn invoke_coding_intent(
                 }
                 Err(error) => return substrate_problem(&error),
             }
-            let file = match project_file(
-                &arguments.path,
-                &base,
-                &working,
-                session.limits.max_file_bytes,
-            )
-            .await
+            let file = match project_file(&arguments.path, &working, session.limits.max_file_bytes)
+                .await
             {
                 Ok(Some(file)) => file,
                 Ok(None) => {
@@ -1891,17 +1902,38 @@ async fn coding_session(
         Err(response) => return response,
     };
     if session.state == CodingSessionState::Preparing
-        && !state.materialization_workers.is_active(&session.id).await
-        && let Ok(Some(client)) = substrate_client(&state, &authority).await
+        && !state.materialization_workers.is_active(&session.id)
     {
-        spawn_coding_session_materialization(
-            state.clone(),
-            authority,
-            project,
-            client,
-            session.clone(),
-        )
-        .await;
+        let source = match state
+            .store
+            .coding_session_source(&authority, &session.id)
+            .await
+        {
+            // The durable source intent is the recovery authority. It deliberately does not depend
+            // on the mutable current Project snapshot after reservation.
+            Ok(source) => Some(source),
+            // A rolling predecessor has no source-intent companion row. Backfill below is admitted
+            // only when the current snapshot proves the exact same source coordinates.
+            Err(StoreError::NotFound) => {
+                match coding_materialization_source(&project, &session.source_revision) {
+                    Ok(source) => match state
+                        .store
+                        .backfill_coding_session_source(&authority, &session, &project, &source)
+                        .await
+                    {
+                        Ok(source) => Some(source),
+                        Err(_) => {
+                            return problem(StatusCode::CONFLICT, "coding_session_source_conflict");
+                        }
+                    },
+                    Err(_) => None,
+                }
+            }
+            Err(_) => None,
+        };
+        if let Some(source) = source {
+            spawn_coding_session_materialization(state.clone(), authority, source, session.clone());
+        }
     }
     confidential(Json(public_session(session)).into_response())
 }
@@ -1909,19 +1941,32 @@ async fn coding_session(
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct CodingTreeQuery {
-    query: String,
+    query: Option<String>,
+    path: Option<String>,
+    cursor: Option<String>,
     limit: u32,
 }
 
 impl Default for CodingTreeQuery {
     fn default() -> Self {
         Self {
-            query: String::new(),
+            query: None,
+            path: None,
+            cursor: None,
             limit: 1_000,
         }
     }
 }
 
+#[derive(Serialize)]
+struct LegacyCodingTreeProjection {
+    format: String,
+    entries: Vec<CodingTreeEntry>,
+    truncated: bool,
+    omitted: Option<u64>,
+}
+
+#[allow(clippy::too_many_lines)] // Keeps both rolling wire shapes visibly bound to one route.
 async fn coding_tree(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1934,9 +1979,17 @@ async fn coding_tree(
             "coding_tree_query_invalid",
         );
     };
+    let legacy_query = query.query.as_deref();
+    let path = query.path.as_deref().unwrap_or_default();
     if query.limit == 0
         || query.limit > b10x_substrate_sdk::MAX_LIST_ITEMS
-        || query.query.len() > 512
+        || query.query.as_ref().is_some_and(|value| value.len() > 512)
+        || (query.query.is_some() && (query.path.is_some() || query.cursor.is_some()))
+        || (!path.is_empty() && !valid_repository_path(path))
+        || query
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.len() > 1_024)
     {
         return problem(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1947,39 +2000,82 @@ async fn coding_tree(
         Ok(authority) => authority,
         Err(response) => return response,
     };
-    let (session, _, working) =
+    let (session, working) =
         match ready_session_materializations(&state, &authority, &session_id).await {
             Ok(materializations) => materializations,
             Err(response) => return response,
         };
-    let tree = match working.tree(session.limits.max_files, true).await {
-        Ok(tree) => tree,
+    if let Some(needle) = legacy_query {
+        let tree = match working.tree(session.limits.max_files, true).await {
+            Ok(tree) => tree,
+            Err(error) => return substrate_problem(&error),
+        };
+        let needle = needle.to_ascii_lowercase();
+        let matching = tree
+            .items
+            .into_iter()
+            .filter_map(|entry| {
+                let kind = serde_json::to_value(entry.kind).ok()?.as_str()?.to_owned();
+                if !needle.is_empty() && !entry.path.to_ascii_lowercase().contains(&needle) {
+                    return None;
+                }
+                Some(CodingTreeEntry {
+                    path: entry.path,
+                    kind,
+                    size: entry.size,
+                    sha256: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        let returned = matching.len().min(query.limit as usize);
+        let omitted = (!tree.truncated).then_some((matching.len() - returned) as u64);
+        return confidential(
+            Json(LegacyCodingTreeProjection {
+                format: "workspace.coding-tree/1".to_owned(),
+                entries: matching.into_iter().take(returned).collect(),
+                truncated: tree.truncated || omitted.is_some_and(|count| count > 0),
+                omitted: if tree.truncated { None } else { omitted },
+            })
+            .into_response(),
+        );
+    }
+    let page = match working
+        .read_directory(path, query.cursor.as_deref(), query.limit)
+        .await
+    {
+        Ok(page) => page,
         Err(error) => return substrate_problem(&error),
     };
-    let needle = query.query.to_ascii_lowercase();
-    let matching = tree
+    let entries = page
         .items
         .into_iter()
-        .filter_map(|entry| {
-            let kind = serde_json::to_value(entry.kind).ok()?.as_str()?.to_owned();
-            if !needle.is_empty() && !entry.path.to_ascii_lowercase().contains(&needle) {
-                return None;
-            }
-            Some(CodingTreeEntry {
-                path: entry.path,
-                kind,
+        .map(|entry| {
+            let path = if path.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{path}/{}", entry.name)
+            };
+            CodingTreeEntry {
+                path,
+                kind: match entry.kind {
+                    DirectoryEntryKind::File => "file",
+                    DirectoryEntryKind::Directory => "directory",
+                    DirectoryEntryKind::Symlink => "symlink",
+                }
+                .to_owned(),
                 size: entry.size,
                 sha256: None,
-            })
+            }
         })
         .collect::<Vec<_>>();
-    let returned = matching.len().min(query.limit as usize);
-    let omitted = (!tree.truncated).then_some((matching.len() - returned) as u64);
+    let truncated = page.next_cursor.is_some();
     let projection = CodingTreeProjection {
-        format: "workspace.coding-tree/1".to_owned(),
-        entries: matching.into_iter().take(returned).collect(),
-        truncated: tree.truncated || omitted.is_some_and(|count| count > 0),
-        omitted: if tree.truncated { None } else { omitted },
+        format: "workspace.coding-tree/2".to_owned(),
+        root: path.to_owned(),
+        entries,
+        next_cursor: page.next_cursor,
+        truncated,
+        omitted: None,
     };
     confidential(Json(projection).into_response())
 }
@@ -1999,12 +2095,12 @@ async fn coding_file(
         Ok(authority) => authority,
         Err(response) => return response,
     };
-    let (session, base, working) =
+    let (session, working) =
         match ready_session_materializations(&state, &authority, &session_id).await {
             Ok(materializations) => materializations,
             Err(response) => return response,
         };
-    match project_file(&path, &base, &working, session.limits.max_file_bytes).await {
+    match project_file(&path, &working, session.limits.max_file_bytes).await {
         Ok(Some(file)) => confidential(Json(file).into_response()),
         Ok(None) => problem(StatusCode::NOT_FOUND, "workspace_file_not_found"),
         Err(response) => response,
@@ -2034,7 +2130,7 @@ async fn write_coding_file(
         Ok(authority) => authority,
         Err(response) => return response,
     };
-    let (session, base, working) =
+    let (session, working) =
         match ready_session_materializations(&state, &authority, &session_id).await {
             Ok(materializations) => materializations,
             Err(response) => return response,
@@ -2062,7 +2158,7 @@ async fn write_coding_file(
         )
         .await;
     match result {
-        Ok(_) => match project_file(&path, &base, &working, session.limits.max_file_bytes).await {
+        Ok(_) => match project_file(&path, &working, session.limits.max_file_bytes).await {
             Ok(Some(file)) => {
                 let status = if matches!(input.expected, FileExpectedState::Absent) {
                     StatusCode::CREATED
@@ -2077,10 +2173,10 @@ async fn write_coding_file(
         Err(SubstrateError::Refusal(refusal))
             if refusal.class == SubstrateRefusalClass::Conflict =>
         {
-            match project_file(&path, &base, &working, session.limits.max_file_bytes).await {
+            match project_file(&path, &working, session.limits.max_file_bytes).await {
                 Ok(Some(latest)) => {
                     let base =
-                        match base_file_projection(&path, &base, session.limits.max_file_bytes)
+                        match base_file_projection(&path, &working, session.limits.max_file_bytes)
                             .await
                         {
                             Ok(base) => base,
@@ -2122,27 +2218,16 @@ async fn resolve_diff(
         Ok(authority) => authority,
         Err(response) => return response,
     };
-    let (session, base, working) =
+    let (session, working) =
         match ready_session_materializations(&state, &authority, &session_id).await {
             Ok(materializations) => materializations,
             Err(response) => return response,
         };
-    let base_files = match materialization_files(&base, &session).await {
-        Ok(files) => files,
-        Err(response) => return response,
-    };
-    let working_files = match materialization_files(&working, &session).await {
-        Ok(files) => files,
-        Err(response) => return response,
-    };
-    let projection = canonical_diff(
-        &input.selector,
-        input.mode,
-        &session.source_revision,
-        &base_files,
-        &working_files,
-        &authority.subject,
-    );
+    let projection =
+        match git_diff_projection(&working, &session, input.mode, &authority.subject).await {
+            Ok(projection) => projection,
+            Err(response) => return response,
+        };
     confidential(Json(projection).into_response())
 }
 
@@ -2242,7 +2327,7 @@ async fn create_terminal(
         Ok(authority) => authority,
         Err(response) => return response,
     };
-    let (coding_session, _, working) =
+    let (coding_session, working) =
         match ready_session_materializations(&state, &authority, &session_id).await {
             Ok(materializations) => materializations,
             Err(response) => return response,
@@ -3011,7 +3096,7 @@ fn terminal_session_row_matches(
 ) -> bool {
     row.get("session_id").and_then(Value::as_str) == Some(agentide_session_id)
         && row.get("workspace_root").and_then(Value::as_str)
-            == coding_session.working_materialization_ref.as_deref()
+            == coding_session.materialization_ref.as_deref()
         && row.get("workspace_session_id").and_then(Value::as_str)
             == Some(coding_session.id.as_str())
         && row.get("project_id").and_then(Value::as_str) == Some(coding_session.project_id.as_str())
@@ -3131,9 +3216,11 @@ async fn close_coding_session(
         }
         Err(response) => return response,
     };
+    let worker_active = state.materialization_workers.is_active(&session.id);
     let terminal_cleanup_unknown = cleanup_terminals(&state, &authority, &client, &session).await;
-    let cleanup_unknown =
-        terminal_cleanup_unknown || cleanup_materializations(&client, &session).await;
+    let cleanup_unknown = worker_active
+        || terminal_cleanup_unknown
+        || cleanup_materializations(&state.store, &authority, &client, &session).await;
     let stored = if cleanup_unknown {
         state
             .store
@@ -3171,22 +3258,17 @@ async fn create_coding_session(
         Ok(project) => project,
         Err(response) => return response,
     };
-    if project.pinned_commit.as_deref() != Some(input.source_revision.as_str()) {
-        return problem(StatusCode::CONFLICT, "project_snapshot_stale");
-    }
-    let client = match substrate_client(&state, &authority).await {
-        Ok(Some(client)) => client,
-        Ok(None) => {
-            return problem(StatusCode::SERVICE_UNAVAILABLE, "substrate_unavailable");
-        }
-        Err(response) => return response,
+    let source = match coding_materialization_source(&project, &input.source_revision) {
+        Ok(source) => source,
+        Err(code) => return problem(StatusCode::CONFLICT, code),
     };
     let reservation = match state
         .store
         .reserve_coding_session(
             &authority,
-            &project_id,
+            &project,
             &input,
+            &source,
             SOURCE_MATERIALIZATION_LIMITS,
         )
         .await
@@ -3201,23 +3283,48 @@ async fn create_coding_session(
         SessionReservation::New(session) | SessionReservation::Existing(session) => session,
     };
 
-    spawn_coding_session_materialization(state, authority, project, client, session.clone()).await;
+    spawn_coding_session_materialization(state, authority, source, session.clone());
     confidential((StatusCode::ACCEPTED, Json(public_session(session))).into_response())
 }
 
-async fn spawn_coding_session_materialization(
+fn coding_materialization_source(
+    project: &Project,
+    source_revision: &str,
+) -> Result<CodingSessionSource, &'static str> {
+    if project.pinned_commit.as_deref() != Some(source_revision) {
+        return Err("project_snapshot_stale");
+    }
+    let default_branch = project
+        .default_branch
+        .as_deref()
+        .filter(|branch| valid_branch(branch))
+        .ok_or("coding_session_default_branch_required")?;
+    if project.selected_branch != default_branch {
+        return Err("coding_session_default_branch_required");
+    }
+    if !valid_ref(&project.forge_instance_ref) || !valid_ref(&project.project_ref) {
+        return Err("coding_session_source_invalid");
+    }
+    Ok(CodingSessionSource {
+        forge_instance_ref: project.forge_instance_ref.clone(),
+        provider_project_ref: project.project_ref.clone(),
+        branch: default_branch.to_owned(),
+    })
+}
+
+fn spawn_coding_session_materialization(
     state: AppState,
     authority: Authority,
-    project: Project,
-    client: SubstrateClient,
+    source: CodingSessionSource,
     session: CodingSession,
 ) {
-    if !state.materialization_workers.begin(&session.id).await {
+    let Some(worker_guard) = state.materialization_workers.begin(&session.id) else {
         return;
-    }
+    };
     tokio::spawn(async move {
+        let _worker_guard = worker_guard;
         Box::pin(prepare_coding_session_materialization(
-            state, authority, project, client, session,
+            state, authority, source, session,
         ))
         .await;
     });
@@ -3226,63 +3333,305 @@ async fn spawn_coding_session_materialization(
 async fn prepare_coding_session_materialization(
     state: AppState,
     authority: Authority,
-    project: Project,
-    client: SubstrateClient,
+    source: CodingSessionSource,
     session: CodingSession,
 ) {
-    let session_id = session.id.clone();
-    if let Ok(files) = collect_source_files(&state, &authority, &project).await {
-        if let Err((failed, _)) = Box::pin(provision_materializations(
-            state.clone(),
-            authority.clone(),
-            client.clone(),
-            session,
-            files,
-        ))
-        .await
-        {
-            let cleanup_unknown =
-                cleanup_materializations_owned(client.clone(), failed.clone()).await;
-            record_materialization_refusal(
-                state.store.clone(),
-                authority.clone(),
-                failed.id,
-                if cleanup_unknown {
-                    "materialization_cleanup_unknown"
-                } else {
-                    "substrate_materialization_refused"
-                },
-                cleanup_unknown,
-            )
-            .await;
+    let client = match substrate_client_result(&state, &authority).await {
+        Ok(client) => client,
+        Err(SubstrateClientFailure::Retryable) => return,
+        Err(SubstrateClientFailure::Unconfigured | SubstrateClientFailure::Refused) => {
+            let failure_code = if state.substrate.is_none() {
+                "substrate_unavailable"
+            } else {
+                "substrate_authority_refused"
+            };
+            record_materialization_refusal(state.store, authority, session, failure_code, false)
+                .await;
+            return;
         }
-    } else {
-        let cleanup_unknown = cleanup_materializations_owned(client, session.clone()).await;
+    };
+    if let Err((failed, failure_code, retryable)) = provision_git_materialization(
+        state.clone(),
+        authority.clone(),
+        client.clone(),
+        session,
+        source,
+    )
+    .await
+    {
+        if retryable {
+            return;
+        }
+        let cleanup_unknown = cleanup_materializations_owned(
+            state.store.clone(),
+            authority.clone(),
+            client,
+            failed.clone(),
+        )
+        .await;
         record_materialization_refusal(
             state.store.clone(),
             authority,
-            session.id,
+            failed,
             if cleanup_unknown {
                 "materialization_cleanup_unknown"
             } else {
-                "source_materialization_refused"
+                failure_code
             },
             cleanup_unknown,
         )
         .await;
     }
-    state.materialization_workers.finish(&session_id).await;
+}
+
+#[allow(clippy::too_many_lines)] // Security-sensitive broker, create, recovery, and publish order is explicit.
+async fn provision_git_materialization(
+    state: AppState,
+    authority: Authority,
+    client: SubstrateClient,
+    mut session: CodingSession,
+    source: CodingSessionSource,
+) -> Result<CodingSession, (CodingSession, &'static str, bool)> {
+    let session_label = session.id.clone();
+    let revision_label = session.source_revision.clone();
+    let labels = [
+        ("coding.session", session_label.as_str()),
+        ("materialization.role", "git-workspace"),
+        ("source.revision", revision_label.as_str()),
+    ];
+    if labels
+        .iter()
+        .any(|(key, value)| !valid_materialization_label(key, value))
+    {
+        return Err((session, "substrate_materialization_label_invalid", false));
+    }
+    let project_id = source
+        .provider_project_ref
+        .parse::<u64>()
+        .ok()
+        .filter(|project_id| *project_id > 0)
+        .ok_or_else(|| (session.clone(), "provider_project_invalid", false))?;
+    let fetch = tokio::time::timeout(
+        GIT_FETCH_SESSION_TIMEOUT,
+        state.connectors.create_git_fetch_session(
+            &authority.connector_bearer,
+            &authority.context,
+            connectors_client::git_fetch::CreateRequest {
+                idempotency_key: session.id.clone(),
+                connection_ref: source.forge_instance_ref.clone(),
+                project_id,
+                reference: source.branch.clone(),
+                expected_commit: session.source_revision.clone(),
+                depth: 50,
+            },
+        ),
+    )
+    .await
+    .map_err(|_| (session.clone(), "source_authority_timeout", true))?
+    .map_err(|error| {
+        (
+            session.clone(),
+            "source_authority_refused",
+            matches!(error, ConnectorsError::HostedUnavailable),
+        )
+    })?;
+    if fetch.reference != source.branch
+        || fetch.expected_commit != session.source_revision
+        || fetch.depth != 50
+    {
+        return Err((session, "source_authority_inconsistent", false));
+    }
+    let operation_id = substrate_operation_id(&session.id, &["create", "git-workspace"]);
+    let create = client
+        .workspace()
+        .git(
+            &fetch.source,
+            &fetch.locator,
+            &fetch.reference,
+            &fetch.expected_commit,
+            u16::from(fetch.depth),
+            fetch.expose_at_source_boundary(),
+        )
+        .label("coding.session", &session.id)
+        .label("materialization.role", "git-workspace")
+        .label("source.revision", &session.source_revision)
+        .storage(StorageLimit {
+            max_bytes: session.limits.max_total_bytes,
+            max_inodes: SOURCE_MATERIALIZATION_INODES,
+        })
+        .operation_id(&operation_id)
+        .create();
+    let workspace = match tokio::time::timeout(GIT_MATERIALIZATION_TIMEOUT, create).await {
+        Ok(Ok(workspace)) => workspace,
+        Ok(Err(error)) if retryable_substrate_error(&error) => {
+            recover_git_materialization(&client, &operation_id)
+                .await
+                .map_err(|failure| {
+                    (
+                        session.clone(),
+                        "substrate_materialization_unknown",
+                        failure == MaterializationRecoveryFailure::Retryable,
+                    )
+                })?
+        }
+        Ok(Err(_)) => {
+            return Err((session, "substrate_materialization_refused", false));
+        }
+        Err(_) => recover_git_materialization(&client, &operation_id)
+            .await
+            .map_err(|failure| {
+                (
+                    session.clone(),
+                    "substrate_materialization_timeout",
+                    failure == MaterializationRecoveryFailure::Retryable,
+                )
+            })?,
+    };
+    // Carry every answered resource reference immediately. Any later contract or store failure
+    // can then retire exactly this Workspace instead of leaking an unrecorded materialization.
+    session.materialization_ref = Some(workspace.id().to_owned());
+    if !materialization_labels_match(&workspace, &labels) {
+        return Err((session, "substrate_materialization_inconsistent", false));
+    }
+    session = state
+        .store
+        .record_materialization_ref(&authority, &session.id, workspace.id())
+        .await
+        .map_err(|_| {
+            (
+                session.clone(),
+                "workspace_materialization_record_unavailable",
+                // The created reference is known locally. Always enter cleanup instead of losing
+                // it behind a retry classification (notably when Close won the state CAS).
+                false,
+            )
+        })?;
+    let manifest_sha256 = git_source_manifest_sha256(&source, &session.source_revision);
+    state
+        .store
+        .complete_coding_session(&authority, &session.id, &manifest_sha256)
+        .await
+        .map_err(|_| {
+            (
+                session,
+                "workspace_materialization_publish_unavailable",
+                true,
+            )
+        })
+}
+
+async fn recover_git_materialization(
+    client: &SubstrateClient,
+    operation_id: &str,
+) -> Result<SubstrateWorkspace, MaterializationRecoveryFailure> {
+    let operation = tokio::time::timeout(
+        GIT_MATERIALIZATION_RECOVERY_TIMEOUT,
+        client.operation(operation_id),
+    )
+    .await
+    .map_err(|_| MaterializationRecoveryFailure::Retryable)?
+    .map_err(|_| MaterializationRecoveryFailure::Retryable)?;
+    if let Some(refusal) = operation.refusal {
+        return Err(if refusal.retriable {
+            MaterializationRecoveryFailure::Retryable
+        } else {
+            MaterializationRecoveryFailure::Refused
+        });
+    }
+    let reference = operation.resource.or_else(|| {
+        operation
+            .result
+            .as_ref()
+            .and_then(|result| result.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    let reference = reference.ok_or(MaterializationRecoveryFailure::Retryable)?;
+    tokio::time::timeout(
+        GIT_MATERIALIZATION_RECOVERY_TIMEOUT,
+        client.get_workspace(reference),
+    )
+    .await
+    .map_err(|_| MaterializationRecoveryFailure::Retryable)?
+    .map_err(|error| {
+        if retryable_substrate_error(&error)
+            || matches!(
+                &error,
+                SubstrateError::Refusal(refusal) if refusal.code == "resource.not-found"
+            )
+        {
+            MaterializationRecoveryFailure::Retryable
+        } else {
+            MaterializationRecoveryFailure::Refused
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaterializationRecoveryFailure {
+    Retryable,
+    Refused,
+}
+
+fn retryable_substrate_error(error: &SubstrateError) -> bool {
+    match error {
+        SubstrateError::Transport(_)
+        | SubstrateError::TokenUnavailable
+        | SubstrateError::UnknownOperation { .. } => true,
+        SubstrateError::Refusal(refusal) => refusal.retriable,
+        _ => false,
+    }
+}
+
+fn valid_materialization_label(key: &str, value: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 128
+        && value.len() <= 256
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+fn materialization_labels_match(workspace: &SubstrateWorkspace, expected: &[(&str, &str)]) -> bool {
+    expected.iter().all(|(key, value)| {
+        workspace
+            .observation()
+            .labels
+            .get(*key)
+            .is_some_and(|observed| observed == value)
+    })
+}
+
+fn git_source_manifest_sha256(source: &CodingSessionSource, source_revision: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"b10x/workspace/git-source/v1");
+    append_digest_part(&mut digest, source.forge_instance_ref.as_bytes());
+    append_digest_part(&mut digest, source.provider_project_ref.as_bytes());
+    append_digest_part(&mut digest, source.branch.as_bytes());
+    append_digest_part(&mut digest, source_revision.as_bytes());
+    hex::encode(digest.finalize())
 }
 
 async fn record_materialization_refusal(
     store: Store,
     authority: Authority,
-    session_id: String,
+    session: CodingSession,
     failure_code: &'static str,
     cleanup_unknown: bool,
 ) {
+    if cleanup_unknown && let Some(materialization_ref) = session.materialization_ref.as_deref() {
+        let _ = store
+            .retain_materialization_cleanup_unknown(
+                &authority,
+                &session.id,
+                materialization_ref,
+                failure_code,
+            )
+            .await;
+        return;
+    }
     let _ = store
-        .refuse_coding_session(&authority, &session_id, failure_code, cleanup_unknown)
+        .refuse_coding_session(&authority, &session.id, failure_code, cleanup_unknown)
         .await;
 }
 
@@ -3462,7 +3811,7 @@ async fn create_message(
             spawn_task_completion(
                 state.store.clone(),
                 agent_platform.clone(),
-                agent_platform_bearer.to_owned(),
+                Zeroizing::new(agent_platform_bearer.to_owned()),
                 authority.tenant_id,
                 authority.subject,
                 thread.id,
@@ -3715,7 +4064,7 @@ async fn start_workflow(
                 store: state.store.clone(),
                 client: agent_platform.clone(),
                 observers: state.workflow_observers.clone(),
-                bearer: agent_platform_bearer.to_owned(),
+                bearer: Zeroizing::new(agent_platform_bearer.to_owned()),
                 tenant_id: authority.tenant_id,
                 subject: authority.subject,
                 run_id: run.id.clone(),
@@ -3758,7 +4107,7 @@ async fn start_workflow(
         store: state.store.clone(),
         client: agent_platform.clone(),
         observers: state.workflow_observers.clone(),
-        bearer: agent_platform_bearer.to_owned(),
+        bearer: Zeroizing::new(agent_platform_bearer.to_owned()),
         tenant_id: authority.tenant_id,
         subject: authority.subject,
         run_id: run.id.clone(),
@@ -3818,10 +4167,17 @@ async fn accessible_project(
 struct Authority {
     tenant_id: String,
     subject: String,
-    connector_bearer: String,
-    agent_platform_bearer: Option<String>,
-    session_authorization: String,
+    connector_bearer: Zeroizing<String>,
+    agent_platform_bearer: Option<Zeroizing<String>>,
+    session_authorization: Zeroizing<String>,
     context: OwnerContext,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubstrateClientFailure {
+    Unconfigured,
+    Retryable,
+    Refused,
 }
 
 async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Authority, Response> {
@@ -3842,12 +4198,26 @@ async fn substrate_client(
     state: &AppState,
     authority: &Authority,
 ) -> Result<Option<SubstrateClient>, Response> {
+    match substrate_client_result(state, authority).await {
+        Ok(client) => Ok(Some(client)),
+        Err(SubstrateClientFailure::Unconfigured) => Ok(None),
+        Err(SubstrateClientFailure::Retryable | SubstrateClientFailure::Refused) => Err(problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "substrate_unavailable",
+        )),
+    }
+}
+
+async fn substrate_client_result(
+    state: &AppState,
+    authority: &Authority,
+) -> Result<SubstrateClient, SubstrateClientFailure> {
     let Some(configuration) = state.substrate.as_ref() else {
-        return Ok(None);
+        return Err(SubstrateClientFailure::Unconfigured);
     };
     let identity = state.identity.clone();
     let authorization = authority.session_authorization.clone();
-    SubstrateClient::builder()
+    let client = SubstrateClient::builder()
         .https_endpoint(&configuration.origin)
         .trust_roots(&configuration.ca_bundle)
         .server_identity(&configuration.server_identity)
@@ -3855,10 +4225,17 @@ async fn substrate_client(
             let identity = identity.clone();
             let authorization = authorization.clone();
             async move {
-                let access = identity
-                    .issue_access_token(&authorization, SUBSTRATE_AUDIENCE, SUBSTRATE_SCOPE)
-                    .await
-                    .map_err(|_| SubstrateError::TokenUnavailable)?;
+                let access = tokio::time::timeout(
+                    SUBSTRATE_TOKEN_TIMEOUT,
+                    identity.issue_access_token(
+                        &authorization,
+                        SUBSTRATE_AUDIENCE,
+                        SUBSTRATE_SCOPE,
+                    ),
+                )
+                .await
+                .map_err(|_| SubstrateError::TokenUnavailable)?
+                .map_err(|_| SubstrateError::TokenUnavailable)?;
                 AccessToken::new(
                     access
                         .credential
@@ -3867,17 +4244,24 @@ async fn substrate_client(
                 )
             }
         })
-        .connect()
+        .connect();
+    tokio::time::timeout(SUBSTRATE_CONNECT_TIMEOUT, client)
         .await
-        .map(Some)
-        .map_err(|_| problem(StatusCode::SERVICE_UNAVAILABLE, "substrate_unavailable"))
+        .map_err(|_| SubstrateClientFailure::Retryable)?
+        .map_err(|error| {
+            if retryable_substrate_error(&error) {
+                SubstrateClientFailure::Retryable
+            } else {
+                SubstrateClientFailure::Refused
+            }
+        })
 }
 
 async fn ready_session_materializations(
     state: &AppState,
     authority: &Authority,
     session_id: &str,
-) -> Result<(CodingSession, SubstrateWorkspace, SubstrateWorkspace), Response> {
+) -> Result<(CodingSession, SubstrateWorkspace), Response> {
     let session = state
         .store
         .coding_session(authority, session_id)
@@ -3887,33 +4271,20 @@ async fn ready_session_materializations(
     if session.state != CodingSessionState::Ready {
         return Err(problem(StatusCode::CONFLICT, "coding_session_not_ready"));
     }
-    let base_ref = session.base_materialization_ref.as_deref().ok_or_else(|| {
+    let materialization_ref = session.materialization_ref.as_deref().ok_or_else(|| {
         problem(
             StatusCode::SERVICE_UNAVAILABLE,
             "coding_session_inconsistent",
         )
     })?;
-    let working_ref = session
-        .working_materialization_ref
-        .as_deref()
-        .ok_or_else(|| {
-            problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "coding_session_inconsistent",
-            )
-        })?;
     let client = substrate_client(state, authority)
         .await?
         .ok_or_else(|| problem(StatusCode::SERVICE_UNAVAILABLE, "substrate_unavailable"))?;
-    let base = client
-        .get_workspace(base_ref)
-        .await
-        .map_err(|error| substrate_problem(&error))?;
     let working = client
-        .get_workspace(working_ref)
+        .get_workspace(materialization_ref)
         .await
         .map_err(|error| substrate_problem(&error))?;
-    Ok((session, base, working))
+    Ok((session, working))
 }
 
 async fn authority(
@@ -3937,7 +4308,7 @@ async fn authority(
     let agent_platform_bearer = state
         .agent_platform
         .as_ref()
-        .map(|_| authorization.to_owned());
+        .map(|_| Zeroizing::new(authorization.to_owned()));
     let mut digest = Sha256::new();
     digest.update(session.tenant_id.as_bytes());
     digest.update(b"\0");
@@ -3946,12 +4317,14 @@ async fn authority(
     Ok(Authority {
         tenant_id: session.tenant_id.clone(),
         subject: session.subject.clone(),
-        connector_bearer: access
-            .credential
-            .expose_at_authorization_boundary()
-            .to_owned(),
+        connector_bearer: Zeroizing::new(
+            access
+                .credential
+                .expose_at_authorization_boundary()
+                .to_owned(),
+        ),
         agent_platform_bearer,
-        session_authorization: authorization.to_owned(),
+        session_authorization: Zeroizing::new(authorization.to_owned()),
         context: OwnerContext {
             tenant_id: session.tenant_id,
             agent_id: format!("workspace:{}", session.subject),
@@ -4315,223 +4688,10 @@ async fn exact_repository_tree(
 }
 
 #[derive(Clone)]
-struct MaterializedFile {
-    path: String,
+struct CompleteWorkspaceFile {
     bytes: Vec<u8>,
     sha256: String,
-    executable: bool,
-}
-
-async fn collect_source_files(
-    state: &AppState,
-    authority: &Authority,
-    project: &Project,
-) -> Result<Vec<MaterializedFile>, Response> {
-    let commit = project
-        .pinned_commit
-        .as_deref()
-        .ok_or_else(|| problem(StatusCode::CONFLICT, "project_snapshot_unpinned"))?;
-    let project_id = project
-        .project_ref
-        .parse::<u64>()
-        .map_err(|_| problem(StatusCode::BAD_GATEWAY, "provider_project_invalid"))?;
-    let tree_description = operation_description(
-        state,
-        authority,
-        "gitlab-repository-tree-list",
-        &project.forge_instance_ref,
-    )
-    .await?;
-    let file_description = operation_description(
-        state,
-        authority,
-        "gitlab-repository-file-get",
-        &project.forge_instance_ref,
-    )
-    .await?;
-    let blobs = collect_source_entries(
-        state,
-        authority,
-        project,
-        &tree_description,
-        project_id,
-        commit,
-    )
-    .await?;
-    let mut files = stream::iter(blobs)
-        .map(|entry| {
-            let file_description = file_description.clone();
-            async move {
-                read_source_file(state, authority, project, &file_description, &entry, commit).await
-            }
-        })
-        .buffer_unordered(SOURCE_FETCH_CONCURRENCY)
-        .try_collect::<Vec<_>>()
-        .await?;
-    files.sort_by(|left, right| left.path.cmp(&right.path));
-    let mut total_bytes = 0_u64;
-    for file in &files {
-        total_bytes = total_bytes
-            .checked_add(file.bytes.len() as u64)
-            .ok_or_else(|| {
-                problem(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "repository_total_limit_exceeded",
-                )
-            })?;
-        if total_bytes > SOURCE_MATERIALIZATION_LIMITS.max_total_bytes {
-            return Err(problem(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "repository_total_limit_exceeded",
-            ));
-        }
-    }
-    Ok(files)
-}
-
-async fn collect_source_entries(
-    state: &AppState,
-    authority: &Authority,
-    project: &Project,
-    tree_description: &str,
-    project_id: u64,
-    commit: &str,
-) -> Result<Vec<RepositoryEntry>, Response> {
-    let mut directories = VecDeque::from([String::new()]);
-    let mut visited_directories = BTreeSet::new();
-    let mut seen_paths = BTreeSet::new();
-    let mut blobs = Vec::new();
-    while let Some(directory) = directories.pop_front() {
-        if !visited_directories.insert(directory.clone())
-            || visited_directories.len() > MAX_SOURCE_DIRECTORIES
-        {
-            return Err(problem(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "repository_tree_limit_exceeded",
-            ));
-        }
-        let mut page = 1_u64;
-        loop {
-            let mut input = serde_json::json!({
-                "project_id": project_id,
-                "ref": commit,
-                "page": page,
-                "per_page": 100
-            });
-            if !directory.is_empty() {
-                input
-                    .as_object_mut()
-                    .expect("static object")
-                    .insert("path".to_owned(), Value::String(directory.clone()));
-            }
-            let output = invoke_operation(
-                state,
-                authority,
-                operation::InvokeRequest {
-                    operation_ref: "gitlab-repository-tree-list".to_owned(),
-                    connection_ref: project.forge_instance_ref.clone(),
-                    description_ref: tree_description.to_owned(),
-                    input,
-                    approval_evidence_ref: None,
-                },
-            )
-            .await?;
-            let values = output
-                .as_array()
-                .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
-            for value in values {
-                let entry = strict_repository_entry(value)
-                    .map_err(|error| problem(error.status, error.code))?;
-                if !seen_paths.insert(entry.path.clone()) {
-                    return Err(problem(
-                        StatusCode::BAD_GATEWAY,
-                        "repository_tree_inconsistent",
-                    ));
-                }
-                match entry.kind {
-                    RepositoryEntryKind::Tree => directories.push_back(entry.path),
-                    RepositoryEntryKind::Blob => {
-                        if blobs.len()
-                            >= usize::try_from(SOURCE_MATERIALIZATION_LIMITS.max_files)
-                                .expect("file limit fits usize")
-                        {
-                            return Err(problem(
-                                StatusCode::PAYLOAD_TOO_LARGE,
-                                "repository_file_limit_exceeded",
-                            ));
-                        }
-                        blobs.push(entry);
-                    }
-                }
-            }
-            if values.len() < 100 {
-                break;
-            }
-            page = page.checked_add(1).ok_or_else(|| {
-                problem(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "repository_tree_limit_exceeded",
-                )
-            })?;
-        }
-    }
-    blobs.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(blobs)
-}
-
-#[derive(Clone, Copy)]
-struct EntryProblem {
-    status: StatusCode,
-    code: &'static str,
-}
-
-fn entry_problem(status: StatusCode, code: &'static str) -> EntryProblem {
-    EntryProblem { status, code }
-}
-
-fn strict_repository_entry(value: &Value) -> Result<RepositoryEntry, EntryProblem> {
-    let object_id = value
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| entry_problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
-    let name = value
-        .get("name")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| entry_problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
-    let path = value
-        .get("path")
-        .and_then(Value::as_str)
-        .filter(|value| valid_repository_path(value))
-        .ok_or_else(|| entry_problem(StatusCode::BAD_GATEWAY, "repository_path_refused"))?;
-    let mode = value
-        .get("mode")
-        .and_then(Value::as_str)
-        .ok_or_else(|| entry_problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
-    let kind = match (value.get("type").and_then(Value::as_str), mode) {
-        (Some("blob"), "100644" | "100755") => RepositoryEntryKind::Blob,
-        (Some("tree"), "040000") => RepositoryEntryKind::Tree,
-        (Some("commit"), _) | (_, "120000" | "160000") => {
-            return Err(entry_problem(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "repository_entry_unsupported",
-            ));
-        }
-        _ => {
-            return Err(entry_problem(
-                StatusCode::BAD_GATEWAY,
-                "repository_tree_inconsistent",
-            ));
-        }
-    };
-    Ok(RepositoryEntry {
-        object_id: object_id.to_owned(),
-        name: name.to_owned(),
-        path: path.to_owned(),
-        kind,
-        mode: mode.to_owned(),
-    })
+    size: u64,
 }
 
 fn valid_repository_path(path: &str) -> bool {
@@ -4544,262 +4704,15 @@ fn valid_repository_path(path: &str) -> bool {
             .all(|component| !component.is_empty() && !matches!(component, "." | ".." | ".git"))
 }
 
-async fn read_source_file(
-    state: &AppState,
-    authority: &Authority,
-    project: &Project,
-    description_ref: &str,
-    entry: &RepositoryEntry,
-    commit: &str,
-) -> Result<MaterializedFile, Response> {
-    let project_id = project
-        .project_ref
-        .parse::<u64>()
-        .map_err(|_| problem(StatusCode::BAD_GATEWAY, "provider_project_invalid"))?;
-    let output = invoke_operation(
-        state,
-        authority,
-        operation::InvokeRequest {
-            operation_ref: "gitlab-repository-file-get".to_owned(),
-            connection_ref: project.forge_instance_ref.clone(),
-            description_ref: description_ref.to_owned(),
-            input: source_file_input(project_id, &entry.path, commit),
-            approval_evidence_ref: None,
-        },
-    )
-    .await?;
-    if output.get("encoding").and_then(Value::as_str) != Some("base64")
-        || output.get("file_path").and_then(Value::as_str) != Some(entry.path.as_str())
-        || output.get("commit_id").and_then(Value::as_str) != Some(commit)
-    {
-        return Err(problem(
-            StatusCode::BAD_GATEWAY,
-            "repository_file_inconsistent",
-        ));
-    }
-    let size = output
-        .get("size")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
-    if size > SOURCE_MATERIALIZATION_LIMITS.max_file_bytes {
-        return Err(problem(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "repository_file_limit_exceeded",
-        ));
-    }
-    let encoded = output
-        .get("content")
-        .and_then(Value::as_str)
-        .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
-    let compact = encoded
-        .bytes()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .collect::<Vec<_>>();
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(compact)
-        .map_err(|_| problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
-    let observed_sha256 = output
-        .get("content_sha256")
-        .and_then(Value::as_str)
-        .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
-    let sha256 = hex::encode(Sha256::digest(&bytes));
-    let executable = entry.mode == "100755";
-    if bytes.len() as u64 != size
-        || observed_sha256 != sha256
-        || output
-            .get("execute_filemode")
-            .and_then(Value::as_bool)
-            .is_some_and(|observed| observed != executable)
-    {
-        return Err(problem(
-            StatusCode::BAD_GATEWAY,
-            "repository_file_inconsistent",
-        ));
-    }
-    Ok(MaterializedFile {
-        path: entry.path.clone(),
-        bytes,
-        sha256,
-        executable,
-    })
-}
-
-fn source_file_input(project_id: u64, path: &str, commit: &str) -> Value {
-    serde_json::json!({
-        "project_id": project_id,
-        "file_path": path,
-        "ref": commit
-    })
-}
-
-async fn provision_materializations(
-    state: AppState,
-    authority: Authority,
-    client: SubstrateClient,
-    mut session: CodingSession,
-    files: Vec<MaterializedFile>,
-) -> Result<CodingSession, (CodingSession, SubstrateError)> {
-    let base = ensure_materialization(&state, &authority, &client, &mut session, true).await?;
-    let working = ensure_materialization(&state, &authority, &client, &mut session, false).await?;
-    let files = Arc::new(files);
-    tokio::try_join!(
-        upload_materialization(base, session.id.clone(), "base", Arc::clone(&files)),
-        upload_materialization(working, session.id.clone(), "working", Arc::clone(&files)),
-    )
-    .map_err(|error| (session.clone(), error))?;
-    let manifest_sha256 = source_manifest_sha256(&session.source_revision, &files);
-    state
-        .store
-        .complete_coding_session(&authority, &session.id, &manifest_sha256)
-        .await
-        .map_err(|error| {
-            (
-                session,
-                SubstrateError::Protocol(format!("Workspace store refused completion: {error}")),
-            )
-        })
-}
-
-async fn ensure_materialization(
-    state: &AppState,
-    authority: &Authority,
-    client: &SubstrateClient,
-    session: &mut CodingSession,
-    base: bool,
-) -> Result<SubstrateWorkspace, (CodingSession, SubstrateError)> {
-    let existing = if base {
-        session.base_materialization_ref.as_deref()
-    } else {
-        session.working_materialization_ref.as_deref()
-    };
-    if let Some(reference) = existing {
-        return client
-            .get_workspace(reference)
-            .await
-            .map_err(|error| (session.clone(), error));
-    }
-    let role = if base { "base" } else { "working" };
-    let workspace = client
-        .workspace()
-        .empty()
-        .label("coding.session", &session.id)
-        .label("materialization.role", role)
-        .label("source.revision", &session.source_revision)
-        .operation_id(substrate_operation_id(&session.id, &["create", role]))
-        .create()
-        .await
-        .map_err(|error| (session.clone(), error))?;
-    *session = state
-        .store
-        .record_materialization_ref(authority, &session.id, base, workspace.id())
-        .await
-        .map_err(|error| {
-            (
-                session.clone(),
-                SubstrateError::Protocol(format!(
-                    "Workspace store refused materialization reference: {error}"
-                )),
-            )
-        })?;
-    Ok(workspace)
-}
-
-async fn upload_materialization(
-    workspace: SubstrateWorkspace,
-    session_id: String,
-    role: &'static str,
-    files: Arc<Vec<MaterializedFile>>,
-) -> Result<(), SubstrateError> {
-    stream::iter(0..files.len())
-        .map(|index| {
-            let workspace = workspace.clone();
-            let session_id = session_id.clone();
-            let files = Arc::clone(&files);
-            async move {
-                let file = &files[index];
-                workspace
-                    .replace_file(
-                        &file.path,
-                        &file.bytes,
-                        ExpectedFileState::Absent,
-                        true,
-                        Some(substrate_operation_id(
-                            &session_id,
-                            &["file", role, &file.path, &file.sha256],
-                        )),
-                    )
-                    .await
-            }
-        })
-        .buffer_unordered(MATERIALIZATION_UPLOAD_CONCURRENCY)
-        .try_collect::<Vec<_>>()
-        .await?;
-    let executable = files
-        .iter()
-        .filter(|file| file.executable)
-        .map(|file| file.path.as_str())
-        .collect::<Vec<_>>();
-    for (index, chunk) in executable.chunks(64).enumerate() {
-        let mut arguments = Vec::with_capacity(chunk.len() + 2);
-        arguments.push("u+x");
-        arguments.push("--");
-        arguments.extend(chunk.iter().copied());
-        let policy = ExecutionPolicy::builder()
-            .timeout(Duration::from_secs(30))
-            .cpu_time(Duration::from_secs(5))
-            .memory_bytes(64 * 1024 * 1024)
-            .processes(16)
-            .output_bytes(64 * 1024)
-            .build()?;
-        let output = workspace
-            .command("/usr/bin/chmod")
-            .args(arguments)
-            .policy(policy)
-            .operation_id(substrate_operation_id(
-                &session_id,
-                &["chmod", role, &index.to_string()],
-            ))
-            .run()
-            .await?;
-        if output.exec.exit.as_ref().and_then(|exit| exit.code) != Some(0) {
-            return Err(SubstrateError::Protocol(
-                "confined executable-mode application failed".to_owned(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn source_manifest_sha256(source_revision: &str, files: &[MaterializedFile]) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"b10x/workspace/source-manifest/v1");
-    append_digest_part(&mut digest, source_revision.as_bytes());
-    for file in files {
-        append_digest_part(&mut digest, file.path.as_bytes());
-        append_digest_part(&mut digest, file.sha256.as_bytes());
-        digest.update((file.bytes.len() as u64).to_be_bytes());
-        digest.update([u8::from(file.executable)]);
-    }
-    hex::encode(digest.finalize())
-}
-
-#[derive(Clone)]
-struct CompleteWorkspaceFile {
-    bytes: Vec<u8>,
-    sha256: String,
-    size: u64,
-}
-
 async fn project_file(
     path: &str,
-    base: &SubstrateWorkspace,
-    working: &SubstrateWorkspace,
+    workspace: &SubstrateWorkspace,
     max_file_bytes: u64,
 ) -> Result<Option<FileProjection>, Response> {
-    let Some(current) = read_complete_file(working, path, max_file_bytes).await? else {
+    let Some(current) = read_complete_file(workspace, path, max_file_bytes).await? else {
         return Ok(None);
     };
-    let base = read_complete_file(base, path, max_file_bytes).await?;
+    let base = read_git_baseline_file(workspace, path, max_file_bytes).await?;
     let modification = match base {
         None => FileModificationState::Added,
         Some(base) if base.sha256 == current.sha256 => FileModificationState::Unchanged,
@@ -4810,12 +4723,34 @@ async fn project_file(
 
 async fn base_file_projection(
     path: &str,
-    base: &SubstrateWorkspace,
+    workspace: &SubstrateWorkspace,
     max_file_bytes: u64,
 ) -> Result<Option<FileProjection>, Response> {
-    Ok(read_complete_file(base, path, max_file_bytes)
+    Ok(read_git_baseline_file(workspace, path, max_file_bytes)
         .await?
         .map(|file| file_projection(path, file, FileModificationState::Unchanged)))
+}
+
+async fn read_git_baseline_file(
+    workspace: &SubstrateWorkspace,
+    path: &str,
+    max_file_bytes: u64,
+) -> Result<Option<CompleteWorkspaceFile>, Response> {
+    workspace
+        .read_git_file(path, max_file_bytes)
+        .await
+        .map_err(|error| substrate_problem(&error))?
+        .map(|file| {
+            file.content
+                .decode()
+                .map(|bytes| CompleteWorkspaceFile {
+                    bytes,
+                    sha256: file.sha256,
+                    size: file.size,
+                })
+                .map_err(|_| problem(StatusCode::BAD_GATEWAY, "substrate_protocol_invalid"))
+        })
+        .transpose()
 }
 
 fn file_projection(
@@ -4859,6 +4794,179 @@ async fn read_complete_file(
     }
 }
 
+async fn git_diff_projection(
+    workspace: &SubstrateWorkspace,
+    session: &CodingSession,
+    mode: DiffMode,
+    actor: &str,
+) -> Result<DiffProjection, Response> {
+    let observed = workspace
+        .git_changes(
+            session.limits.max_files,
+            session.limits.max_file_bytes,
+            b10x_substrate_sdk::MAX_IO_BYTES,
+        )
+        .await
+        .map_err(|error| substrate_problem(&error))?;
+    if observed.commit != session.source_revision {
+        return Err(problem(
+            StatusCode::BAD_GATEWAY,
+            "substrate_git_baseline_inconsistent",
+        ));
+    }
+    let mut additions = 0_u64;
+    let mut deletions = 0_u64;
+    let mut partial = observed.truncated;
+    let files = observed
+        .items
+        .into_iter()
+        .map(|change| {
+            let status = match change.status {
+                b10x_substrate_sdk::GitChangeStatus::Added => "added",
+                b10x_substrate_sdk::GitChangeStatus::Modified => "modified",
+                b10x_substrate_sdk::GitChangeStatus::Deleted => "deleted",
+                b10x_substrate_sdk::GitChangeStatus::Renamed => "renamed",
+                b10x_substrate_sdk::GitChangeStatus::Copied => "copied",
+                b10x_substrate_sdk::GitChangeStatus::TypeChanged => "type_changed",
+                b10x_substrate_sdk::GitChangeStatus::Untracked => "untracked",
+                b10x_substrate_sdk::GitChangeStatus::Conflicted => "conflicted",
+            };
+            let (all_hunks, file_additions, file_deletions) =
+                parse_unified_diff(&change.patch.text);
+            additions = additions.saturating_add(file_additions);
+            deletions = deletions.saturating_add(file_deletions);
+            partial |= change.patch.truncated;
+            DiffFile {
+                old_path: change.baseline.as_ref().map(|side| side.path.clone()),
+                new_path: change.current.as_ref().map(|side| side.path.clone()),
+                status: status.to_owned(),
+                additions: (!change.patch.binary).then_some(file_additions),
+                deletions: (!change.patch.binary).then_some(file_deletions),
+                // Git object ids are SHA-1 object identities, not content SHA-256 values.
+                old_sha256: None,
+                new_sha256: None,
+                hunks: matches!(mode, DiffMode::Patch)
+                    .then_some(all_hunks)
+                    .unwrap_or_default(),
+                attribution: vec![format!("actor:{actor}"), "operation:workspace".to_owned()],
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut seal = serde_json::json!({
+        "format": "workspace.diff-projection/1",
+        "selector": ChangeSelector::Workspace,
+        "mode": mode,
+        "source_revision": session.source_revision,
+        "files": files,
+        "additions": additions,
+        "deletions": deletions,
+        "partial": partial
+    });
+    let digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&seal).expect("Git diff projection serializes"),
+    ));
+    seal.as_object_mut()
+        .expect("static Git diff seal is an object")
+        .insert("digest".to_owned(), Value::String(digest));
+    serde_json::from_value(seal)
+        .map_err(|_| problem(StatusCode::BAD_GATEWAY, "workspace_diff_invalid"))
+}
+
+fn parse_unified_diff(text: &str) -> (Vec<DiffHunk>, u64, u64) {
+    let mut hunks = Vec::new();
+    let mut current: Option<DiffHunk> = None;
+    let mut old_line = 0_u64;
+    let mut new_line = 0_u64;
+    let mut additions = 0_u64;
+    let mut deletions = 0_u64;
+    for line in text.lines() {
+        if let Some((old, new, heading)) = parse_hunk_header(line) {
+            if let Some(hunk) = current.take() {
+                hunks.push(hunk);
+            }
+            old_line = old.start;
+            new_line = new.start;
+            let id = hex::encode(Sha256::digest(line.as_bytes()));
+            current = Some(DiffHunk {
+                id,
+                old,
+                new,
+                heading,
+                lines: Vec::new(),
+            });
+            continue;
+        }
+        let Some(hunk) = current.as_mut() else {
+            continue;
+        };
+        let Some(prefix) = line.as_bytes().first().copied() else {
+            continue;
+        };
+        let content = line.get(1..).unwrap_or_default().to_owned();
+        let projected = match prefix {
+            b' ' => {
+                let projected = DiffLine {
+                    kind: "context".to_owned(),
+                    old_line: Some(old_line),
+                    new_line: Some(new_line),
+                    content,
+                };
+                old_line = old_line.saturating_add(1);
+                new_line = new_line.saturating_add(1);
+                projected
+            }
+            b'-' => {
+                deletions = deletions.saturating_add(1);
+                let projected = DiffLine {
+                    kind: "deletion".to_owned(),
+                    old_line: Some(old_line),
+                    new_line: None,
+                    content,
+                };
+                old_line = old_line.saturating_add(1);
+                projected
+            }
+            b'+' => {
+                additions = additions.saturating_add(1);
+                let projected = DiffLine {
+                    kind: "addition".to_owned(),
+                    old_line: None,
+                    new_line: Some(new_line),
+                    content,
+                };
+                new_line = new_line.saturating_add(1);
+                projected
+            }
+            _ => continue,
+        };
+        hunk.lines.push(projected);
+    }
+    if let Some(hunk) = current {
+        hunks.push(hunk);
+    }
+    (hunks, additions, deletions)
+}
+
+fn parse_hunk_header(line: &str) -> Option<(DiffRange, DiffRange, Option<String>)> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (ranges, heading) = rest.split_once(" @@")?;
+    let (old, new) = ranges.split_once(" +")?;
+    let heading = heading.trim();
+    Some((
+        parse_diff_range(old)?,
+        parse_diff_range(new)?,
+        (!heading.is_empty()).then(|| heading.to_owned()),
+    ))
+}
+
+fn parse_diff_range(value: &str) -> Option<DiffRange> {
+    let (start, lines) = value.split_once(',').unwrap_or((value, "1"));
+    Some(DiffRange {
+        start: start.parse().ok()?,
+        lines: lines.parse().ok()?,
+    })
+}
+
 fn language_for_path(path: &str) -> Option<&'static str> {
     let extension = path.rsplit_once('.').map(|(_, extension)| extension)?;
     match extension.to_ascii_lowercase().as_str() {
@@ -4899,202 +5007,6 @@ fn file_operation_id(session_id: &str, path: &str, input: &WriteFile) -> String 
     digest.update([u8::from(input.create_parents)]);
     hex::encode(digest.finalize())
 }
-
-async fn materialization_files(
-    workspace: &SubstrateWorkspace,
-    session: &CodingSession,
-) -> Result<BTreeMap<String, CompleteWorkspaceFile>, Response> {
-    let tree = workspace
-        .tree(session.limits.max_files, true)
-        .await
-        .map_err(|error| substrate_problem(&error))?;
-    if tree.truncated {
-        return Err(problem(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "diff_tree_truncated",
-        ));
-    }
-    let mut files = BTreeMap::new();
-    for entry in tree.items {
-        if serde_json::to_value(entry.kind)
-            .ok()
-            .and_then(|kind| kind.as_str().map(str::to_owned))
-            .as_deref()
-            != Some("file")
-        {
-            continue;
-        }
-        let file = read_complete_file(workspace, &entry.path, session.limits.max_file_bytes)
-            .await?
-            .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "workspace_tree_file_inconsistent"))?;
-        files.insert(entry.path, file);
-    }
-    Ok(files)
-}
-
-fn canonical_diff(
-    selector: &ChangeSelector,
-    mode: DiffMode,
-    source_revision: &str,
-    base: &BTreeMap<String, CompleteWorkspaceFile>,
-    working: &BTreeMap<String, CompleteWorkspaceFile>,
-    actor: &str,
-) -> DiffProjection {
-    let paths = base
-        .keys()
-        .chain(working.keys())
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let mut files = Vec::new();
-    let mut additions = 0_u64;
-    let mut deletions = 0_u64;
-    for path in paths {
-        let old = base.get(&path);
-        let new = working.get(&path);
-        if old
-            .zip(new)
-            .is_some_and(|(old, new)| old.sha256 == new.sha256)
-        {
-            continue;
-        }
-        let (file, file_additions, file_deletions) = canonical_file_diff(
-            &path,
-            old,
-            new,
-            mode,
-            &[format!("actor:{actor}"), "operation:workspace".to_owned()],
-        );
-        additions = additions.saturating_add(file_additions);
-        deletions = deletions.saturating_add(file_deletions);
-        files.push(file);
-    }
-    let mut seal = serde_json::json!({
-        "format": "workspace.diff-projection/1",
-        "selector": selector,
-        "mode": mode,
-        "source_revision": source_revision,
-        "files": files,
-        "additions": additions,
-        "deletions": deletions,
-        "partial": false
-    });
-    let digest = hex::encode(Sha256::digest(
-        serde_json::to_vec(&seal).expect("canonical diff serializes"),
-    ));
-    seal.as_object_mut()
-        .expect("static diff seal is an object")
-        .insert("digest".to_owned(), Value::String(digest));
-    serde_json::from_value(seal).expect("canonical diff contract is self-consistent")
-}
-
-fn canonical_file_diff(
-    path: &str,
-    old: Option<&CompleteWorkspaceFile>,
-    new: Option<&CompleteWorkspaceFile>,
-    mode: DiffMode,
-    attribution: &[String],
-) -> (DiffFile, u64, u64) {
-    let status = match (old, new) {
-        (None, Some(_)) => "added",
-        (Some(_), None) => "deleted",
-        (Some(_), Some(_)) => "modified",
-        (None, None) => unreachable!("union path exists on at least one side"),
-    };
-    let old_text = old.and_then(|file| std::str::from_utf8(&file.bytes).ok());
-    let new_text = new.and_then(|file| std::str::from_utf8(&file.bytes).ok());
-    let text_representable =
-        old.is_none_or(|_| old_text.is_some()) && new.is_none_or(|_| new_text.is_some());
-    let (additions, deletions, mut hunks) = if text_representable {
-        text_diff(
-            old_text.unwrap_or_default(),
-            new_text.unwrap_or_default(),
-            path,
-        )
-    } else {
-        (0, 0, Vec::new())
-    };
-    if mode != DiffMode::Patch {
-        hunks.clear();
-    }
-    let counts_visible = text_representable && mode != DiffMode::FilesOnly;
-    (
-        DiffFile {
-            old_path: old.map(|_| path.to_owned()),
-            new_path: new.map(|_| path.to_owned()),
-            status: status.to_owned(),
-            additions: counts_visible.then_some(additions),
-            deletions: counts_visible.then_some(deletions),
-            old_sha256: old.map(|file| file.sha256.clone()),
-            new_sha256: new.map(|file| file.sha256.clone()),
-            hunks,
-            attribution: attribution.to_vec(),
-        },
-        additions,
-        deletions,
-    )
-}
-
-fn text_diff(old: &str, new: &str, path: &str) -> (u64, u64, Vec<DiffHunk>) {
-    let diff = TextDiff::from_lines(old, new);
-    let mut additions = 0_u64;
-    let mut deletions = 0_u64;
-    let mut hunks = Vec::new();
-    for group in diff.grouped_ops(3) {
-        let first = group.first().expect("diff group is non-empty");
-        let last = group.last().expect("diff group is non-empty");
-        let old_start = first.old_range().start;
-        let old_end = last.old_range().end;
-        let new_start = first.new_range().start;
-        let new_end = last.new_range().end;
-        let mut lines = Vec::new();
-        for operation in group {
-            for change in diff.iter_changes(&operation) {
-                let kind = match change.tag() {
-                    ChangeTag::Equal => "context",
-                    ChangeTag::Delete => {
-                        deletions = deletions.saturating_add(1);
-                        "deletion"
-                    }
-                    ChangeTag::Insert => {
-                        additions = additions.saturating_add(1);
-                        "addition"
-                    }
-                };
-                lines.push(DiffLine {
-                    kind: kind.to_owned(),
-                    old_line: change.old_index().map(|line| line as u64 + 1),
-                    new_line: change.new_index().map(|line| line as u64 + 1),
-                    content: change
-                        .value()
-                        .strip_suffix('\n')
-                        .unwrap_or(change.value())
-                        .to_owned(),
-                });
-            }
-        }
-        let old_range = DiffRange {
-            start: old_start as u64 + 1,
-            lines: (old_end - old_start) as u64,
-        };
-        let new_range = DiffRange {
-            start: new_start as u64 + 1,
-            lines: (new_end - new_start) as u64,
-        };
-        let hunk_id = hex::encode(Sha256::digest(
-            serde_json::to_vec(&(path, &old_range, &new_range, &lines))
-                .expect("diff hunk serializes"),
-        ));
-        hunks.push(DiffHunk {
-            id: hunk_id,
-            old: old_range,
-            new: new_range,
-            heading: None,
-            lines,
-        });
-    }
-    (additions, deletions, hunks)
-}
-
 fn substrate_operation_id(session_id: &str, parts: &[&str]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"b10x/workspace/substrate-operation/v1");
@@ -5189,43 +5101,75 @@ async fn cleanup_terminals(
     unknown
 }
 
-async fn cleanup_materializations(client: &SubstrateClient, session: &CodingSession) -> bool {
-    let mut unknown = false;
-    for (role, reference) in [
-        ("base", session.base_materialization_ref.as_deref()),
-        ("working", session.working_materialization_ref.as_deref()),
-    ] {
-        let Some(reference) = reference else {
-            continue;
-        };
-        match client.get_workspace(reference).await {
-            Ok(workspace) => {
-                if workspace
-                    .destroy_with_operation_id(Some(substrate_operation_id(
-                        &session.id,
-                        &["cleanup", role],
-                    )))
-                    .await
-                    .is_err()
-                {
-                    unknown = true;
-                }
-            }
-            Err(SubstrateError::Refusal(refusal)) if refusal.code == "resource.not-found" => {}
-            Err(_) => unknown = true,
+async fn cleanup_materializations(
+    store: &Store,
+    authority: &Authority,
+    client: &SubstrateClient,
+    session: &CodingSession,
+) -> bool {
+    let Ok(references) = store
+        .coding_session_materialization_refs(authority, &session.id)
+        .await
+    else {
+        if let Some(reference) = session.materialization_ref.as_ref() {
+            return destroy_materialization(client, &session.id, reference, "unrecorded").await;
         }
+        return true;
+    };
+    let mut references = references;
+    if let Some(reference) = session
+        .materialization_ref
+        .as_ref()
+        .filter(|candidate| !references.contains(candidate))
+    {
+        references.push(reference.clone());
+    }
+    let mut unknown = false;
+    for (index, reference) in references.iter().enumerate() {
+        unknown |=
+            destroy_materialization(client, &session.id, reference, &index.to_string()).await;
     }
     unknown
 }
 
-async fn cleanup_materializations_owned(client: SubstrateClient, session: CodingSession) -> bool {
-    cleanup_materializations(&client, &session).await
+async fn destroy_materialization(
+    client: &SubstrateClient,
+    session_id: &str,
+    reference: &str,
+    operation_suffix: &str,
+) -> bool {
+    match tokio::time::timeout(
+        MATERIALIZATION_CLEANUP_TIMEOUT,
+        client.get_workspace(reference),
+    )
+    .await
+    {
+        Ok(Ok(workspace)) => tokio::time::timeout(
+            MATERIALIZATION_CLEANUP_TIMEOUT,
+            workspace.destroy_with_operation_id(Some(substrate_operation_id(
+                session_id,
+                &["cleanup", operation_suffix],
+            ))),
+        )
+        .await
+        .map_or(true, |result| result.is_err()),
+        Ok(Err(SubstrateError::Refusal(refusal))) if refusal.code == "resource.not-found" => false,
+        Ok(Err(_)) | Err(_) => true,
+    }
+}
+
+async fn cleanup_materializations_owned(
+    store: Store,
+    authority: Authority,
+    client: SubstrateClient,
+    session: CodingSession,
+) -> bool {
+    cleanup_materializations(&store, &authority, &client, &session).await
 }
 
 fn public_session(mut session: CodingSession) -> CodingSession {
     if session.state != CodingSessionState::Ready {
-        session.base_materialization_ref = None;
-        session.working_materialization_ref = None;
+        session.materialization_ref = None;
         session.manifest_sha256 = None;
     }
     session
@@ -5481,7 +5425,7 @@ async fn ensure_project_agent(
 fn spawn_task_completion(
     store: Store,
     client: AgentPlatformClient,
-    bearer: String,
+    bearer: Zeroizing<String>,
     tenant_id: String,
     subject: String,
     thread_id: String,
@@ -5573,7 +5517,7 @@ async fn resume_workflow_completions(
             store: state.store.clone(),
             client: client.clone(),
             observers: state.workflow_observers.clone(),
-            bearer: bearer.to_owned(),
+            bearer: Zeroizing::new(bearer.to_owned()),
             tenant_id: authority.tenant_id.clone(),
             subject: authority.subject.clone(),
             run_id: task.run_id,
@@ -5588,7 +5532,7 @@ struct WorkflowObservation {
     store: Store,
     client: AgentPlatformClient,
     observers: WorkflowObservers,
-    bearer: String,
+    bearer: Zeroizing<String>,
     tenant_id: String,
     subject: String,
     run_id: String,
@@ -5883,21 +5827,25 @@ async fn shutdown() {
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
+    use bytes::Bytes;
     use connectors_client::operation::OwnerContext;
-    use sha2::Digest as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::UnixListener;
 
     use super::{
-        AppState, Authority, CompleteWorkspaceFile, MaterializationWorkers, MaterializedFile,
-        SUBSTRATE_SCOPE, WorkflowObservation, WorkflowObservers, WorkflowTaskOutcome,
-        agentide_grants, agentide_session_row, canonical_diff, coding_intent_profile,
-        diff_pin_content, file_operation_id, install_crypto_provider, language_for_path,
-        repository_candidate, resume_workflow_completions, sha256_text, source_file_input,
-        source_manifest_sha256, spawn_workflow_completion, strict_repository_entry,
-        submit_workflow_task, terminal_grant_row_matches, terminal_session_row_matches,
-        valid_repository_path, validate_identity_transport, workflow_task_outcome,
+        AppState, Authority, MaterializationWorkers, SOURCE_MATERIALIZATION_INODES,
+        SOURCE_MATERIALIZATION_LIMITS, SUBSTRATE_SCOPE, WorkflowObservation, WorkflowObservers,
+        WorkflowTaskOutcome, agentide_grants, agentide_session_row, coding_intent_profile,
+        coding_materialization_source, file_operation_id, git_source_manifest_sha256,
+        install_crypto_provider, language_for_path, parse_hunk_header, parse_unified_diff,
+        provision_git_materialization, repository_candidate, resume_workflow_completions,
+        spawn_workflow_completion, submit_workflow_task, terminal_grant_row_matches,
+        terminal_session_row_matches, valid_materialization_label, valid_repository_path,
+        validate_identity_transport, workflow_task_outcome,
     };
-    use crate::store::Store;
+    use crate::store::{CodingSessionSource, Store};
     use agent_platform_client::AgentPlatformClient;
     use agent_platform_core::{AgentId, SubmitTask, TaskId, TaskStatus};
     use agentide_contracts::{ActorContext, ActorKind, authorize_intent};
@@ -5907,10 +5855,62 @@ mod tests {
     use axum::response::IntoResponse as _;
     use axum::routing::{get, post};
     use workspace_core::{
-        ChangeSelector, CodingSession, CodingSessionState, DiffMode, FileExpectedState,
-        MaterializationLimits, Project, StartWorkflow, WorkflowRunState, WriteFile,
+        CodingSession, CodingSessionState, FileExpectedState, MaterializationLimits, Project,
+        StartWorkflow, WorkflowRunState, WriteFile,
     };
     use workspace_service::terminal::{TerminalBrokers, TerminalProfiles, TerminalReplayHub};
+    use zeroize::Zeroizing;
+
+    async fn read_http_request(stream: &mut tokio::net::UnixStream) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let boundary = loop {
+            if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+            let mut block = [0_u8; 1024];
+            let count = stream.read(&mut block).await.expect("read request");
+            assert!(count > 0, "client closed before request head");
+            bytes.extend_from_slice(&block[..count]);
+        };
+        let head = std::str::from_utf8(&bytes[..boundary]).expect("ASCII request head");
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("content length"))
+            })
+            .unwrap_or(0);
+        while bytes.len() < boundary + content_length {
+            let mut block = [0_u8; 1024];
+            let count = stream.read(&mut block).await.expect("read request body");
+            assert!(count > 0, "client closed during request body");
+            bytes.extend_from_slice(&block[..count]);
+        }
+        bytes
+    }
+
+    fn http_request_body(request: &[u8]) -> &[u8] {
+        let boundary = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("request boundary")
+            + 4;
+        &request[boundary..]
+    }
+
+    fn substrate_http_response(status: &str, body: &[u8]) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 {status}\r\nx-b10x-contract: {}\r\nx-b10x-contract-bundle-sha256: {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            b10x_substrate_sdk::CONTRACT,
+            b10x_substrate_sdk::CONTRACT_SHA256,
+            body.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body.iter().copied())
+        .collect()
+    }
 
     #[test]
     fn installs_the_process_crypto_provider_before_tls_clients_are_built() {
@@ -5921,12 +5921,283 @@ mod tests {
     #[tokio::test]
     async fn materialization_workers_are_single_flight_and_recoverable() {
         let workers = MaterializationWorkers::default();
-        assert!(!workers.is_active("session-one").await);
-        assert!(workers.begin("session-one").await);
-        assert!(workers.is_active("session-one").await);
-        assert!(!workers.begin("session-one").await);
-        workers.finish("session-one").await;
-        assert!(workers.begin("session-one").await);
+        assert!(!workers.is_active("session-one"));
+        let guard = workers.begin("session-one").expect("first worker");
+        assert!(workers.is_active("session-one"));
+        assert!(workers.begin("session-one").is_none());
+        drop(guard);
+        assert!(!workers.is_active("session-one"));
+
+        let guard = workers.begin("session-one").expect("recovered worker");
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            panic!("synthetic worker panic");
+        });
+        assert!(task.await.expect_err("worker must panic").is_panic());
+        assert!(!workers.is_active("session-one"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One complete broker-to-Substrate materialization boundary.
+    async fn git_materialization_recovers_one_exact_bounded_secret_free_create() {
+        async fn git_fetch(headers: HeaderMap, body: Bytes) -> axum::response::Response {
+            assert_eq!(headers[header::AUTHORIZATION], "Bearer connector-authority");
+            let request: serde_json::Value = serde_json::from_slice(&body).expect("fetch request");
+            let intent = &request["request"];
+            assert_eq!(intent["connection_ref"], "connection:gitlab:one");
+            assert_eq!(intent["project_id"], 42);
+            assert_eq!(intent["reference"], "trunk");
+            assert_eq!(intent["expected_commit"], "a".repeat(40));
+            assert_eq!(intent["depth"], 50);
+            (
+                [
+                    (header::CACHE_CONTROL, "no-store"),
+                    (header::PRAGMA, "no-cache"),
+                ],
+                Json(serde_json::json!({
+                    "protocol": connectors_client::git_fetch::CONTRACT,
+                    "request_id": request["request_id"],
+                    "session_ref": "git-fetch:one",
+                    "source": "gitlab",
+                    "locator": "https://connectors.test/internal/git-fetch/one/repository.git",
+                    "reference": "trunk",
+                    "expected_commit": "a".repeat(40),
+                    "depth": 50,
+                    "expires_at_unix_ms": 2_000_000_000_000_u64,
+                    "source_authorization": "synthetic-one-use-source-capability"
+                })),
+            )
+                .into_response()
+        }
+
+        let connector_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("connector listener");
+        let connector_address = connector_listener.local_addr().expect("connector address");
+        let connector_server = tokio::spawn(async move {
+            axum::serve(
+                connector_listener,
+                Router::new().route("/api/connectors/v1/git-fetch-sessions", post(git_fetch)),
+            )
+            .await
+            .expect("connector server");
+        });
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let socket = std::env::temp_dir().join(format!(
+            "workspace-materialization-{}-{unique}.sock",
+            std::process::id()
+        ));
+        let substrate_listener = UnixListener::bind(&socket).expect("Substrate listener");
+        let substrate_server = tokio::spawn(async move {
+            let (mut machine_stream, _) = substrate_listener.accept().await.expect("machine");
+            let machine_request = read_http_request(&mut machine_stream).await;
+            assert!(machine_request.starts_with(b"GET /v1/machine HTTP/1.1\r\n"));
+            let machine = br#"{"api_version":"v1","request_id":"machine","result":{"config_generation":7,"driver":"host","driver_version":"fixture","facts":{"events.pull":true,"events.retention-events":10000,"events.stream":true,"exec.argv-only":true,"exec.cgroup-kill":true,"exec.cgroup-limits":{"cpu":true,"memory":true,"processes":true},"exec.inline-capsule":{"max_file_bytes":262144,"max_files":32,"max_total_bytes":524288,"mount":"/runtime"},"exec.max-current":2048,"exec.namespaces":{"ipc":true,"mount":true,"network":true,"pid":true,"user":true,"uts":true},"exec.no-egress":true,"exec.output-limit-bytes":65536,"exec.signals":["INT","TERM","KILL"],"leases.clock-tolerance-ms":30000,"leases.explicit":true,"operation.ledger-global-max-bytes":4294967296,"operation.ledger-global-max-rows":1000000,"operation.ledger-subject-max-bytes":536870912,"operation.ledger-subject-max-rows":100000,"snapshot.provenance-events":1024,"workspace.atomic-replace":true,"workspace.guarded-io":true,"workspace.list-limit-items":100,"workspace.max-current":1024,"workspace.max-file-bytes":1048576,"workspace.openat2-beneath":true,"workspace.read-limit-bytes":65536},"probed_at":"2026-09-01T00:00:00Z","snapshot":"sha256:7777777777777777777777777777777777777777777777777777777777777777"}}"#;
+            machine_stream
+                .write_all(&substrate_http_response("200 OK", machine))
+                .await
+                .expect("machine response");
+
+            let (mut create_stream, _) = substrate_listener.accept().await.expect("create");
+            let create_request = read_http_request(&mut create_stream).await;
+            let create_head = std::str::from_utf8(&create_request).expect("create request ASCII");
+            assert!(create_head.starts_with("POST /v1/workspaces HTTP/1.1\r\n"));
+            assert!(create_head.contains(
+                "x-b10x-workspace-source-authorization: synthetic-one-use-source-capability\r\n"
+            ));
+            let create: serde_json::Value =
+                serde_json::from_slice(http_request_body(&create_request)).expect("create JSON");
+            assert_eq!(create["input"]["source"]["git"]["ref"], "trunk");
+            assert_eq!(create["input"]["source"]["git"]["commit"], "a".repeat(40));
+            assert_eq!(create["input"]["source"]["git"]["depth"], 50);
+            assert_eq!(create["input"]["storage"]["max_inodes"], 1_000);
+            assert!(create["input"].get("source_authorization").is_none());
+            let labels = create["input"]["labels"].clone();
+            let operation_id = create["op"].as_str().expect("operation id").to_owned();
+            // The daemon committed the deterministic create but the transport lost its response.
+            // Workspace must reconcile that operation rather than issuing a second create.
+            drop(create_stream);
+
+            let (mut operation_stream, _) = substrate_listener.accept().await.expect("operation");
+            let operation_request = read_http_request(&mut operation_stream).await;
+            assert!(
+                operation_request
+                    .starts_with(format!("GET /v1/ops/{operation_id} HTTP/1.1\r\n").as_bytes())
+            );
+            let operation = serde_json::to_vec(&serde_json::json!({
+                "api_version": "v1",
+                "request_id": "operation",
+                "result": {
+                    "operation": operation_id,
+                    "operation_kind": "workspace.create",
+                    "request_hash": "d".repeat(64),
+                    "state": "terminal",
+                    "accepted_at": "2026-09-01T00:00:00Z",
+                    "terminal_at": "2026-09-01T00:00:01Z",
+                    "capability_snapshot": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+                    "actor": "workspace-test",
+                    "principal": null,
+                    "resource": "ws_materialized",
+                    "outcome": {
+                        "kind": "success",
+                        "result": {
+                            "id": "ws_materialized",
+                            "kind": "workspace",
+                            "labels": labels,
+                            "observed_at": "2026-09-01T00:00:01Z",
+                            "state": "ready"
+                        }
+                    }
+                }
+            }))
+            .expect("operation response");
+            operation_stream
+                .write_all(&substrate_http_response("200 OK", &operation))
+                .await
+                .expect("operation response");
+
+            let (mut workspace_stream, _) = substrate_listener.accept().await.expect("workspace");
+            let workspace_request = read_http_request(&mut workspace_stream).await;
+            assert!(
+                workspace_request.starts_with(b"GET /v1/workspaces/ws_materialized HTTP/1.1\r\n")
+            );
+            let workspace = serde_json::to_vec(&serde_json::json!({
+                "api_version": "v1",
+                "request_id": "workspace",
+                "result": {
+                    "id": "ws_materialized",
+                    "kind": "workspace",
+                    "labels": create["input"]["labels"],
+                    "observed_at": "2026-09-01T00:00:01Z",
+                    "state": "ready"
+                }
+            }))
+            .expect("workspace response");
+            workspace_stream
+                .write_all(&substrate_http_response("200 OK", &workspace))
+                .await
+                .expect("workspace response");
+        });
+
+        let substrate = b10x_substrate_sdk::Client::builder()
+            .unix_socket(&socket)
+            .connect()
+            .await
+            .expect("Substrate client");
+        let store = Store::connect_lazy("sqlite::memory:").expect("store");
+        store.ready().await.expect("schema");
+        let authority = Authority {
+            tenant_id: "tenant-one".to_owned(),
+            subject: "person:owner".to_owned(),
+            connector_bearer: Zeroizing::new("connector-authority".to_owned()),
+            agent_platform_bearer: None,
+            session_authorization: Zeroizing::new("Bearer identity-session".to_owned()),
+            context: OwnerContext {
+                tenant_id: "tenant-one".to_owned(),
+                agent_id: "workspace:test".to_owned(),
+                agent_revision: 1,
+                authority_snapshot_id: "identity:test".to_owned(),
+                authority_snapshot_sha256: "b".repeat(64),
+            },
+        };
+        let project = Project {
+            id: "project-one".to_owned(),
+            forge_instance_ref: "connection:gitlab:one".to_owned(),
+            project_ref: "42".to_owned(),
+            path_with_namespace: "group/project".to_owned(),
+            name: "project".to_owned(),
+            default_branch: Some("trunk".to_owned()),
+            selected_branch: "trunk".to_owned(),
+            pinned_commit: Some("a".repeat(40)),
+            web_url: "https://git.example.test/group/project".to_owned(),
+        };
+        store
+            .open_project(&authority, &project)
+            .await
+            .expect("project");
+        let source = coding_materialization_source(&project, &"a".repeat(40)).expect("source");
+        let input = workspace_core::CreateCodingSession {
+            source_revision: "a".repeat(40),
+            idempotency_key: "materialize-once".to_owned(),
+        };
+        let crate::store::SessionReservation::New(session) = store
+            .reserve_coding_session(
+                &authority,
+                &project,
+                &input,
+                &source,
+                SOURCE_MATERIALIZATION_LIMITS,
+            )
+            .await
+            .expect("reservation")
+        else {
+            panic!("first reservation must be new");
+        };
+        let state = AppState {
+            identity: identity_client::IdentityClient::new(
+                "http://127.0.0.1:1",
+                "urn:b10x:workspace",
+            )
+            .expect("identity client"),
+            connectors: connectors_client::HostedClient::new(&format!(
+                "http://{connector_address}/api/connectors/v1"
+            ))
+            .expect("connector client"),
+            agent_platform: None,
+            project_agent_model: None,
+            aep: None,
+            substrate: None,
+            terminal_profiles: TerminalProfiles::load(None).expect("terminal profiles"),
+            terminal_brokers: TerminalBrokers::default(),
+            terminal_replay: TerminalReplayHub::default(),
+            materialization_workers: MaterializationWorkers::default(),
+            workflow_observers: WorkflowObservers::default(),
+            store: store.clone(),
+        };
+        let ready =
+            provision_git_materialization(state, authority.clone(), substrate, session, source)
+                .await
+                .expect("materialization");
+        assert_eq!(ready.state, CodingSessionState::Ready);
+        assert_eq!(
+            ready.materialization_ref.as_deref(),
+            Some("ws_materialized")
+        );
+        assert_eq!(
+            u64::from(ready.limits.max_files),
+            SOURCE_MATERIALIZATION_INODES
+        );
+
+        substrate_server.await.expect("Substrate server");
+        connector_server.abort();
+        std::fs::remove_file(&socket).expect("remove exact test socket");
+    }
+
+    #[test]
+    fn coding_sessions_admit_only_the_exact_provider_default_branch() {
+        let mut project = Project {
+            id: "project-one".to_owned(),
+            forge_instance_ref: "connection:gitlab:one".to_owned(),
+            project_ref: "42".to_owned(),
+            path_with_namespace: "group/project".to_owned(),
+            name: "project".to_owned(),
+            default_branch: Some("trunk".to_owned()),
+            selected_branch: "trunk".to_owned(),
+            pinned_commit: Some("a".repeat(40)),
+            web_url: "https://git.example.test/group/project".to_owned(),
+        };
+        let source = coding_materialization_source(&project, &"a".repeat(40))
+            .expect("default branch source");
+        assert_eq!(source.branch, "trunk");
+        project.selected_branch = "feature".to_owned();
+        assert_eq!(
+            coding_materialization_source(&project, &"a".repeat(40)),
+            Err("coding_session_default_branch_required")
+        );
     }
 
     #[test]
@@ -5959,9 +6230,9 @@ mod tests {
         let authority = Authority {
             tenant_id: "tenant-one".to_owned(),
             subject: "person:owner".to_owned(),
-            connector_bearer: "not-retained".to_owned(),
+            connector_bearer: Zeroizing::new("not-retained".to_owned()),
             agent_platform_bearer: None,
-            session_authorization: "Bearer expired-session".to_owned(),
+            session_authorization: Zeroizing::new("Bearer expired-session".to_owned()),
             context: OwnerContext {
                 tenant_id: "tenant-one".to_owned(),
                 agent_id: "workspace:test".to_owned(),
@@ -6059,7 +6330,7 @@ mod tests {
             store: restarted.clone(),
             client,
             observers: WorkflowObservers::default(),
-            bearer: "Bearer fresh-session".to_owned(),
+            bearer: Zeroizing::new("Bearer fresh-session".to_owned()),
             tenant_id: authority.tenant_id.clone(),
             subject: authority.subject.clone(),
             run_id: recoverable[0].run_id.clone(),
@@ -6097,9 +6368,11 @@ mod tests {
         let authority = Authority {
             tenant_id: "tenant-one".to_owned(),
             subject: "person:owner".to_owned(),
-            connector_bearer: "not-retained".to_owned(),
+            connector_bearer: Zeroizing::new("not-retained".to_owned()),
             agent_platform_bearer: None,
-            session_authorization: "Bearer session-without-agent-platform".to_owned(),
+            session_authorization: Zeroizing::new(
+                "Bearer session-without-agent-platform".to_owned(),
+            ),
             context: OwnerContext {
                 tenant_id: "tenant-one".to_owned(),
                 agent_id: "workspace:test".to_owned(),
@@ -6187,9 +6460,9 @@ mod tests {
         let authority = Authority {
             tenant_id: "tenant-one".to_owned(),
             subject: "person:owner".to_owned(),
-            connector_bearer: "not-retained".to_owned(),
-            agent_platform_bearer: Some("Bearer current-session".to_owned()),
-            session_authorization: "Bearer current-session".to_owned(),
+            connector_bearer: Zeroizing::new("not-retained".to_owned()),
+            agent_platform_bearer: Some(Zeroizing::new("Bearer current-session".to_owned())),
+            session_authorization: Zeroizing::new("Bearer current-session".to_owned()),
             context: OwnerContext {
                 tenant_id: "tenant-one".to_owned(),
                 agent_id: "workspace:test".to_owned(),
@@ -6282,7 +6555,7 @@ mod tests {
             store: store.clone(),
             client,
             observers: WorkflowObservers::default(),
-            bearer: "Bearer current-session".to_owned(),
+            bearer: Zeroizing::new("Bearer current-session".to_owned()),
             tenant_id: authority.tenant_id.clone(),
             subject: authority.subject.clone(),
             run_id: run.id.clone(),
@@ -6348,7 +6621,7 @@ mod tests {
             client: AgentPlatformClient::new(&format!("http://{address}"))
                 .expect("Agent Platform client"),
             observers: WorkflowObservers::default(),
-            bearer: "Bearer current-session".to_owned(),
+            bearer: Zeroizing::new("Bearer current-session".to_owned()),
             tenant_id: authority.tenant_id.clone(),
             subject: authority.subject.clone(),
             run_id: run.id,
@@ -6480,9 +6753,9 @@ mod tests {
         Authority {
             tenant_id: "tenant-one".to_owned(),
             subject: "person:owner".to_owned(),
-            connector_bearer: "not-retained".to_owned(),
-            agent_platform_bearer: Some("Bearer current-session".to_owned()),
-            session_authorization: "Bearer current-session".to_owned(),
+            connector_bearer: Zeroizing::new("not-retained".to_owned()),
+            agent_platform_bearer: Some(Zeroizing::new("Bearer current-session".to_owned())),
+            session_authorization: Zeroizing::new("Bearer current-session".to_owned()),
             context: OwnerContext {
                 tenant_id: "tenant-one".to_owned(),
                 agent_id: "workspace:test".to_owned(),
@@ -6614,9 +6887,9 @@ mod tests {
         let authority = Authority {
             tenant_id: "tenant-one".to_owned(),
             subject: "person:owner".to_owned(),
-            connector_bearer: "not-retained".to_owned(),
+            connector_bearer: Zeroizing::new("not-retained".to_owned()),
             agent_platform_bearer: None,
-            session_authorization: "Bearer synthetic-session".to_owned(),
+            session_authorization: Zeroizing::new("Bearer synthetic-session".to_owned()),
             context: OwnerContext {
                 tenant_id: "tenant-one".to_owned(),
                 agent_id: "workspace:test".to_owned(),
@@ -6629,8 +6902,7 @@ mod tests {
             id: "workspace-session-one".to_owned(),
             project_id: "project-one".to_owned(),
             source_revision: "b".repeat(40),
-            base_materialization_ref: Some("base-one".to_owned()),
-            working_materialization_ref: Some("working-one".to_owned()),
+            materialization_ref: Some("working-one".to_owned()),
             manifest_sha256: Some("c".repeat(64)),
             state: CodingSessionState::Ready,
             failure_code: None,
@@ -6713,9 +6985,9 @@ mod tests {
         let authority = Authority {
             tenant_id: "tenant-one".to_owned(),
             subject: "person:owner".to_owned(),
-            connector_bearer: "not-retained".to_owned(),
+            connector_bearer: Zeroizing::new("not-retained".to_owned()),
             agent_platform_bearer: None,
-            session_authorization: "Bearer synthetic-session".to_owned(),
+            session_authorization: Zeroizing::new("Bearer synthetic-session".to_owned()),
             context: OwnerContext {
                 tenant_id: "tenant-one".to_owned(),
                 agent_id: "workspace:test".to_owned(),
@@ -6728,8 +7000,7 @@ mod tests {
             id: "workspace-session-one".to_owned(),
             project_id: "project-one".to_owned(),
             source_revision: "b".repeat(40),
-            base_materialization_ref: Some("base-one".to_owned()),
-            working_materialization_ref: Some("working-one".to_owned()),
+            materialization_ref: Some("working-one".to_owned()),
             manifest_sha256: Some("c".repeat(64)),
             state: CodingSessionState::Ready,
             failure_code: None,
@@ -6821,139 +7092,50 @@ mod tests {
     }
 
     #[test]
-    fn materialization_tree_parser_refuses_git_metadata_and_non_regular_entries() {
+    fn materialization_paths_refuse_git_metadata_and_escapes() {
+        assert!(!valid_repository_path(".git"));
         assert!(!valid_repository_path(".git/config"));
+        assert!(!valid_repository_path("src/.git/config"));
         assert!(!valid_repository_path("src/../secret"));
         assert!(!valid_repository_path("/absolute"));
-        assert!(
-            strict_repository_entry(&serde_json::json!({
-                "id": "abc",
-                "name": "link",
-                "path": "link",
-                "type": "blob",
-                "mode": "120000"
-            }))
-            .is_err()
-        );
-        assert!(
-            strict_repository_entry(&serde_json::json!({
-                "id": "abc",
-                "name": "dependency",
-                "path": "dependency",
-                "type": "commit",
-                "mode": "160000"
-            }))
-            .is_err()
-        );
+        assert!(valid_repository_path(".github/workflows/check.yml"));
     }
 
     #[test]
-    fn source_file_input_preserves_nested_repository_paths() {
-        let commit = "a".repeat(40);
-        let input = source_file_input(42, ".github/workflows/check.yml", &commit);
-
-        assert_eq!(input["project_id"], 42);
-        assert_eq!(input["file_path"], ".github/workflows/check.yml");
-        assert_eq!(input["ref"], commit);
-        assert_ne!(input["file_path"], ".github%2Fworkflows%2Fcheck.yml");
+    fn materialization_labels_are_bounded_before_substrate_operations() {
+        assert!(valid_materialization_label("coding.session", "session-one"));
+        assert!(!valid_materialization_label("", "session-one"));
+        assert!(!valid_materialization_label("bad/key", "session-one"));
+        assert!(!valid_materialization_label(
+            "source.revision",
+            &"a".repeat(257)
+        ));
     }
 
     #[test]
-    fn source_manifest_commits_to_revision_content_and_executable_mode() {
-        let ordinary = MaterializedFile {
-            path: "tool".to_owned(),
-            bytes: b"hello".to_vec(),
-            sha256: hex::encode(sha2::Sha256::digest(b"hello")),
-            executable: false,
+    fn source_manifest_commits_to_the_exact_revision() {
+        let source = CodingSessionSource {
+            forge_instance_ref: "connection:gitlab:one".to_owned(),
+            provider_project_ref: "42".to_owned(),
+            branch: "trunk".to_owned(),
         };
-        let mut executable = ordinary.clone();
-        executable.executable = true;
-
-        let first = source_manifest_sha256(&"a".repeat(40), std::slice::from_ref(&ordinary));
-        let changed_mode =
-            source_manifest_sha256(&"a".repeat(40), std::slice::from_ref(&executable));
-        let changed_revision = source_manifest_sha256(&"b".repeat(40), &[ordinary]);
-
-        assert_ne!(first, changed_mode);
-        assert_ne!(first, changed_revision);
+        let first = git_source_manifest_sha256(&source, &"a".repeat(40));
+        assert_eq!(first, git_source_manifest_sha256(&source, &"a".repeat(40)));
+        assert_ne!(first, git_source_manifest_sha256(&source, &"b".repeat(40)));
+        let mut other = source;
+        other.branch = "other".to_owned();
+        assert_ne!(first, git_source_manifest_sha256(&other, &"a".repeat(40)));
     }
 
     #[test]
-    fn canonical_diff_is_deterministic_structured_and_mode_specific() {
-        let file = |bytes: &[u8]| CompleteWorkspaceFile {
-            bytes: bytes.to_vec(),
-            sha256: hex::encode(sha2::Sha256::digest(bytes)),
-            size: bytes.len() as u64,
-        };
-        let base = std::collections::BTreeMap::from([
-            ("src/lib.rs".to_owned(), file(b"one\ntwo\n")),
-            ("old.txt".to_owned(), file(b"removed\n")),
-        ]);
-        let working = std::collections::BTreeMap::from([
-            ("src/lib.rs".to_owned(), file(b"one\nchanged\n")),
-            ("new.txt".to_owned(), file(b"added\n")),
-        ]);
-        let selector = ChangeSelector::Workspace;
-        let patch = canonical_diff(
-            &selector,
-            DiffMode::Patch,
-            &"a".repeat(40),
-            &base,
-            &working,
-            "person-a",
-        );
-        let repeated = canonical_diff(
-            &selector,
-            DiffMode::Patch,
-            &"a".repeat(40),
-            &base,
-            &working,
-            "person-a",
-        );
-        assert_eq!(patch, repeated);
-        assert_eq!(patch.files.len(), 3);
-        assert_eq!(patch.additions, 2);
-        assert_eq!(patch.deletions, 2);
-        assert!(patch.files.iter().any(|file| {
-            file.new_path.as_deref() == Some("src/lib.rs")
-                && file.hunks.iter().any(|hunk| {
-                    hunk.lines
-                        .iter()
-                        .any(|line| line.kind == "addition" && line.new_line == Some(2))
-                })
-        }));
-        let files_only = canonical_diff(
-            &selector,
-            DiffMode::FilesOnly,
-            &"a".repeat(40),
-            &base,
-            &working,
-            "person-a",
-        );
-        assert_ne!(patch.digest, files_only.digest);
-        assert!(files_only.files.iter().all(|file| {
-            file.additions.is_none() && file.deletions.is_none() && file.hunks.is_empty()
-        }));
-
-        let changed = patch
-            .files
-            .iter()
-            .find(|file| file.new_path.as_deref() == Some("src/lib.rs"))
-            .expect("changed file");
-        let hunk = changed.hunks.first().expect("hunk");
-        let reference = format!("workspace-diff/{}/src/lib.rs/{}", patch.digest, hunk.id);
-        let content = diff_pin_content(&patch, &reference).expect("canonical hunk selection");
-        assert_eq!(
-            sha256_text(&content),
-            hex::encode(sha2::Sha256::digest(content.as_bytes()))
-        );
-        assert!(
-            diff_pin_content(
-                &patch,
-                &format!("workspace-diff/{}/src/lib.rs/{}", "0".repeat(64), hunk.id)
-            )
-            .is_none()
-        );
+    fn substrate_unified_diff_is_projected_with_exact_line_counts() {
+        let (hunks, additions, deletions) =
+            parse_unified_diff("@@ -1,2 +1,2 @@\n one\n-two\n+changed\n");
+        assert_eq!((additions, deletions), (1, 1));
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old.start, 1);
+        assert_eq!(hunks[0].new.start, 1);
+        assert!(parse_hunk_header("not a hunk").is_none());
     }
 
     #[test]

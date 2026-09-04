@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.16"
+version = "0.2.17"
 edition = "2024"
 rust-version = "1.98"
 license = "LicenseRef-B10x-Proprietary"
@@ -18,13 +18,13 @@ publish = false
 workspace-core = { path = "crates/workspace-core" }
 workspace-client = { path = "crates/workspace-client" }
 identity-client = { git = "https://github.com/beyond10x/identity.git", tag = "0.5.6" }
-connectors-client = { git = "https://github.com/beyond10x/connectors.git", tag = "v0.5.6" }
+connectors-client = { git = "https://github.com/beyond10x/connectors.git", rev = "03d7fc146c2e11f56ae6fb12e5da578821e2be15", version = "=0.6.2" }
 agent-platform-client = { git = "https://github.com/beyond10x/agent-platform.git", tag = "0.6.7" }
 agent-platform-core = { git = "https://github.com/beyond10x/agent-platform.git", tag = "0.6.7" }
-agentide-contracts = { git = "https://github.com/beyond10x/agentide.git", tag = "0.3.1" }
+agentide-contracts = { git = "https://github.com/beyond10x/agentide.git", rev = "081761e35d2b28f793500045e9d12cab70cb81f7", version = "=0.3.4" }
 aep-client = { git = "https://github.com/beyond10x/aep", tag = "0.51.0" }
 aep-contract = { git = "https://github.com/beyond10x/aep", tag = "0.51.0" }
-b10x-substrate-sdk = { git = "https://github.com/beyond10x/substrate.git", tag = "0.5.0" }
+b10x-substrate-sdk = { git = "https://github.com/beyond10x/substrate.git", rev = "9c370d5c0fde3e6920256ee39830f7df10e8e0f2", version = "=0.7.1" }
 
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
@@ -40,11 +40,11 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-similar = "2"
 sqlx = { version = "0.8", default-features = false, features = ["any", "runtime-tokio", "sqlite", "postgres"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 url = "2"
+zeroize = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

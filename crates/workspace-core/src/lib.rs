@@ -124,15 +124,16 @@ pub enum CodingSessionState {
     Closed,
 }
 
-/// One project coding session backed by an immutable base reference and writable working tree.
+/// One project coding session backed by one Git-aware writable materialization.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct CodingSession {
     pub id: String,
     pub project_id: String,
     pub source_revision: String,
-    pub base_materialization_ref: Option<String>,
-    pub working_materialization_ref: Option<String>,
+    /// The single writable materialization. It retains the predecessor's wire name during the
+    /// rolling migration so strict older clients do not reject otherwise valid session rows.
+    #[serde(rename = "working_materialization_ref", alias = "materialization_ref")]
+    pub materialization_ref: Option<String>,
     pub manifest_sha256: Option<String>,
     pub state: CodingSessionState,
     pub failure_code: Option<String>,
@@ -448,7 +449,13 @@ pub struct CodingTreeEntry {
 #[serde(deny_unknown_fields)]
 pub struct CodingTreeProjection {
     pub format: String,
+    /// Present on paged directory projections and empty on the legacy search projection.
+    #[serde(default)]
+    pub root: String,
     pub entries: Vec<CodingTreeEntry>,
+    /// Present on paged directory projections and absent on the legacy search projection.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
     pub truncated: bool,
     pub omitted: Option<u64>,
 }
@@ -637,4 +644,51 @@ pub struct CodingIntentResult {
 pub struct Problem {
     /// Stable refusal or failure code.
     pub code: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CodingSession, CodingTreeProjection};
+
+    #[test]
+    fn coding_session_accepts_predecessor_materialization_fields_and_keeps_legacy_wire_name() {
+        let session: CodingSession = serde_json::from_value(serde_json::json!({
+            "id": "session-one",
+            "project_id": "project-one",
+            "source_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "base_materialization_ref": "base-one",
+            "working_materialization_ref": "working-one",
+            "manifest_sha256": null,
+            "state": "preparing",
+            "failure_code": null,
+            "limits": {"max_files": 1000, "max_total_bytes": 1024, "max_file_bytes": 128},
+            "created_at_ms": 1,
+            "updated_at_ms": 1
+        }))
+        .expect("predecessor session wire");
+        assert_eq!(session.materialization_ref.as_deref(), Some("working-one"));
+
+        let encoded = serde_json::to_value(session).expect("successor session wire");
+        assert_eq!(
+            encoded
+                .get("working_materialization_ref")
+                .and_then(|value| value.as_str()),
+            Some("working-one")
+        );
+        assert!(encoded.get("materialization_ref").is_none());
+        assert!(encoded.get("base_materialization_ref").is_none());
+    }
+
+    #[test]
+    fn coding_tree_accepts_the_predecessor_search_projection() {
+        let tree: CodingTreeProjection = serde_json::from_value(serde_json::json!({
+            "format": "workspace.coding-tree/1",
+            "entries": [],
+            "truncated": false,
+            "omitted": 0
+        }))
+        .expect("predecessor tree wire");
+        assert_eq!(tree.root, "");
+        assert_eq!(tree.next_cursor, None);
+    }
 }

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.17 - 2026-09-05
+
+- Materialize one exact provider-default-branch commit directly through a short-lived,
+  Connector-authorized Smart Git session into Substrate's native Git source boundary.
+- Persist the immutable source intent independently of later project refreshes and recover
+  interrupted preparation without storing provider or session credentials.
+- Retain late-created materializations for bounded cleanup, distinguish permanent refusals from
+  retryable failures, and zeroize delegated bearer and transient Git authority in background work.
+- Pin the released Connectors 0.6.2, AgentIDE 0.3.4, and Substrate 0.7.1 source revisions so the
+  release composes one immutable contract graph for the new materialization path.
+
 ## 0.2.16 - 2026-09-04
 
 - Acknowledge coding-session creation with a durable `preparing` session, resume interrupted

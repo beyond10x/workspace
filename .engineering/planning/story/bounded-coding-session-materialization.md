@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:bounded-coding-session-materialization
 kind: story
-status: active
+status: implemented
 title: Bound coding-session materialization
 summary: Acknowledge coding-session creation promptly and materialize repositories without serial per-file Connector and Substrate fan-out.
 relations:
@@ -16,7 +16,13 @@ scope:
   path: crates/workspace-client
 - confidence: cited
   path: crates/workspace-service/src/main.rs
-revision: 4
+- confidence: cited
+  path: crates/workspace-service/src/store.rs
+- confidence: cited
+  path: domains/coding-session.yaml
+- confidence: cited
+  path: system.yaml
+revision: 6
 ---
 # Story: Bound coding-session materialization
 
