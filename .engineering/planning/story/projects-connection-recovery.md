@@ -15,7 +15,7 @@ scope:
   path: crates/workspace-service/src/main.rs
 - confidence: cited
   path: crates/workspace-service/src/repository_search_tests.rs
-revision: 6
+revision: 7
 ---
 ## Outcome
 
@@ -39,3 +39,11 @@ A test uses the real Workspace HTTP/client boundary with a Connector fixture tha
 Authenticated repository discovery recovered after normal OAuth reconnect. Project details loaded, but branches took roughly 18 seconds and a subsequent branch selection returned 503 after timing out. Source inspection shows discover_branches resolves gitlab.branches bindings by scanning the provider membership project catalogue; each datasource page resolves the same binding through another scan. This measured UI path is in the original Projects loading scope.
 
 The repair additionally uses the existing admitted gitlab-branch-list operation, bound to the already revalidated project and connection, with 100 records per provider page. It preserves the current Branch response and failure semantics, fetches additional pages until a short page, and never uses missing authorization as permission. Regression fixtures must prove exact numeric project identity and fresh description use, current connection admission, page progression, and errors instead of hidden partial lists. No cross-principal cache or new endpoint is introduced.
+
+## Integrated validation
+
+Integration commit 1f225640586ecb61ffc9c7cb4ed905398b0242a4 passed the complete `task check` on the final source and adversarial tests: 59 Cargo tests plus 5 release-policy and 15 release-adversary cases, all passing. Formatting and full-workspace Clippy with warnings denied passed. Runtime was 10.707 seconds with per-tree build output. The test-runner-only short TMPDIR resolves inside the assigned tree and preserves the existing Unix-socket fixture.
+
+The adversary added two reachable authority/reconnection cases and found no defect; its report is retained verbatim. The installed planning CLI validates the store but warns that the report has no findings despite its explicit empty findings fence; no report bytes were rewritten to suppress that tooling warning.
+
+Runtime 0.2.20 is ready for publication. Hosted deployment verification remains required before this story closes.
