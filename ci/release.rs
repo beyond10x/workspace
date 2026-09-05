@@ -220,23 +220,40 @@ fn private_package(allow_missing: bool) -> Result<(), String> {
             "target package is not private",
         );
     }
-    // GHCR's documented initial visibility is private. Confirm absence with an authenticated
-    // list request, never treating an arbitrary API failure as absence.
+    // Repository tokens cannot authoritatively enumerate an organization's packages, and their
+    // 404 can also hide an existing private package. Initial creation therefore needs an owner's
+    // one-use absence attestation, bound to this exact image and verified release source.
     // https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry
     if allow_missing && String::from_utf8_lossy(&result.stderr).contains("(HTTP 404)") {
-        let names = run(
-            "gh",
+        let commit = required("SOURCE_COMMIT")?;
+        check(
+            source(&commit)
+                && env::var("WORKSPACE_BOOTSTRAP_SOURCE").as_deref()
+                    == Ok(&format!("{image}@{commit}")),
+            "package 404 is ambiguous; an administrator must verify absence and temporarily attest this exact image@source in WORKSPACE_BOOTSTRAP_SOURCE",
+        )?;
+        // Disable curl's configuration file so this is genuinely credential-free. Require an
+        // exact HTTP404; public packages, auth/rate failures and transport errors all refuse.
+        let anonymous = run(
+            "curl",
             &[
-                "api",
-                &format!("/orgs/{owner}/packages?package_type=container&per_page=100"),
-                "--paginate",
-                "--jq",
-                ".[].name",
+                "--disable",
+                "--silent",
+                "--show-error",
+                "--proto",
+                "=https",
+                "--connect-timeout",
+                "10",
+                "--max-time",
+                "30",
+                "--write-out",
+                "\n%{http_code}",
+                &format!("https://api.github.com{api}"),
             ],
         )?;
         check(
-            !names.lines().any(|n| n == name),
-            "package exists but cannot be inspected",
+            anonymous.lines().last() == Some("404"),
+            "anonymous package probe did not confirm HTTP404; bootstrap refused",
         )?;
         return Ok(());
     }

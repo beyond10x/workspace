@@ -1,6 +1,15 @@
 use std::{env, fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command};
 
 fn probe(name: &str, visibility: &str, release_state: &str) -> std::process::Output {
+    probe_with_bootstrap(name, visibility, release_state, "")
+}
+
+fn probe_with_bootstrap(
+    name: &str,
+    visibility: &str,
+    release_state: &str,
+    bootstrap: &str,
+) -> std::process::Output {
     let root = PathBuf::from(env::var("TMPDIR").unwrap()).join(name);
     fs::create_dir_all(root.join("bin")).unwrap();
     fs::write(
@@ -13,11 +22,11 @@ fn probe(name: &str, visibility: &str, release_state: &str) -> std::process::Out
 case "$*" in
   *'/packages/container/'*)
     case "$PROBE_VISIBILITY" in
-      missing) echo 'gh: Not Found (HTTP 404)' >&2; exit 1;;
+      missing|bootstrap-*) echo 'gh: Not Found (HTTP 404)' >&2; exit 1;;
       forbidden) echo 'gh: Forbidden (HTTP 403)' >&2; exit 1;;
       *) echo private;;
     esac;;
-  *'/packages?'*) exit 0;;
+  *'/packages?'*) echo 'gh: Invalid argument. (HTTP 400)' >&2; exit 1;;
   *'/releases?'*) printf '0.2.17\t%s\n' "$PROBE_RELEASE_STATE";;
   'release view '*) echo release-manifest.json;;
   'release edit '*) exit 0;;
@@ -38,11 +47,21 @@ esac
 "#;
     let cosign =
         "#!/bin/sh\nif [ \"$PROBE_VISIBILITY\" = unsigned ]; then exit 1; fi\necho verified\n";
+    let curl = r#"#!/bin/sh
+case "$PROBE_VISIBILITY" in
+  bootstrap-public) printf '{"visibility":"public"}\n200';;
+  bootstrap-rate) printf '{"message":"rate limited"}\n429';;
+  bootstrap-auth) printf '{"message":"unauthorized"}\n401';;
+  bootstrap-network) exit 7;;
+  *) printf '{"message":"not found"}\n404';;
+esac
+"#;
     for (name, body) in [
         ("gh", gh),
         ("git", git),
         ("docker", docker),
         ("cosign", cosign),
+        ("curl", curl),
     ] {
         let file = root.join("bin").join(name);
         fs::write(&file, body).unwrap();
@@ -63,11 +82,72 @@ esac
         .env("WORKSPACE_IMAGE", "ghcr.io/example/workspace")
         .env("RELEASE_VERSION", "0.2.17")
         .env("SOURCE_COMMIT", "a".repeat(40))
+        .env("WORKSPACE_BOOTSTRAP_SOURCE", bootstrap)
         .env("GITHUB_OUTPUT", root.join("output"))
         .env("PROBE_VISIBILITY", visibility)
         .env("PROBE_RELEASE_STATE", release_state)
         .output()
         .unwrap()
+}
+
+#[test]
+fn confirmed_initial_bootstrap_does_not_enumerate_organization_packages() {
+    let result = probe_with_bootstrap(
+        "bootstrap-initial",
+        "missing",
+        "absent",
+        &format!("ghcr.io/example/workspace@{}", "a".repeat(40)),
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output("bootstrap-initial").contains("build=true"));
+}
+
+#[test]
+fn ambiguous_package_not_found_requires_exact_image_and_source_attestation() {
+    for (index, value) in [
+        String::new(),
+        format!("ghcr.io/example/other@{}", "a".repeat(40)),
+        format!("ghcr.io/example/workspace@{}", "b".repeat(40)),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let result = probe_with_bootstrap(
+            &format!("bootstrap-scope-{index}"),
+            "missing",
+            "absent",
+            value,
+        );
+        assert!(
+            !result.status.success(),
+            "ambiguous 404 passed without exact administrative attestation"
+        );
+    }
+}
+
+#[test]
+fn bootstrap_refuses_public_package_and_ambiguous_anonymous_probe_failures() {
+    for visibility in [
+        "bootstrap-public",
+        "bootstrap-rate",
+        "bootstrap-auth",
+        "bootstrap-network",
+    ] {
+        let result = probe_with_bootstrap(
+            visibility,
+            visibility,
+            "absent",
+            &format!("ghcr.io/example/workspace@{}", "a".repeat(40)),
+        );
+        assert!(
+            !result.status.success(),
+            "unsafe anonymous probe admitted bootstrap"
+        );
+    }
 }
 
 fn output(name: &str) -> String {
