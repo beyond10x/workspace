@@ -17,21 +17,17 @@ it as `artifacts.workspace_service` in the release's `release-manifest.json`, al
 commit and both platform digests. Deployment composition consumes that manifest without rebuilding
 Workspace or running Devcenter's release pipeline.
 
-The registry target is configured through the repository's `WORKSPACE_IMAGE` variable. Existing
-packages must be private before any publication; a confirmed missing GHCR package uses GHCR's
-default private initial visibility and is checked again after publication. CI never changes package
-visibility. Recovery dispatches require the same exact tag and source commit. A successful matching
+The registry target is configured through the repository's `WORKSPACE_IMAGE` variable. An
+administrator must first provision a private package and grant this repository access. Release CI
+requires that existing target to be verifiably private before allocating image builds and before
+every push, and checks again after publication. An absent or inaccessible package stops the release;
+there is no initial-publication exception. Package setup and visibility changes remain administrative
+operations outside CI. Recovery dispatches require the same exact tag and source commit. A successful matching
 release returns without allocating image builds. Drafts with an uploaded receipt finish from that
 receipt and also skip image builds. Both paths verify that the private package, all recorded image
 digests, the index's platform membership, and the owner's signature still exist; neither replaces
 an existing manifest. Image build credentials only admit the source dependencies. No cluster
 operation participates in publication, and no deployment coordinates are embedded in the manifest.
-
-For a first package, a scoped CI token's `404` does not prove absence. An administrator must verify
-the exact target is absent, temporarily set `WORKSPACE_BOOTSTRAP_SOURCE` to the configured image
-followed by `@` and the exact release source commit, and remove that attestation after the first
-successful private-package check. It admits only that initial image/source pair; it never bypasses
-the post-publication privacy check or permits an existing release receipt to use a missing package.
 
 ## Run locally
 

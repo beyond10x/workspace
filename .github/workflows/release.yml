@@ -82,7 +82,6 @@ jobs:
           RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
           SOURCE_COMMIT: ${{ inputs.source_commit || github.sha }}
           WORKSPACE_IMAGE: ${{ vars.WORKSPACE_IMAGE }}
-          WORKSPACE_BOOTSTRAP_SOURCE: ${{ vars.WORKSPACE_BOOTSTRAP_SOURCE }}
         run: /tmp/release-helper prepare
       - name: Preserve the trusted policy for both native runners
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -157,8 +156,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WORKSPACE_IMAGE: ${{ vars.WORKSPACE_IMAGE }}
-          WORKSPACE_BOOTSTRAP_SOURCE: ${{ vars.WORKSPACE_BOOTSTRAP_SOURCE }}
-          SOURCE_COMMIT: ${{ needs.verify.outputs.source }}
           ARCH: ${{ matrix.arch }}
         run: |
           /tmp/release-helper private

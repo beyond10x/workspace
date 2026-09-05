@@ -24,6 +24,8 @@ case "$*" in
     case "$PROBE_VISIBILITY" in
       missing|bootstrap-*) echo 'gh: Not Found (HTTP 404)' >&2; exit 1;;
       forbidden) echo 'gh: Forbidden (HTTP 403)' >&2; exit 1;;
+      public) echo public;;
+      internal) echo internal;;
       *) echo private;;
     esac;;
   *'/packages?'*) echo 'gh: Invalid argument. (HTTP 400)' >&2; exit 1;;
@@ -47,23 +49,11 @@ esac
 "#;
     let cosign =
         "#!/bin/sh\nif [ \"$PROBE_VISIBILITY\" = unsigned ]; then exit 1; fi\necho verified\n";
-    let curl = r#"#!/bin/sh
-case "$PROBE_VISIBILITY" in
-  bootstrap-public) printf '{"token":"synthetic-public-token"}\n200';;
-  bootstrap-rate) printf '{"message":"rate limited"}\n429';;
-  bootstrap-auth) printf '{"message":"unauthorized"}\n401';;
-  bootstrap-network) exit 7;;
-  bootstrap-forbidden) printf '{"errors":[{"code":"TOOMANYREQUESTS"}]}\n403';;
-  bootstrap-malformed) printf 'not-json\n403';;
-  *) printf '{"errors":[{"code":"DENIED","message":"requested access to the resource is denied"}]}\n403';;
-esac
-"#;
     for (name, body) in [
         ("gh", gh),
         ("git", git),
         ("docker", docker),
         ("cosign", cosign),
-        ("curl", curl),
     ] {
         let file = root.join("bin").join(name);
         fs::write(&file, body).unwrap();
@@ -93,7 +83,7 @@ esac
 }
 
 #[test]
-fn confirmed_initial_bootstrap_does_not_enumerate_organization_packages() {
+fn missing_package_refuses_before_build_even_with_legacy_bootstrap_attestation() {
     let result = probe_with_bootstrap(
         "bootstrap-initial",
         "missing",
@@ -101,15 +91,14 @@ fn confirmed_initial_bootstrap_does_not_enumerate_organization_packages() {
         &format!("ghcr.io/example/workspace@{}", "a".repeat(40)),
     );
     assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
+        !result.status.success(),
+        "initial package creation must never be admitted by release automation"
     );
-    assert!(output("bootstrap-initial").contains("build=true"));
+    assert!(!output("bootstrap-initial").contains("build=true"));
 }
 
 #[test]
-fn ambiguous_package_not_found_requires_exact_image_and_source_attestation() {
+fn absent_package_refuses_legacy_bootstrap_values() {
     for (index, value) in [
         String::new(),
         format!("ghcr.io/example/other@{}", "a".repeat(40)),
@@ -132,15 +121,8 @@ fn ambiguous_package_not_found_requires_exact_image_and_source_attestation() {
 }
 
 #[test]
-fn bootstrap_refuses_public_package_and_ambiguous_anonymous_probe_failures() {
-    for visibility in [
-        "bootstrap-public",
-        "bootstrap-rate",
-        "bootstrap-auth",
-        "bootstrap-network",
-        "bootstrap-forbidden",
-        "bootstrap-malformed",
-    ] {
+fn public_and_internal_packages_refuse_before_build_allocation() {
+    for visibility in ["public", "internal"] {
         let result = probe_with_bootstrap(
             visibility,
             visibility,
@@ -149,8 +131,9 @@ fn bootstrap_refuses_public_package_and_ambiguous_anonymous_probe_failures() {
         );
         assert!(
             !result.status.success(),
-            "unsafe anonymous probe admitted bootstrap"
+            "non-private target admitted image builds"
         );
+        assert!(!output(visibility).contains("build=true"));
     }
 }
 

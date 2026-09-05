@@ -86,7 +86,7 @@ fn query_json(json: &str, query: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&result.stdout).into_owned())
 }
 fn receipt(release: &str, commit: &str) -> Result<String, String> {
-    private_package(false)?;
+    private_package()?;
     let json = run(
         "gh",
         &[
@@ -191,7 +191,7 @@ fn output(key: &str, value: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     writeln!(file, "{key}={value}").map_err(|e| e.to_string())
 }
-fn private_package(allow_missing: bool) -> Result<(), String> {
+fn private_package() -> Result<(), String> {
     let image = required("WORKSPACE_IMAGE")?;
     let repository = required("GITHUB_REPOSITORY")?;
     let owner = repository.split('/').next().ok_or("missing owner")?;
@@ -220,58 +220,9 @@ fn private_package(allow_missing: bool) -> Result<(), String> {
             "target package is not private",
         );
     }
-    // Repository tokens cannot authoritatively enumerate an organization's packages, and their
-    // 404 can also hide an existing private package. Initial creation therefore needs an owner's
-    // one-use absence attestation, bound to this exact image and verified release source.
-    // https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry
-    if allow_missing && String::from_utf8_lossy(&result.stderr).contains("(HTTP 404)") {
-        let commit = required("SOURCE_COMMIT")?;
-        check(
-            source(&commit)
-                && env::var("WORKSPACE_BOOTSTRAP_SOURCE").as_deref()
-                    == Ok(&format!("{image}@{commit}")),
-            "package 404 is ambiguous; an administrator must verify absence and temporarily attest this exact image@source in WORKSPACE_BOOTSTRAP_SOURCE",
-        )?;
-        // The REST package API requires authentication even for an absent target. Probe GHCR's
-        // anonymous pull-token endpoint instead: public images admit a token (HTTP200), whereas
-        // absent/private images return HTTP403 with the registry DENIED code. This only excludes
-        // public visibility; the owner's exact attestation remains the authority for absence.
-        // Disable curl configuration so no ambient credential can turn this into an authenticated probe.
-        let anonymous = run(
-            "curl",
-            &[
-                "--disable",
-                "--silent",
-                "--show-error",
-                "--proto",
-                "=https",
-                "--connect-timeout",
-                "10",
-                "--max-time",
-                "30",
-                "--write-out",
-                "\n%{http_code}",
-                &format!(
-                    "https://ghcr.io/token?service=ghcr.io&scope=repository:{}/{name}:pull",
-                    owner.to_ascii_lowercase()
-                ),
-            ],
-        )?;
-        let (body, status) = anonymous
-            .rsplit_once('\n')
-            .ok_or("anonymous registry probe has no status")?;
-        check(
-            status == "403",
-            "anonymous registry probe did not refuse token access with HTTP403; bootstrap refused",
-        )?;
-        let codes = query_json(body, ".errors[].code")?;
-        check(
-            !codes.trim().is_empty() && codes.lines().all(|code| code == "DENIED"),
-            "anonymous registry probe was not an explicit DENIED response; bootstrap refused",
-        )?;
-        return Ok(());
-    }
-    Err("cannot verify private package".into())
+    // No initial-publication exception: an absent or inaccessible package is not a verified
+    // private target. Registry setup is a one-time administrative operation outside release CI.
+    Err("cannot verify private package; an administrator must provision a private target and grant this repository access before publication".into())
 }
 fn prepare() -> Result<(), String> {
     let repository = required("GITHUB_REPOSITORY")?;
@@ -353,7 +304,7 @@ fn prepare() -> Result<(), String> {
     let draft = releases
         .lines()
         .any(|line| line == format!("{release}\ttrue"));
-    private_package(!completed && !draft)?;
+    private_package()?;
     let has_receipt = if completed || draft {
         run(
             "gh",
@@ -536,8 +487,7 @@ fn main() {
     let args: Vec<_> = env::args().collect();
     let result = match args.get(1).map(String::as_str) {
         Some("prepare") => prepare(),
-        Some("private") => private_package(true),
-        Some("private-existing") => private_package(false),
+        Some("private" | "private-existing") => private_package(),
         Some("smoke") => args
             .get(2)
             .ok_or_else(|| "missing image".to_owned())
