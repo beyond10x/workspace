@@ -27,6 +27,12 @@ digests, the index's platform membership, and the owner's signature still exist;
 an existing manifest. Image build credentials only admit the source dependencies. No cluster
 operation participates in publication, and no deployment coordinates are embedded in the manifest.
 
+For a first package, a scoped CI token's `404` does not prove absence. An administrator must verify
+the exact target is absent, temporarily set `WORKSPACE_BOOTSTRAP_SOURCE` to the configured image
+followed by `@` and the exact release source commit, and remove that attestation after the first
+successful private-package check. It admits only that initial image/source pair; it never bypasses
+the post-publication privacy check or permits an existing release receipt to use a missing package.
+
 ## Run locally
 
 ```bash
