@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:independent-runtime-publication
 kind: story
-status: active
+status: implemented
 title: Publish the Workspace runtime from its owner repository
 scope:
 - confidence: cited
@@ -13,7 +13,7 @@ scope:
   path: Dockerfile
 - confidence: cited
   path: Taskfile.yml
-revision: 5
+revision: 6
 ---
 ## Outcome
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.18 - 2026-09-05
+
+- Publish native runtime images and signed immutable release metadata from the Workspace repository.
+- Check real image health and readiness before publication, and recover interrupted releases
+  from verified existing receipts without rebuilding successful artifacts.
+- Keep registry configuration outside public source and refuse unavailable or inconsistent
+  retained artifacts.
+
 ## 0.2.17 - 2026-09-05
 
 - Materialize one exact provider-default-branch commit directly through a short-lived,
