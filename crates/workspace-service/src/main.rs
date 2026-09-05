@@ -64,6 +64,8 @@ use workspace_core::{
 use zeroize::Zeroizing;
 
 mod aep;
+#[cfg(test)]
+mod repository_search_tests;
 mod store;
 
 use aep::{AepTransport, RequestCredential};
@@ -4360,14 +4362,27 @@ async fn search_projects(
     authority: &Authority,
     query: &str,
 ) -> Result<Vec<RepositoryCandidate>, Response> {
-    let described = connector_operation(
-        state,
-        authority,
-        operation::OperationRequest::Describe(operation::DescribeRequest {
-            operation_ref: "gitlab-project-list".to_owned(),
-        }),
-    )
-    .await?;
+    let response = state
+        .connectors
+        .operation(
+            &authority.connector_bearer,
+            &authority.context,
+            operation::OperationRequest::Describe(operation::DescribeRequest {
+                operation_ref: "gitlab-project-list".to_owned(),
+            }),
+        )
+        .await
+        .map_err(|_| problem(StatusCode::SERVICE_UNAVAILABLE, "connectors_unavailable"))?;
+    // Describe hides the operation when no current connection admits it. The client has
+    // validated this envelope; only that discovery refusal is an empty repository list.
+    if response
+        .error
+        .as_ref()
+        .is_some_and(|error| error.code == operation::OperationErrorCode::NotFound)
+    {
+        return Ok(Vec::new());
+    }
+    let described = connector_operation_result(response)?;
     let operation::OperationResult::Describe(description) = described else {
         return Err(problem(
             StatusCode::BAD_GATEWAY,
@@ -4499,69 +4514,80 @@ async fn discover_branches(
     authority: &Authority,
     project: &Project,
 ) -> Result<Vec<Branch>, Response> {
-    let description = describe(state, authority, "gitlab.branches").await?;
-    let binding = bindings(
+    #[derive(Deserialize)]
+    struct ProviderCommit {
+        id: String,
+    }
+
+    #[derive(Deserialize)]
+    struct ProviderBranch {
+        name: String,
+        commit: ProviderCommit,
+        #[serde(default, rename = "default")]
+        provider_default: bool,
+        #[serde(default)]
+        protected: bool,
+    }
+
+    const PAGE_SIZE: usize = 100;
+    let project_id = project
+        .project_ref
+        .parse::<u64>()
+        .ok()
+        .filter(|project_id| *project_id > 0)
+        .ok_or_else(|| {
+            problem(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "project_reference_invalid",
+            )
+        })?;
+    let description_ref = operation_description(
         state,
         authority,
-        "gitlab.branches",
-        &project.path_with_namespace,
+        "gitlab-branch-list",
+        &project.forge_instance_ref,
     )
-    .await?
-    .into_iter()
-    .find(|binding| {
-        binding.connection_ref == project.forge_instance_ref
-            && binding.label == project.path_with_namespace
-    })
-    .ok_or_else(|| problem(StatusCode::FORBIDDEN, "project_access_refused"))?;
+    .await?;
     let mut branches = Vec::new();
-    let mut cursor = None;
+    let mut page = 1_u64;
     loop {
-        let result = datasource(
+        let output = invoke_operation(
             state,
             authority,
-            DatasourceRequest::Read(ReadRequest {
-                datasource_ref: "gitlab.branches".to_owned(),
-                binding_ref: binding.binding_ref.clone(),
-                description_ref: description.clone(),
-                read: DatasourceRead::List { limit: 25, cursor },
-            }),
+            operation::InvokeRequest {
+                operation_ref: "gitlab-branch-list".to_owned(),
+                connection_ref: project.forge_instance_ref.clone(),
+                description_ref: description_ref.clone(),
+                input: serde_json::json!({
+                    "project_id": project_id,
+                    "page": page,
+                    "per_page": PAGE_SIZE,
+                }),
+                approval_evidence_ref: None,
+            },
         )
         .await?;
-        let DatasourceResult::Read(page) = result else {
+        let values: Vec<ProviderBranch> = serde_json::from_value(output)
+            .map_err(|_| problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
+        let count = values.len();
+        if count > PAGE_SIZE {
             return Err(problem(
                 StatusCode::BAD_GATEWAY,
                 "connector_protocol_invalid",
             ));
-        };
-        for record in page.records {
-            let value = record.value;
-            let Some(name) = value.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(commit) = value
-                .get("commit")
-                .and_then(|commit| commit.get("id"))
-                .and_then(Value::as_str)
-            else {
-                continue;
-            };
-            branches.push(Branch {
-                name: name.to_owned(),
-                commit: commit.to_owned(),
-                provider_default: value
-                    .get("default")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                protected: value
-                    .get("protected")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            });
         }
-        cursor = page.next_cursor;
-        if cursor.is_none() {
+        branches.extend(values.into_iter().map(|value| Branch {
+            name: value.name,
+            commit: value.commit.id,
+            provider_default: value.provider_default,
+            protected: value.protected,
+        }));
+        if count < PAGE_SIZE {
             break;
         }
+        page = page
+            .checked_add(1)
+            .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "connector_protocol_invalid"))?;
     }
     Ok(branches)
 }
@@ -5353,6 +5379,12 @@ async fn connector_operation(
         .operation(&authority.connector_bearer, &authority.context, request)
         .await
         .map_err(|_| problem(StatusCode::SERVICE_UNAVAILABLE, "connectors_unavailable"))?;
+    connector_operation_result(response)
+}
+
+fn connector_operation_result(
+    response: operation::ResponseEnvelope,
+) -> Result<operation::OperationResult, Response> {
     response
         .response
         .ok_or_else(|| match response.error.map(|error| error.code) {

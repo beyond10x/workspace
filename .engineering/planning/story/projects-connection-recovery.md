@@ -8,8 +8,14 @@ relations:
 - informed_by: story:bounded-coding-session-materialization
 scope:
 - confidence: cited
+  path: Cargo.lock
+- confidence: cited
+  path: Cargo.toml
+- confidence: cited
   path: crates/workspace-service/src/main.rs
-revision: 4
+- confidence: cited
+  path: crates/workspace-service/src/repository_search_tests.rs
+revision: 6
 ---
 ## Outcome
 
@@ -27,3 +33,9 @@ A test uses the real Workspace HTTP/client boundary with a Connector fixture tha
 
 - cited: crates/workspace-service/src/main.rs, repository search and Connector operation error mapping.
 - inferred: Cargo.toml and Cargo.lock for the separately authorized runtime release.
+
+## Hosted branch discovery finding
+
+Authenticated repository discovery recovered after normal OAuth reconnect. Project details loaded, but branches took roughly 18 seconds and a subsequent branch selection returned 503 after timing out. Source inspection shows discover_branches resolves gitlab.branches bindings by scanning the provider membership project catalogue; each datasource page resolves the same binding through another scan. This measured UI path is in the original Projects loading scope.
+
+The repair additionally uses the existing admitted gitlab-branch-list operation, bound to the already revalidated project and connection, with 100 records per provider page. It preserves the current Branch response and failure semantics, fetches additional pages until a short page, and never uses missing authorization as permission. Regression fixtures must prove exact numeric project identity and fresh description use, current connection admission, page progression, and errors instead of hidden partial lists. No cross-principal cache or new endpoint is introduced.
