@@ -347,6 +347,42 @@ mod branch_discovery {
     }
 
     #[tokio::test]
+    async fn revoked_connection_discards_pages_and_is_not_reused_on_the_next_read() {
+        let project = project();
+        let fixture = Fixture::scripted(
+            "gitlab-branch-list",
+            vec![
+                description("description:before-revocation", &project.forge_instance_ref),
+                page(rows(100)),
+                Reply::Failure(OperationErrorCode::NotGranted),
+                description("description:after-revocation", "connection:gitlab:other"),
+            ],
+        )
+        .await;
+        let authority = authority(&fixture).await;
+
+        let error = discover_branches(&fixture.state, &authority, &project)
+            .await
+            .expect_err("revocation cannot produce a partial branch list");
+        assert_error(error, StatusCode::FORBIDDEN, "connector_access_refused").await;
+
+        let error = discover_branches(&fixture.state, &authority, &project)
+            .await
+            .expect_err("the next read must recheck the connection");
+        assert_error(error, StatusCode::FORBIDDEN, "project_access_refused").await;
+        let requests = fixture.requests();
+        assert!(matches!(
+            requests.as_slice(),
+            [
+                OperationRequest::Describe(_),
+                OperationRequest::Invoke(_),
+                OperationRequest::Invoke(_),
+                OperationRequest::Describe(_),
+            ]
+        ));
+    }
+
+    #[tokio::test]
     async fn the_project_connection_must_be_currently_admitted() {
         let fixture = Fixture::scripted(
             "gitlab-branch-list",
@@ -568,6 +604,49 @@ async fn absent_gitlab_operation_returns_empty_repositories_without_invoking() {
     assert!(matches!(
         fixture.requests().as_slice(),
         [OperationRequest::Describe(_)]
+    ));
+}
+
+#[tokio::test]
+async fn a_newly_connected_operation_is_discovered_after_an_empty_recovery_result() {
+    let fixture = Fixture::scripted(
+        "gitlab-project-list",
+        vec![
+            Reply::Failure(OperationErrorCode::NotFound),
+            admitted_description(),
+            invocation(json!([{
+                "id": 42,
+                "path_with_namespace": "group/project",
+                "name": "Project",
+                "default_branch": "trunk"
+            }])),
+        ],
+    )
+    .await;
+    let (status, body) = fixture.repositories("/v1/repositories").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!([]));
+
+    let (status, body) = fixture.repositories("/v1/repositories").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the connected retry must be usable: {body}"
+    );
+    let repositories = body.as_array().expect("connected repository listing");
+    assert_eq!(repositories.len(), 1);
+    assert_eq!(repositories[0]["project_ref"], "42");
+    assert_eq!(
+        repositories[0]["forge_instance_ref"],
+        "connection:gitlab:admitted"
+    );
+    assert!(matches!(
+        fixture.requests().as_slice(),
+        [
+            OperationRequest::Describe(_),
+            OperationRequest::Describe(_),
+            OperationRequest::Invoke(_),
+        ]
     ));
 }
 
