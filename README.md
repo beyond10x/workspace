@@ -8,6 +8,25 @@ The service never stores a forge credential. Repository discovery is performed t
 read-only datasource contract, and every project operation revalidates that the current subject can
 still see the repository.
 
+## Independent runtime publication
+
+Workspace publishes its own service image from an exact version tag on the repository's default
+branch. Native AMD64 and ARM64 images must serve both health and database readiness probes before
+publication. The owner workflow signs and verifies the composed immutable image digest, then records
+it as `artifacts.workspace_service` in the release's `release-manifest.json`, alongside the source
+commit and both platform digests. Deployment composition consumes that manifest without rebuilding
+Workspace or running Devcenter's release pipeline.
+
+The registry target is configured through the repository's `WORKSPACE_IMAGE` variable. Existing
+packages must be private before any publication; a confirmed missing GHCR package uses GHCR's
+default private initial visibility and is checked again after publication. CI never changes package
+visibility. Recovery dispatches require the same exact tag and source commit. A successful matching
+release returns without allocating image builds. Drafts with an uploaded receipt finish from that
+receipt and also skip image builds. Both paths verify that the private package, all recorded image
+digests, the index's platform membership, and the owner's signature still exist; neither replaces
+an existing manifest. Image build credentials only admit the source dependencies. No cluster
+operation participates in publication, and no deployment coordinates are embedded in the manifest.
+
 ## Run locally
 
 ```bash

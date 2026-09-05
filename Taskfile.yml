@@ -5,6 +5,14 @@ tasks:
     desc: Run the complete Workspace repository gate
     cmds:
       - bash ci/check-toolchain-consistency.sh
+      - rustfmt --edition=2024 --check ci/release.rs ci/release_adversary.rs
+      - mkdir -p target
+      - rustc --edition=2024 --deny warnings --test ci/release.rs -o target/release-policy-tests
+      - target/release-policy-tests
+      - rustc --edition=2024 --deny warnings ci/release.rs -o target/release-helper
+      - rustc --edition=2024 --deny warnings --test ci/release_adversary.rs -o target/release-adversary-tests
+      - mkdir -p target/release-adversary-scratch
+      - TMPDIR="$PWD/target/release-adversary-scratch" ADV_HELPER="$PWD/target/release-helper" target/release-adversary-tests
       - cargo fmt --all --check
       - cargo clippy --workspace --all-targets --locked -- -D warnings
       - cargo test --workspace --locked
