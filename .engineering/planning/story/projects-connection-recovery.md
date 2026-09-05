@@ -2,7 +2,7 @@
 format: aep.planning-md/1
 id: story:projects-connection-recovery
 kind: story
-status: active
+status: implemented
 title: Recover repository discovery without usable GitLab authority
 relations:
 - informed_by: story:bounded-coding-session-materialization
@@ -15,7 +15,7 @@ scope:
   path: crates/workspace-service/src/main.rs
 - confidence: cited
   path: crates/workspace-service/src/repository_search_tests.rs
-revision: 7
+revision: 10
 ---
 ## Outcome
 
@@ -46,4 +46,12 @@ Integration commit 1f225640586ecb61ffc9c7cb4ed905398b0242a4 passed the complete 
 
 The adversary added two reachable authority/reconnection cases and found no defect; its report is retained verbatim. The installed planning CLI validates the store but warns that the report has no findings despite its explicit empty findings fence; no report bytes were rewritten to suppress that tooling warning.
 
-Runtime 0.2.20 is ready for publication. Hosted deployment verification remains required before this story closes.
+Runtime 0.2.20 publication and the repository/branch scope of hosted verification are now complete, as recorded in the following section. Broader coding-workspace and Agent validation remains in the coordination story.
+
+## Publication and hosted verification
+
+Runtime 0.2.20 was published from main 9caeeb7d030029a1d4629ac5f72b989b01c75bb2 at sha256:9aea220540221588d0a45ba38336dc6d747c6113ff73f7e1bf77c771250f4cda. Release workflow33982973953 succeeded after the complete source/release checks. It is deployed with Devcenter server0.8.21.
+
+Authenticated post-release verification confirmed repository search and project detail for an admitted connection, 18 returned branches, and successful default-branch selection. The measured branch request fell from 12048 ms to 1009 ms; branch selection returned HTTP200 in1310 ms. These observations close this story's repository-discovery and branch-resolution scope. The existing source-boundary regressions continue to distinguish missing operation authority from real provider, transport and protocol failures.
+
+The subsequent file-preparation refusal was traced to the separate hosted Substrate quota capability. That repair and its storage cutover are now deployed. The broader coordination story remains active for authenticated headless file-tree/editor and both Agent-surface checks: the final headless diagnostic currently requires a sign-in session. This story does not claim those consumer checks or end-to-end coding startup timing are complete.
