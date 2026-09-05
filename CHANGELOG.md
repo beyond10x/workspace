@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.19 - 2026-09-05
+
+- Share bounded Substrate HTTPS connections and initialized TLS configuration across coding-session
+  reads. Each caller still obtains current Identity authority and verifies the Substrate contract;
+  repository grants and workspace readiness are revalidated for every operation.
+- Report handler duration through `Server-Timing` to make workspace startup latency measurable.
+
 ## 0.2.18 - 2026-09-05
 
 - Publish native runtime images and signed immutable release metadata from the Workspace repository.

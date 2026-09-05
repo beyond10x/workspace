@@ -33,8 +33,8 @@ use axum::{Json, serve};
 use b10x_substrate_sdk::{
     AccessToken, Client as SubstrateClient, DirectoryEntryKind, ExecutionPolicy, ExpectedFileState,
     PipeChannel, PipeFrame, PipeSessionState, PtyWindow, RefusalClass as SubstrateRefusalClass,
-    SdkError as SubstrateError, Signal, StorageLimit, Workspace as SubstrateWorkspace,
-    WorkspaceAccess,
+    RemoteEndpoint, SdkError as SubstrateError, Signal, StorageLimit,
+    Workspace as SubstrateWorkspace, WorkspaceAccess,
 };
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
@@ -251,6 +251,7 @@ struct SubstrateConfiguration {
     origin: String,
     ca_bundle: String,
     server_identity: String,
+    endpoint: Arc<tokio::sync::OnceCell<RemoteEndpoint>>,
 }
 
 #[tokio::main]
@@ -312,6 +313,7 @@ async fn main() -> Result<()> {
             origin,
             ca_bundle,
             server_identity,
+            endpoint: Arc::new(tokio::sync::OnceCell::new()),
         }),
         _ => None,
     };
@@ -435,7 +437,23 @@ fn router(state: AppState) -> Router {
             "/v1/projects/{project_id}/workflow-runs",
             get(workflow_runs).post(start_workflow),
         )
+        .route_layer(axum::middleware::from_fn(workspace_request_timing))
         .with_state(state)
+}
+
+async fn workspace_request_timing(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let started = std::time::Instant::now();
+    let mut response = next.run(request).await;
+    if let Ok(value) = axum::http::HeaderValue::from_str(&format!(
+        "workspace;dur={:.3}",
+        started.elapsed().as_secs_f64() * 1_000.0,
+    )) {
+        response.headers_mut().append("server-timing", value);
+    }
+    response
 }
 
 async fn health() -> Json<Value> {
@@ -4217,34 +4235,36 @@ async fn substrate_client_result(
     };
     let identity = state.identity.clone();
     let authorization = authority.session_authorization.clone();
-    let client = SubstrateClient::builder()
-        .https_endpoint(&configuration.origin)
-        .trust_roots(&configuration.ca_bundle)
-        .server_identity(&configuration.server_identity)
-        .token_provider(move |_| {
-            let identity = identity.clone();
-            let authorization = authorization.clone();
-            async move {
-                let access = tokio::time::timeout(
-                    SUBSTRATE_TOKEN_TIMEOUT,
-                    identity.issue_access_token(
-                        &authorization,
-                        SUBSTRATE_AUDIENCE,
-                        SUBSTRATE_SCOPE,
-                    ),
-                )
-                .await
-                .map_err(|_| SubstrateError::TokenUnavailable)?
-                .map_err(|_| SubstrateError::TokenUnavailable)?;
-                AccessToken::new(
-                    access
-                        .credential
-                        .expose_at_authorization_boundary()
-                        .to_owned(),
-                )
-            }
+    let endpoint = configuration
+        .endpoint
+        .get_or_try_init(|| async {
+            RemoteEndpoint::new(
+                &configuration.origin,
+                std::path::Path::new(&configuration.ca_bundle),
+                &configuration.server_identity,
+            )
         })
-        .connect();
+        .await
+        .map_err(|_| SubstrateClientFailure::Refused)?;
+    let client = endpoint.connect(move |_| {
+        let identity = identity.clone();
+        let authorization = authorization.clone();
+        async move {
+            let access = tokio::time::timeout(
+                SUBSTRATE_TOKEN_TIMEOUT,
+                identity.issue_access_token(&authorization, SUBSTRATE_AUDIENCE, SUBSTRATE_SCOPE),
+            )
+            .await
+            .map_err(|_| SubstrateError::TokenUnavailable)?
+            .map_err(|_| SubstrateError::TokenUnavailable)?;
+            AccessToken::new(
+                access
+                    .credential
+                    .expose_at_authorization_boundary()
+                    .to_owned(),
+            )
+        }
+    });
     tokio::time::timeout(SUBSTRATE_CONNECT_TIMEOUT, client)
         .await
         .map_err(|_| SubstrateClientFailure::Retryable)?

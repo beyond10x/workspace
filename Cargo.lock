@@ -425,16 +425,20 @@ dependencies = [
 
 [[package]]
 name = "b10x-substrate-sdk"
-version = "0.7.1"
-source = "git+https://github.com/beyond10x/substrate.git?rev=9c370d5c0fde3e6920256ee39830f7df10e8e0f2#9c370d5c0fde3e6920256ee39830f7df10e8e0f2"
+version = "0.7.3"
+source = "git+https://github.com/beyond10x/substrate.git?rev=329a128606a7c18c4477d6fff58ffc57b296fb70#329a128606a7c18c4477d6fff58ffc57b296fb70"
 dependencies = [
  "b10x-substrate-wire",
  "base64 0.23.1",
+ "bytes",
  "chrono",
  "ed25519-dalek",
  "futures-util",
  "getrandom 0.4.3",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "nix",
  "rustls",
  "rustls-pemfile",
@@ -452,8 +456,8 @@ dependencies = [
 
 [[package]]
 name = "b10x-substrate-wire"
-version = "0.7.1"
-source = "git+https://github.com/beyond10x/substrate.git?rev=9c370d5c0fde3e6920256ee39830f7df10e8e0f2#9c370d5c0fde3e6920256ee39830f7df10e8e0f2"
+version = "0.7.3"
+source = "git+https://github.com/beyond10x/substrate.git?rev=329a128606a7c18c4477d6fff58ffc57b296fb70#329a128606a7c18c4477d6fff58ffc57b296fb70"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -700,16 +704,16 @@ dependencies = [
 
 [[package]]
 name = "connector-state"
-version = "0.6.2"
-source = "git+https://github.com/beyond10x/connectors.git?rev=03d7fc146c2e11f56ae6fb12e5da578821e2be15#03d7fc146c2e11f56ae6fb12e5da578821e2be15"
+version = "0.6.4"
+source = "git+https://github.com/beyond10x/connectors.git?rev=dbdd285c629d8b93bb685cc5a89a270316978ce5#dbdd285c629d8b93bb685cc5a89a270316978ce5"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "connectors-client"
-version = "0.6.2"
-source = "git+https://github.com/beyond10x/connectors.git?rev=03d7fc146c2e11f56ae6fb12e5da578821e2be15#03d7fc146c2e11f56ae6fb12e5da578821e2be15"
+version = "0.6.4"
+source = "git+https://github.com/beyond10x/connectors.git?rev=dbdd285c629d8b93bb685cc5a89a270316978ce5#dbdd285c629d8b93bb685cc5a89a270316978ce5"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
@@ -918,8 +922,8 @@ dependencies = [
 
 [[package]]
 name = "domain"
-version = "0.6.2"
-source = "git+https://github.com/beyond10x/connectors.git?rev=03d7fc146c2e11f56ae6fb12e5da578821e2be15#03d7fc146c2e11f56ae6fb12e5da578821e2be15"
+version = "0.6.4"
+source = "git+https://github.com/beyond10x/connectors.git?rev=dbdd285c629d8b93bb685cc5a89a270316978ce5#dbdd285c629d8b93bb685cc5a89a270316978ce5"
 dependencies = [
  "async-trait",
  "connector-state",
@@ -2135,8 +2139,8 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.6.2"
-source = "git+https://github.com/beyond10x/connectors.git?rev=03d7fc146c2e11f56ae6fb12e5da578821e2be15#03d7fc146c2e11f56ae6fb12e5da578821e2be15"
+version = "0.6.4"
+source = "git+https://github.com/beyond10x/connectors.git?rev=dbdd285c629d8b93bb685cc5a89a270316978ce5#dbdd285c629d8b93bb685cc5a89a270316978ce5"
 dependencies = [
  "domain",
  "schemars 1.2.2",
@@ -3255,7 +3259,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -4059,7 +4063,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workspace-client"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "agentide-contracts 0.3.4",
  "reqwest 0.13.4",
@@ -4071,7 +4075,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-core"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "serde",
  "serde_json",
@@ -4079,7 +4083,7 @@ dependencies = [
 
 [[package]]
 name = "workspace-service"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "aep-client",
  "aep-contract",
