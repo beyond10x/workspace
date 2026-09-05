@@ -49,11 +49,13 @@ esac
         "#!/bin/sh\nif [ \"$PROBE_VISIBILITY\" = unsigned ]; then exit 1; fi\necho verified\n";
     let curl = r#"#!/bin/sh
 case "$PROBE_VISIBILITY" in
-  bootstrap-public) printf '{"visibility":"public"}\n200';;
+  bootstrap-public) printf '{"token":"synthetic-public-token"}\n200';;
   bootstrap-rate) printf '{"message":"rate limited"}\n429';;
   bootstrap-auth) printf '{"message":"unauthorized"}\n401';;
   bootstrap-network) exit 7;;
-  *) printf '{"message":"not found"}\n404';;
+  bootstrap-forbidden) printf '{"errors":[{"code":"TOOMANYREQUESTS"}]}\n403';;
+  bootstrap-malformed) printf 'not-json\n403';;
+  *) printf '{"errors":[{"code":"DENIED","message":"requested access to the resource is denied"}]}\n403';;
 esac
 "#;
     for (name, body) in [
@@ -136,6 +138,8 @@ fn bootstrap_refuses_public_package_and_ambiguous_anonymous_probe_failures() {
         "bootstrap-rate",
         "bootstrap-auth",
         "bootstrap-network",
+        "bootstrap-forbidden",
+        "bootstrap-malformed",
     ] {
         let result = probe_with_bootstrap(
             visibility,

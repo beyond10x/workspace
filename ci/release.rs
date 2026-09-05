@@ -232,8 +232,11 @@ fn private_package(allow_missing: bool) -> Result<(), String> {
                     == Ok(&format!("{image}@{commit}")),
             "package 404 is ambiguous; an administrator must verify absence and temporarily attest this exact image@source in WORKSPACE_BOOTSTRAP_SOURCE",
         )?;
-        // Disable curl's configuration file so this is genuinely credential-free. Require an
-        // exact HTTP404; public packages, auth/rate failures and transport errors all refuse.
+        // The REST package API requires authentication even for an absent target. Probe GHCR's
+        // anonymous pull-token endpoint instead: public images admit a token (HTTP200), whereas
+        // absent/private images return HTTP403 with the registry DENIED code. This only excludes
+        // public visibility; the owner's exact attestation remains the authority for absence.
+        // Disable curl configuration so no ambient credential can turn this into an authenticated probe.
         let anonymous = run(
             "curl",
             &[
@@ -248,12 +251,23 @@ fn private_package(allow_missing: bool) -> Result<(), String> {
                 "30",
                 "--write-out",
                 "\n%{http_code}",
-                &format!("https://api.github.com{api}"),
+                &format!(
+                    "https://ghcr.io/token?service=ghcr.io&scope=repository:{}/{name}:pull",
+                    owner.to_ascii_lowercase()
+                ),
             ],
         )?;
+        let (body, status) = anonymous
+            .rsplit_once('\n')
+            .ok_or("anonymous registry probe has no status")?;
         check(
-            anonymous.lines().last() == Some("404"),
-            "anonymous package probe did not confirm HTTP404; bootstrap refused",
+            status == "403",
+            "anonymous registry probe did not refuse token access with HTTP403; bootstrap refused",
+        )?;
+        let codes = query_json(body, ".errors[].code")?;
+        check(
+            !codes.trim().is_empty() && codes.lines().all(|code| code == "DENIED"),
+            "anonymous registry probe was not an explicit DENIED response; bootstrap refused",
         )?;
         return Ok(());
     }
