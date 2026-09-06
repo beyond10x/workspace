@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.22 - 2026-09-06
+
+- List the workspace root through the released bounded tree observation, with pages bound to
+  the current materialization and root listing. Preserve native child-directory pagination and
+  refuse incomplete root observations instead of reporting a misleading complete listing.
+
 ## 0.2.21 - 2026-09-06
 
 - Recheck durable coding-session state before resuming provisioning, preserving a ready checkout

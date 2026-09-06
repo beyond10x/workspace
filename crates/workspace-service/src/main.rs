@@ -2059,13 +2059,40 @@ async fn coding_tree(
             .into_response(),
         );
     }
-    let page = match working
-        .read_directory(path, query.cursor.as_deref(), query.limit)
-        .await
+    match coding_directory_tree(
+        &working,
+        &session,
+        path,
+        query.cursor.as_deref(),
+        query.limit,
+    )
+    .await
     {
-        Ok(page) => page,
-        Err(error) => return substrate_problem(&error),
-    };
+        Ok(projection) => confidential(Json(projection).into_response()),
+        Err(response) => response,
+    }
+}
+
+async fn coding_directory_tree(
+    working: &SubstrateWorkspace,
+    session: &CodingSession,
+    path: &str,
+    cursor: Option<&str>,
+    limit: u32,
+) -> Result<CodingTreeProjection, Response> {
+    if path.is_empty() {
+        // The released directory API accepts strict relative paths. Root observation uses
+        // the existing recursive tree, bounded by the same ceiling as materialization inodes.
+        let tree = working
+            .tree(session.limits.max_files, true)
+            .await
+            .map_err(|error| substrate_problem(&error))?;
+        return root_tree_page(session, tree, cursor, limit);
+    }
+    let page = working
+        .read_directory(path, cursor, limit)
+        .await
+        .map_err(|error| substrate_problem(&error))?;
     let entries = page
         .items
         .into_iter()
@@ -2089,15 +2116,97 @@ async fn coding_tree(
         })
         .collect::<Vec<_>>();
     let truncated = page.next_cursor.is_some();
-    let projection = CodingTreeProjection {
+    Ok(CodingTreeProjection {
         format: "workspace.coding-tree/2".to_owned(),
         root: path.to_owned(),
         entries,
         next_cursor: page.next_cursor,
         truncated,
         omitted: None,
+    })
+}
+
+fn root_tree_page(
+    session: &CodingSession,
+    tree: b10x_substrate_sdk::WorkspaceTree,
+    cursor: Option<&str>,
+    limit: u32,
+) -> Result<CodingTreeProjection, Response> {
+    if tree.truncated {
+        // A partial recursive walk may omit later root siblings; it cannot prove a root page.
+        return Err(problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "coding_tree_root_incomplete",
+        ));
+    }
+    if session.materialization_ref.as_deref() != Some(tree.workspace.as_str())
+        || tree.items.len() > session.limits.max_files as usize
+    {
+        return Err(problem(
+            StatusCode::BAD_GATEWAY,
+            "substrate_protocol_invalid",
+        ));
+    }
+    let mut entries = tree
+        .items
+        .into_iter()
+        .filter(|entry| !entry.path.contains('/'))
+        .map(|entry| CodingTreeEntry {
+            path: entry.path,
+            kind: match entry.kind {
+                DirectoryEntryKind::File => "file",
+                DirectoryEntryKind::Directory => "directory",
+                DirectoryEntryKind::Symlink => "symlink",
+            }
+            .to_owned(),
+            size: entry.size,
+            sha256: None,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    let snapshot = serde_json::to_vec(&(&session.id, &tree.workspace, &entries)).map_err(|_| {
+        problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "coding_tree_encoding_failed",
+        )
+    })?;
+    let snapshot = hex::encode(Sha256::digest(snapshot));
+    let invalid_cursor = || {
+        problem(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "coding_tree_cursor_invalid",
+        )
     };
-    confidential(Json(projection).into_response())
+    let start = match cursor {
+        None => 0,
+        Some(cursor) => {
+            let (observed, offset) = cursor
+                .strip_prefix("root-v1:")
+                .and_then(|value| value.split_once(':'))
+                .ok_or_else(invalid_cursor)?;
+            if !valid_sha256(observed) {
+                return Err(invalid_cursor());
+            }
+            let start = offset.parse::<usize>().map_err(|_| invalid_cursor())?;
+            if start == 0 || start >= entries.len() || start.to_string() != offset {
+                return Err(invalid_cursor());
+            }
+            if observed != snapshot {
+                return Err(problem(StatusCode::CONFLICT, "coding_tree_cursor_stale"));
+            }
+            start
+        }
+    };
+    let end = start.saturating_add(limit as usize).min(entries.len());
+    let next_cursor = (end < entries.len()).then(|| format!("root-v1:{snapshot}:{end}"));
+    Ok(CodingTreeProjection {
+        format: "workspace.coding-tree/2".to_owned(),
+        root: String::new(),
+        entries: entries.drain(start..end).collect(),
+        truncated: next_cursor.is_some(),
+        next_cursor,
+        omitted: None,
+    })
 }
 
 async fn coding_file(
@@ -5894,6 +6003,7 @@ async fn shutdown() {
 
 #[cfg(test)]
 mod tests {
+    use super::root_tree_page;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -5906,13 +6016,13 @@ mod tests {
     use super::{
         AppState, Authority, MaterializationWorkers, SOURCE_MATERIALIZATION_INODES,
         SOURCE_MATERIALIZATION_LIMITS, SUBSTRATE_SCOPE, WorkflowObservation, WorkflowObservers,
-        WorkflowTaskOutcome, agentide_grants, agentide_session_row, coding_intent_profile,
-        coding_materialization_source, file_operation_id, git_source_manifest_sha256,
-        install_crypto_provider, language_for_path, parse_hunk_header, parse_unified_diff,
-        provision_git_materialization, repository_candidate, resume_workflow_completions,
-        spawn_workflow_completion, submit_workflow_task, terminal_grant_row_matches,
-        terminal_session_row_matches, valid_materialization_label, valid_repository_path,
-        validate_identity_transport, workflow_task_outcome,
+        WorkflowTaskOutcome, agentide_grants, agentide_session_row, coding_directory_tree,
+        coding_intent_profile, coding_materialization_source, file_operation_id,
+        git_source_manifest_sha256, install_crypto_provider, language_for_path, parse_hunk_header,
+        parse_unified_diff, provision_git_materialization, repository_candidate,
+        resume_workflow_completions, spawn_workflow_completion, submit_workflow_task,
+        terminal_grant_row_matches, terminal_session_row_matches, valid_materialization_label,
+        valid_repository_path, validate_identity_transport, workflow_task_outcome,
     };
     use crate::store::{CodingSessionSource, Store};
     use agent_platform_client::AgentPlatformClient;
@@ -5979,6 +6089,142 @@ mod tests {
         .into_iter()
         .chain(body.iter().copied())
         .collect()
+    }
+
+    fn root_tree_fixture() -> (CodingSession, b10x_substrate_sdk::WorkspaceTree) {
+        let session = CodingSession {
+            id: "session-root".to_owned(),
+            project_id: "project-one".to_owned(),
+            source_revision: "a".repeat(40),
+            materialization_ref: Some("ws_root".to_owned()),
+            manifest_sha256: Some("b".repeat(64)),
+            state: CodingSessionState::Ready,
+            failure_code: None,
+            limits: SOURCE_MATERIALIZATION_LIMITS,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let tree = serde_json::from_value(serde_json::json!({
+            "workspace": "ws_root", "truncated": false,
+            "observed_at": "2026-09-01T00:00:00Z",
+            "items": [
+                {"path": "src/child", "kind": "file", "size": 3},
+                {"path": "src", "kind": "directory", "size": null},
+                {"path": "README.md", "kind": "file", "size": 2},
+                {"path": ".hidden", "kind": "file", "size": 1}
+            ]
+        }))
+        .unwrap();
+        (session, tree)
+    }
+
+    #[test]
+    fn root_pages_are_complete_bounded_and_bound_to_the_observed_materialization() {
+        let (session, tree) = root_tree_fixture();
+        let first = root_tree_page(&session, tree.clone(), None, 1).unwrap();
+        assert_eq!(first.entries[0].path, ".hidden");
+        let cursor = first.next_cursor.as_deref();
+        let second = root_tree_page(&session, tree.clone(), cursor, 1).unwrap();
+        assert_eq!(second.entries[0].path, "README.md");
+        let last =
+            root_tree_page(&session, tree.clone(), second.next_cursor.as_deref(), 1).unwrap();
+        assert_eq!(last.entries[0].path, "src");
+        assert!(!last.truncated);
+        assert_eq!(last.next_cursor, None);
+
+        let mut reordered = tree.clone();
+        reordered.items.reverse();
+        assert_eq!(
+            root_tree_page(&session, reordered, cursor, 1).unwrap(),
+            second
+        );
+
+        let mut changed = tree.clone();
+        changed.items[2].size = Some(4);
+        assert_eq!(
+            root_tree_page(&session, changed, cursor, 1)
+                .unwrap_err()
+                .status(),
+            409
+        );
+        let mut other_session = session.clone();
+        other_session.id = "another-session".to_owned();
+        assert_eq!(
+            root_tree_page(&other_session, tree.clone(), cursor, 1)
+                .unwrap_err()
+                .status(),
+            409
+        );
+        let mut another_materialization = tree.clone();
+        another_materialization.workspace = "ws_other".to_owned();
+        assert_eq!(
+            root_tree_page(&session, another_materialization.clone(), None, 1)
+                .unwrap_err()
+                .status(),
+            502
+        );
+        other_session.materialization_ref = Some("ws_other".to_owned());
+        assert_eq!(
+            root_tree_page(&other_session, another_materialization, cursor, 1)
+                .unwrap_err()
+                .status(),
+            409
+        );
+
+        let mut incomplete = tree.clone();
+        incomplete.truncated = true;
+        assert_eq!(
+            root_tree_page(&session, incomplete, None, 1)
+                .unwrap_err()
+                .status(),
+            503
+        );
+        let mut too_small = session;
+        too_small.limits.max_files = 1;
+        assert_eq!(
+            root_tree_page(&too_small, tree, None, 1)
+                .unwrap_err()
+                .status(),
+            502
+        );
+    }
+
+    #[test]
+    fn root_pages_refuse_malformed_cursors_and_do_not_invent_empty_root_pages() {
+        let (session, tree) = root_tree_fixture();
+        let first = root_tree_page(&session, tree.clone(), None, 1).unwrap();
+        let cursor = first.next_cursor.unwrap();
+        let prefix = cursor.strip_suffix(":1").unwrap();
+        for malformed in [
+            String::new(),
+            "native-directory-cursor".to_owned(),
+            format!("{prefix}:0"),
+            format!("{prefix}:01"),
+            format!("{prefix}:3"),
+            format!("{prefix}:999999999999999999999999999999999999"),
+            format!("{prefix}:-1"),
+            format!("{prefix}:1:extra"),
+            "root-v1:invalid:1".to_owned(),
+        ] {
+            assert_eq!(
+                root_tree_page(&session, tree.clone(), Some(&malformed), 1)
+                    .unwrap_err()
+                    .status(),
+                422
+            );
+        }
+        let mut empty = tree;
+        empty.items.clear();
+        let page = root_tree_page(&session, empty.clone(), None, 2).unwrap();
+        assert!(page.entries.is_empty());
+        assert!(!page.truncated);
+        assert_eq!(page.next_cursor, None);
+        assert_eq!(
+            root_tree_page(&session, empty, Some(&cursor), 1)
+                .unwrap_err()
+                .status(),
+            422
+        );
     }
 
     #[test]
@@ -6150,6 +6396,74 @@ mod tests {
                 .write_all(&substrate_http_response("200 OK", &workspace))
                 .await
                 .expect("workspace response");
+
+            let (mut observed_stream, _) = substrate_listener
+                .accept()
+                .await
+                .expect("observed workspace");
+            let observed_request = read_http_request(&mut observed_stream).await;
+            assert!(
+                observed_request.starts_with(b"GET /v1/workspaces/ws_materialized HTTP/1.1\r\n")
+            );
+            observed_stream
+                .write_all(&substrate_http_response("200 OK", &workspace))
+                .await
+                .unwrap();
+
+            // Root pages use the released bounded tree observation. Empty paths are not
+            // relative file paths, while nested directories retain their native API/cursor.
+            for (target, result) in [
+                (
+                    "/v2/workspaces/ws_materialized/tree?limit_items=1000&include_hidden=true",
+                    serde_json::json!({
+                        "workspace": "ws_materialized",
+                        "items": [
+                            {"path": ".hidden", "kind": "file", "size": 1},
+                            {"path": "README.md", "kind": "file", "size": 2},
+                            {"path": "nested", "kind": "directory", "size": null},
+                            {"path": "nested/child", "kind": "file", "size": 3}
+                        ],
+                        "truncated": false,
+                        "observed_at": "2026-09-01T00:00:01Z"
+                    }),
+                ),
+                (
+                    "/v2/workspaces/ws_materialized/tree?limit_items=1000&include_hidden=true",
+                    serde_json::json!({
+                        "workspace": "ws_materialized",
+                        "items": [
+                            {"path": ".hidden", "kind": "file", "size": 1},
+                            {"path": "README.md", "kind": "file", "size": 2},
+                            {"path": "nested", "kind": "directory", "size": null},
+                            {"path": "nested/child", "kind": "file", "size": 3}
+                        ],
+                        "truncated": false,
+                        "observed_at": "2026-09-01T00:00:02Z"
+                    }),
+                ),
+                (
+                    "/v1/workspaces/ws_materialized/files/nested?mode=directory&cursor=native-cursor&limit_items=2",
+                    serde_json::json!({
+                        "kind": "directory", "workspace": "ws_materialized", "path": "nested",
+                        "items": [{"name": "child", "kind": "file", "size": 3}],
+                        "next_cursor": "native-next",
+                        "observed_at": "2026-09-01T00:00:02Z"
+                    }),
+                ),
+            ] {
+                let (mut stream, _) = substrate_listener.accept().await.expect("tree request");
+                let request = read_http_request(&mut stream).await;
+                assert!(request.starts_with(format!("GET {target} HTTP/1.1\r\n").as_bytes()));
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "api_version": if target.starts_with("/v2/") { "v2" } else { "v1" },
+                    "request_id": "tree", "result": result
+                }))
+                .unwrap();
+                stream
+                    .write_all(&substrate_http_response("200 OK", &body))
+                    .await
+                    .unwrap();
+            }
         });
 
         let substrate = b10x_substrate_sdk::Client::builder()
@@ -6245,6 +6559,38 @@ mod tests {
             u64::from(ready.limits.max_files),
             SOURCE_MATERIALIZATION_INODES
         );
+
+        let working = substrate.get_workspace("ws_materialized").await.unwrap();
+        let first = coding_directory_tree(&working, &ready, "", None, 2)
+            .await
+            .expect("root listing must use the released tree observation");
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            [".hidden", "README.md"]
+        );
+        assert!(first.truncated);
+        let second = coding_directory_tree(&working, &ready, "", first.next_cursor.as_deref(), 2)
+            .await
+            .expect("next root page");
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            ["nested"]
+        );
+        assert!(!second.truncated);
+        assert_eq!(second.next_cursor, None);
+        let nested = coding_directory_tree(&working, &ready, "nested", Some("native-cursor"), 2)
+            .await
+            .expect("native child-directory page");
+        assert_eq!(nested.entries[0].path, "nested/child");
+        assert_eq!(nested.next_cursor.as_deref(), Some("native-next"));
 
         substrate_server.await.expect("Substrate server");
         connector_server.abort();
