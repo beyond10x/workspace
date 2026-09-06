@@ -378,6 +378,25 @@ mod tests {
         assert_eq!(replay.frames.len(), 1);
     }
 
+    #[test]
+    fn launch_directory_remains_the_exact_absolute_workspace_root() {
+        let mut admitted = profile();
+        validate_profile(&admitted).expect("absolute launch root remains admitted");
+        for path in [
+            "",
+            ".",
+            "workspace",
+            "/",
+            "/other",
+            "/workspace/",
+            "/workspace/src",
+            "/workspace/../other",
+        ] {
+            admitted.working_directory = path.to_owned();
+            assert!(validate_profile(&admitted).is_err(), "{path:?}");
+        }
+    }
+
     #[tokio::test]
     async fn browser_clones_do_not_consume_the_single_broker_attachment() {
         let brokers = TerminalBrokers::default();
