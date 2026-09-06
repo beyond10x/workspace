@@ -106,6 +106,8 @@ const MAX_CONTEXT_SELECTION_BYTES: usize = 32 * 1024;
 const MAX_CONTEXT_TOTAL_BYTES: usize = 64 * 1024;
 const MAX_CONTEXT_OPEN_FILES: usize = 64;
 const MAX_AGENTIDE_SERVICE_ROWS: usize = 10_000;
+const AGENTIDE_SERVICE_PAGE_SIZE: usize = 1_000;
+const MAX_AGENTIDE_SERVICE_PAGES: usize = 10;
 const CODING_AGENT_INTENTS: [&str; 5] = [
     "code_read",
     "code_changes",
@@ -539,8 +541,10 @@ async fn agentide_service_rows(
 ) -> Result<Vec<Value>, Response> {
     let mut rows = Vec::new();
     let mut cursor: Option<String> = None;
-    loop {
-        let mut page = serde_json::json!({"limit": 1000});
+    let mut seen_cursors = BTreeSet::new();
+    let mut through_version = None;
+    for _ in 0..MAX_AGENTIDE_SERVICE_PAGES {
+        let mut page = serde_json::json!({"limit": AGENTIDE_SERVICE_PAGE_SIZE});
         if let Some(current) = &cursor {
             page.as_object_mut()
                 .expect("static page object")
@@ -559,39 +563,98 @@ async fn agentide_service_rows(
                 "coding_context_authority_unavailable",
             )
         })?;
-        if let Some(items) = output.as_array() {
-            rows.extend(items.iter().cloned());
-            break;
-        }
-        let object = output
-            .as_object()
-            .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "coding_context_authority_invalid"))?;
-        if object.get("partial").and_then(Value::as_bool) != Some(false) {
-            return Err(problem(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "coding_context_authority_partial",
-            ));
-        }
-        let items = object
-            .get("items")
-            .and_then(Value::as_array)
-            .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "coding_context_authority_invalid"))?;
-        rows.extend(items.iter().cloned());
-        if rows.len() > MAX_AGENTIDE_SERVICE_ROWS {
+        let page = agentide_service_page(&output, cursor.is_some())?;
+        if rows.len() + page.items.len() > MAX_AGENTIDE_SERVICE_ROWS {
             return Err(problem(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "coding_context_authority_limit_exceeded",
             ));
         }
-        cursor = object
-            .get("next_cursor")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if cursor.is_none() {
-            break;
+        if let Some(version) = page.through_version {
+            if through_version.is_some_and(|previous| previous != version) {
+                return Err(problem(
+                    StatusCode::CONFLICT,
+                    "coding_context_authority_changed",
+                ));
+            }
+            through_version = Some(version);
         }
+        rows.extend_from_slice(page.items);
+        let Some(next_cursor) = page.next_cursor else {
+            return Ok(rows);
+        };
+        if !seen_cursors.insert(next_cursor.to_owned()) {
+            return Err(problem(
+                StatusCode::BAD_GATEWAY,
+                "coding_context_authority_invalid",
+            ));
+        }
+        cursor = Some(next_cursor.to_owned());
     }
-    Ok(rows)
+    Err(problem(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "coding_context_authority_limit_exceeded",
+    ))
+}
+
+struct AgentIdeServicePage<'a> {
+    items: &'a [Value],
+    next_cursor: Option<&'a str>,
+    through_version: Option<u64>,
+}
+
+fn agentide_service_page(
+    output: &Value,
+    continuing: bool,
+) -> Result<AgentIdeServicePage<'_>, Response> {
+    let invalid = || problem(StatusCode::BAD_GATEWAY, "coding_context_authority_invalid");
+    if let Some(items) = output.as_array() {
+        if continuing {
+            return Err(invalid());
+        }
+        return Ok(AgentIdeServicePage {
+            items,
+            next_cursor: None,
+            through_version: None,
+        });
+    }
+    let object = output.as_object().ok_or_else(invalid)?;
+    let items = object
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(invalid)?;
+    if items.len() > AGENTIDE_SERVICE_PAGE_SIZE {
+        return Err(problem(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "coding_context_authority_limit_exceeded",
+        ));
+    }
+    let partial = object
+        .get("partial")
+        .and_then(Value::as_bool)
+        .ok_or_else(invalid)?;
+    let next_cursor = match object.get("next_cursor") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(cursor)) if !cursor.is_empty() => Some(cursor.as_str()),
+        _ => return Err(invalid()),
+    };
+    if partial != next_cursor.is_some() {
+        return Err(invalid());
+    }
+    // These queries select one session aggregate. Empty filtered pages carry no version;
+    // visible rows must carry the exact authorized aggregate version from the service SDK.
+    let through_version = match object.get("through_version") {
+        None | Some(Value::Null) => None,
+        Some(version) => Some(version.as_u64().ok_or_else(invalid)?),
+    };
+    if !items.is_empty() && through_version.is_none() {
+        return Err(invalid());
+    }
+    Ok(AgentIdeServicePage {
+        items,
+        next_cursor,
+        through_version,
+    })
 }
 
 fn agentide_session_row(
@@ -3152,24 +3215,13 @@ async fn verify_terminal_grant(
     coding_session: &CodingSession,
     input: &CreateTerminal,
 ) -> Result<(), Response> {
-    let session_output = invoke_unique_operation(
+    let session_rows = agentide_service_rows(
         state,
         authority,
         "agentide.get_session",
-        serde_json::json!({
-            "session_id": input.agentide_session_id,
-            "$page": {"limit": 2}
-        }),
+        &input.agentide_session_id,
     )
-    .await
-    .map_err(|_| {
-        problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "terminal_authority_unavailable",
-        )
-    })?;
-    let session_rows = service_rows(&session_output)
-        .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "terminal_authority_invalid"))?;
+    .await?;
     let session_matches = session_rows.iter().any(|row| {
         terminal_session_row_matches(row, authority, coding_session, &input.agentide_session_id)
     });
@@ -3179,24 +3231,13 @@ async fn verify_terminal_grant(
             "terminal_session_binding_refused",
         ));
     }
-    let grants_output = invoke_unique_operation(
+    let grant_rows = agentide_service_rows(
         state,
         authority,
         "agentide.list_grants",
-        serde_json::json!({
-            "session_id": input.agentide_session_id,
-            "$page": {"limit": 1000}
-        }),
+        &input.agentide_session_id,
     )
-    .await
-    .map_err(|_| {
-        problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "terminal_authority_unavailable",
-        )
-    })?;
-    let grant_rows = service_rows(&grants_output)
-        .ok_or_else(|| problem(StatusCode::BAD_GATEWAY, "terminal_authority_invalid"))?;
+    .await?;
     let now = Utc::now();
     let granted = grant_rows.iter().any(|row| {
         terminal_grant_row_matches(
@@ -3268,14 +3309,6 @@ fn terminal_grant_row_matches(
             }
             Some(_) => false,
         }
-}
-
-fn service_rows(output: &Value) -> Option<Vec<&Value>> {
-    output
-        .as_array()
-        .or_else(|| output.get("items").and_then(Value::as_array))
-        .or_else(|| output.get("rows").and_then(Value::as_array))
-        .map(|rows| rows.iter().collect())
 }
 
 async fn invoke_unique_operation(
