@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.24 - 2026-09-06
+
+- Project the admitted terminal launch root as a workspace-relative directory in AgentIDE
+  context, preserving running and finished terminal records. Refuse unsupported stored
+  directories while retaining the absolute shell launch configuration and terminal authority.
+
 ## 0.2.23 - 2026-09-06
 
 - Follow bounded authority-query continuations for terminal sessions, grants, and coding context,

@@ -67,6 +67,8 @@ mod aep;
 #[cfg(test)]
 mod repository_search_tests;
 mod store;
+#[cfg(test)]
+mod terminal_context_tests;
 
 use aep::{AepTransport, RequestCredential};
 use store::{
@@ -1060,7 +1062,7 @@ fn agentide_terminals(
     terminals: Vec<StoredTerminal>,
     agentide_session_id: &str,
     recent_activity: &mut Vec<ContextRecord>,
-) -> Vec<AgentIdeTerminalSession> {
+) -> Result<Vec<AgentIdeTerminalSession>, Response> {
     let mut projected = Vec::new();
     for terminal in terminals {
         let terminal = terminal.public;
@@ -1087,6 +1089,12 @@ fn agentide_terminals(
             recent_activity.push(context_activity("terminal_actor_invalid", &terminal.id));
             continue;
         };
+        if terminal.profile.working_directory != "/workspace" {
+            return Err(problem(
+                StatusCode::BAD_GATEWAY,
+                "coding_terminal_directory_invalid",
+            ));
+        }
         projected.push(AgentIdeTerminalSession {
             format: "agentide.terminal-session/2".into(),
             id: terminal.id,
@@ -1094,14 +1102,15 @@ fn agentide_terminals(
             profile: terminal.profile.id,
             actor,
             process_id,
-            working_directory: terminal.profile.working_directory,
+            // The admitted absolute launch root is the empty workspace-relative AgentIDE root.
+            working_directory: String::new(),
             network: "none".into(),
             state,
             output_sequence: 0,
             exit_code: terminal.exit.and_then(|exit| exit.code),
         });
     }
-    projected
+    Ok(projected)
 }
 
 fn pending_approvals(
@@ -1282,11 +1291,14 @@ async fn coding_actor_view(
     )
     .await;
     let terminals = match state.store.terminals(&authority, &session.id).await {
-        Ok(terminals) => {
-            agentide_terminals(terminals, &input.agentide_session_id, &mut recent_activity)
-        }
+        Ok(terminals) => terminals,
         Err(error) => return store_problem(&error),
     };
+    let terminals =
+        match agentide_terminals(terminals, &input.agentide_session_id, &mut recent_activity) {
+            Ok(terminals) => terminals,
+            Err(response) => return response,
+        };
     let approval_rows = match agentide_service_rows(
         &state,
         &authority,
@@ -1726,12 +1738,16 @@ async fn invoke_coding_intent(
                 Err(error) => return store_problem(&error),
             };
             let mut recent_activity = Vec::new();
+            let terminals = match agentide_terminals(
+                terminals,
+                &input.agentide_session_id,
+                &mut recent_activity,
+            ) {
+                Ok(terminals) => terminals,
+                Err(response) => return response,
+            };
             serde_json::json!({
-                "terminals": agentide_terminals(
-                    terminals,
-                    &input.agentide_session_id,
-                    &mut recent_activity,
-                ),
+                "terminals": terminals,
                 "recent_activity": recent_activity
             })
         }
