@@ -12,6 +12,9 @@ use tower::ServiceExt as _;
 
 use super::{AppState, Store, router};
 
+#[path = "authority_query_tests.rs"]
+mod authority_queries;
+
 fn confidential(mut response: Response) -> Response {
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -84,6 +87,16 @@ impl Fixture {
     }
 
     async fn scripted(operation_ref: &'static str, replies: Vec<Reply>) -> Self {
+        Self::scripted_operations(
+            replies
+                .into_iter()
+                .map(|reply| (operation_ref, reply))
+                .collect(),
+        )
+        .await
+    }
+
+    async fn scripted_operations(replies: Vec<(&'static str, Reply)>) -> Self {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let observed = requests.clone();
         let replies = Arc::new(Mutex::new(VecDeque::from(replies)));
@@ -108,6 +121,11 @@ impl Fixture {
                                 .lock()
                                 .expect("request log")
                                 .push(request.request.clone());
+                            let (operation_ref, reply) = replies
+                                .lock()
+                                .expect("reply queue")
+                                .pop_front()
+                                .expect("no unexpected extra Connector calls");
                             match request.request {
                                 OperationRequest::Describe(params) => {
                                     assert_eq!(params.operation_ref, operation_ref);
@@ -117,12 +135,7 @@ impl Fixture {
                                 }
                                 other => panic!("unexpected operation request: {other:?}"),
                             }
-                            replies
-                                .lock()
-                                .expect("reply queue")
-                                .pop_front()
-                                .expect("no unexpected extra Connector calls")
-                                .respond(&request.request_id)
+                            reply.respond(&request.request_id)
                         }
                     },
                 ),

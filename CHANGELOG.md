@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.23 - 2026-09-06
+
+- Follow bounded authority-query continuations for terminal sessions, grants, and coding context,
+  including empty filtered pages. Refuse malformed, cyclic, incomplete, or changing-version
+  results while preserving current session binding and explicit interactive-terminal grants.
+
 ## 0.2.22 - 2026-09-06
 
 - List the workspace root through the released bounded tree observation, with pages bound to
