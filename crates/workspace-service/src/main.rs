@@ -3412,6 +3412,23 @@ async fn provision_git_materialization(
     mut session: CodingSession,
     source: CodingSessionSource,
 ) -> Result<CodingSession, (CodingSession, &'static str, bool)> {
+    // The request can retain Preparing while awaiting provider access, then acquire the worker
+    // guard after the previous worker has already published Ready. Its old snapshot is not
+    // authority to replay provisioning or clean up the now-published materialization.
+    session = state
+        .store
+        .coding_session(&authority, &session.id)
+        .await
+        .map_err(|_| {
+            (
+                session.clone(),
+                "workspace_materialization_record_unavailable",
+                true,
+            )
+        })?;
+    if session.state != CodingSessionState::Preparing {
+        return Ok(session);
+    }
     let session_label = session.id.clone();
     let revision_label = session.source_revision.clone();
     let labels = [
@@ -6210,10 +6227,15 @@ mod tests {
             workflow_observers: WorkflowObservers::default(),
             store: store.clone(),
         };
-        let ready =
-            provision_git_materialization(state, authority.clone(), substrate, session, source)
-                .await
-                .expect("materialization");
+        let ready = provision_git_materialization(
+            state.clone(),
+            authority.clone(),
+            substrate.clone(),
+            session.clone(),
+            source.clone(),
+        )
+        .await
+        .expect("materialization");
         assert_eq!(ready.state, CodingSessionState::Ready);
         assert_eq!(
             ready.materialization_ref.as_deref(),
@@ -6226,6 +6248,48 @@ mod tests {
 
         substrate_server.await.expect("Substrate server");
         connector_server.abort();
+        connector_server.await.expect_err("fixture server stopped");
+
+        // A GET can retain this preparing snapshot while provider access awaits and the first
+        // worker publishes ready. Once its guard is released, delayed recovery must reload the
+        // durable state before contacting either now-stopped server or authorizing any cleanup.
+        let replayed = provision_git_materialization(
+            state.clone(),
+            authority.clone(),
+            substrate.clone(),
+            session.clone(),
+            source.clone(),
+        )
+        .await
+        .expect("delayed preparing read must preserve the ready materialization");
+        assert_eq!(replayed, ready);
+        assert_eq!(
+            store.coding_session(&authority, &session.id).await.unwrap(),
+            ready
+        );
+
+        let closing = store
+            .begin_close_coding_session(&authority, &session.id)
+            .await
+            .unwrap();
+        let replayed = provision_git_materialization(
+            state.clone(),
+            authority.clone(),
+            substrate.clone(),
+            session.clone(),
+            source.clone(),
+        )
+        .await
+        .expect("delayed recovery must leave closing to its owner");
+        assert_eq!(replayed, closing);
+        let closed = store
+            .complete_close_coding_session(&authority, &session.id)
+            .await
+            .unwrap();
+        let replayed = provision_git_materialization(state, authority, substrate, session, source)
+            .await
+            .expect("delayed recovery must not reopen a closed session");
+        assert_eq!(replayed, closed);
         std::fs::remove_file(&socket).expect("remove exact test socket");
     }
 

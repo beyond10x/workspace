@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.21 - 2026-09-06
+
+- Recheck durable coding-session state before resuming provisioning, preserving a ready checkout
+  when a delayed preparing-session read resumes after publication. Cleanup and closed sessions
+  remain owned by their existing lifecycle.
+
 ## 0.2.19 - 2026-09-05
 
 - Share bounded Substrate HTTPS connections and initialized TLS configuration across coding-session
