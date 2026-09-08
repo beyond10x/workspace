@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Move project chat and workflow orchestration to the product while preserving Workspace-owned
+  conversations, task links and recoverable checkpoints. Persist message completion once.
+- Authenticate downward executor and coordinator calls with separate, short-lived request proofs,
+  durable replay consumption, current Identity/grants and terminal attempt registrations.
+
 ## 0.2.24 - 2026-09-06
 
 - Project the admitted terminal launch root as a workspace-relative directory in AgentIDE

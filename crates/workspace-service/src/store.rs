@@ -15,6 +15,9 @@ use workspace_core::{
 
 use crate::Authority;
 
+mod execution;
+mod project_tasks;
+
 const MAX_ACTIVE_TERMINALS_PER_SESSION: i64 = 8;
 
 const SCHEMA: &[&str] = &[
@@ -85,12 +88,7 @@ pub struct StoredTerminal {
     pub initial_rows: u16,
 }
 
-/// Durable Agent Platform task reference for one non-terminal workflow run.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecoverableWorkflowTask {
-    pub run_id: String,
-    pub task_id: String,
-}
+pub use workspace_core::WorkflowTaskLink as RecoverableWorkflowTask;
 
 /// Tenant-scoped durable Workspace state.
 #[derive(Clone)]
@@ -129,7 +127,11 @@ impl Store {
     async fn ensure_schema(&self) -> Result<(), StoreError> {
         self.initialized
             .get_or_try_init(|| async {
-                for statement in SCHEMA {
+                for statement in SCHEMA
+                    .iter()
+                    .chain(execution::SCHEMA)
+                    .chain(project_tasks::SCHEMA)
+                {
                     sqlx::query(statement)
                         .execute(&self.pool)
                         .await
@@ -1066,17 +1068,21 @@ impl Store {
         if user_message != 1 {
             return Err(StoreError::NotFound);
         }
-        sqlx::query("INSERT INTO workspace_message_tasks (thread_id, message_sequence, tenant_id, actor_subject, task_id, created_at_ms) VALUES (?, ?, ?, ?, ?, ?)")
-            .bind(thread_id)
-            .bind(message_sequence)
-            .bind(&authority.tenant_id)
-            .bind(&authority.subject)
-            .bind(task_id)
-            .bind(as_i64(now_ms()?)?)
-            .execute(&self.pool)
-            .await
-            .map_err(StoreError::Database)?;
-        Ok(())
+        let mut tx = self.pool.begin().await.map_err(StoreError::Database)?;
+        let inserted = sqlx::query("INSERT INTO workspace_message_tasks (thread_id, message_sequence, tenant_id, actor_subject, task_id, created_at_ms) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (thread_id, message_sequence) DO NOTHING")
+            .bind(thread_id).bind(message_sequence).bind(&authority.tenant_id).bind(&authority.subject)
+            .bind(task_id).bind(as_i64(now_ms()?)?).execute(&mut *tx).await.map_err(StoreError::Database)?;
+        let recorded: String = sqlx::query_scalar("SELECT task_id FROM workspace_message_tasks WHERE tenant_id = ? AND actor_subject = ? AND thread_id = ? AND message_sequence = ?")
+            .bind(&authority.tenant_id).bind(&authority.subject).bind(thread_id).bind(message_sequence)
+            .fetch_one(&mut *tx).await.map_err(StoreError::Database)?;
+        if recorded != task_id {
+            return Err(StoreError::Conflict);
+        }
+        if inserted.rows_affected() == 1 {
+            sqlx::query("INSERT INTO workspace_message_observations (thread_id, user_sequence) VALUES (?, ?)")
+                .bind(thread_id).bind(message_sequence).execute(&mut *tx).await.map_err(StoreError::Database)?;
+        }
+        tx.commit().await.map_err(StoreError::Database)
     }
 
     /// Resolve an owned user turn to its exact Agent Platform task without exposing other threads.
@@ -1753,7 +1759,6 @@ mod tests {
             tenant_id: "tenant-one".to_owned(),
             subject: subject.to_owned(),
             connector_bearer: "not-retained".to_owned().into(),
-            agent_platform_bearer: None,
             session_authorization: "Bearer synthetic-session".to_owned().into(),
             context: OwnerContext {
                 tenant_id: "tenant-one".to_owned(),
@@ -2383,6 +2388,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Actual SQL fixture covers owner binding and single-assignment result recovery.
     async fn message_task_stream_association_is_exact_and_owner_scoped() {
         let store = store().await;
         let owner = authority("person:owner");
@@ -2432,6 +2438,90 @@ mod tests {
                 .await,
             Err(StoreError::NotFound)
         ));
+        assert!(
+            store
+                .message_needs_completion(&owner, &thread.id, message.sequence)
+                .await
+                .unwrap()
+        );
+        assert!(
+            matches!(
+                store
+                    .record_message_task(&owner, &thread.id, message.sequence, "task-two")
+                    .await,
+                Err(StoreError::Conflict)
+            ),
+            "a user turn cannot be reassigned to a replacement task"
+        );
+        assert!(
+            matches!(
+                store
+                    .complete_message_task(
+                        &other,
+                        &thread.id,
+                        message.sequence,
+                        "task-one",
+                        MessageRole::Assistant,
+                        "result"
+                    )
+                    .await,
+                Err(StoreError::NotFound)
+            ),
+            "another principal cannot append a result to the personal conversation"
+        );
+        let result = store
+            .complete_message_task(
+                &owner,
+                &thread.id,
+                message.sequence,
+                "task-one",
+                MessageRole::Assistant,
+                "result",
+            )
+            .await
+            .unwrap();
+        let retry = store
+            .complete_message_task(
+                &owner,
+                &thread.id,
+                message.sequence,
+                "task-one",
+                MessageRole::Assistant,
+                "result",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result, retry,
+            "a retried terminal observation returns the same stored result"
+        );
+        assert_eq!(
+            store.messages(&owner, &thread.id).await.unwrap().len(),
+            2,
+            "result retries must not append duplicate conversation messages"
+        );
+        assert!(
+            !store
+                .message_needs_completion(&owner, &thread.id, message.sequence)
+                .await
+                .unwrap()
+        );
+        assert!(
+            matches!(
+                store
+                    .complete_message_task(
+                        &owner,
+                        &thread.id,
+                        message.sequence,
+                        "task-one",
+                        MessageRole::Assistant,
+                        "changed result"
+                    )
+                    .await,
+                Err(StoreError::Conflict)
+            ),
+            "terminal result attribution cannot be rewritten"
+        );
     }
 
     #[tokio::test]

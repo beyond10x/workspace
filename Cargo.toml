@@ -19,8 +19,6 @@ workspace-core = { path = "crates/workspace-core" }
 workspace-client = { path = "crates/workspace-client" }
 identity-client = { git = "https://github.com/beyond10x/identity.git", tag = "0.5.6" }
 connectors-client = { git = "https://github.com/beyond10x/connectors.git", rev = "dbdd285c629d8b93bb685cc5a89a270316978ce5", version = "=0.6.4" }
-agent-platform-client = { git = "https://github.com/beyond10x/agent-platform.git", tag = "0.6.7" }
-agent-platform-core = { git = "https://github.com/beyond10x/agent-platform.git", tag = "0.6.7" }
 agentide-contracts = { git = "https://github.com/beyond10x/agentide.git", rev = "081761e35d2b28f793500045e9d12cab70cb81f7", version = "=0.3.4" }
 aep-client = { git = "https://github.com/beyond10x/aep", tag = "0.51.0" }
 aep-contract = { git = "https://github.com/beyond10x/aep", tag = "0.51.0" }
@@ -34,6 +32,8 @@ chrono = "0.4"
 clap = { version = "4.6", features = ["derive", "env"] }
 futures-util = "0.3"
 hex = "0.4"
+# Ed25519 JWT request proofs authenticate downward service calls without callback dependencies.
+jsonwebtoken = "9.3"
 getrandom = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }

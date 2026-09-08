@@ -9,10 +9,9 @@ publish.workspace = true
 
 [dependencies]
 workspace-core.workspace = true
+workspace-client.workspace = true
 identity-client.workspace = true
 connectors-client.workspace = true
-agent-platform-client.workspace = true
-agent-platform-core.workspace = true
 agentide-contracts.workspace = true
 aep-client.workspace = true
 aep-contract.workspace = true
@@ -38,6 +37,7 @@ url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+ring = "0.17"
 tower = { version = "0.5", features = ["util"] }
 
 [lints]

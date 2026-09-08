@@ -1,0 +1,5 @@
+format: ess/1
+system: workspace
+version: v1
+domains:
+  - workspace.authority

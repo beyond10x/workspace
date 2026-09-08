@@ -605,11 +605,152 @@ pub struct FileConflict {
     pub latest: FileProjection,
 }
 
+/// A bounded file from Workspace's exact repository context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectContextFile {
+    pub path: String,
+    pub content: String,
+    pub truncated: bool,
+}
+
+/// Read-only repository context resolved by the project-context provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectContext {
+    pub project_id: String,
+    pub provider: String,
+    pub provider_project_ref: String,
+    pub path_with_namespace: String,
+    pub branch: String,
+    pub commit: String,
+    #[serde(default)]
+    pub files: Vec<ProjectContextFile>,
+}
+
+/// Existing workflow checkpoints remain in Workspace across coordinator upgrades.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowTaskLink {
+    pub run_id: String,
+    pub task_id: String,
+}
+
+/// Typed bookkeeping for a separately authenticated project coordinator.
+/// No variant admits a tenant, subject or bearer credential from the body.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProjectTaskRequest {
+    Context {
+        project_id: String,
+    },
+    Thread {
+        thread_id: String,
+    },
+    ProjectAgent {
+        project_id: String,
+    },
+    RecordProjectAgent {
+        project_id: String,
+        agent_id: String,
+    },
+    MessageTask {
+        thread_id: String,
+        sequence: u64,
+    },
+    RecordMessageTask {
+        thread_id: String,
+        sequence: u64,
+        task_id: String,
+    },
+    CompleteMessageTask {
+        thread_id: String,
+        sequence: u64,
+        task_id: String,
+        role: MessageRole,
+        content: String,
+    },
+    AppendMessage {
+        thread_id: String,
+        role: MessageRole,
+        content: String,
+    },
+    WorkflowTask {
+        run_id: String,
+    },
+    RecordWorkflowTask {
+        run_id: String,
+        task_id: String,
+    },
+    RecoverableWorkflowTasks {
+        project_id: String,
+    },
+    UpdateWorkflow {
+        run_id: String,
+        state: WorkflowRunState,
+        failure_code: Option<String>,
+        output: Option<String>,
+    },
+}
+
+/// Closed replies to the project bookkeeping surface.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProjectTaskReply {
+    Context {
+        project: Box<Project>,
+        context: ProjectContext,
+    },
+    Thread {
+        thread: Thread,
+    },
+    Agent {
+        agent_id: Option<String>,
+    },
+    Task {
+        task_id: Option<String>,
+    },
+    MessageTask {
+        task_id: String,
+        needs_completion: bool,
+    },
+    Message {
+        message: Message,
+    },
+    WorkflowTasks {
+        tasks: Vec<WorkflowTaskLink>,
+    },
+    Updated {
+        changed: bool,
+    },
+}
+
+/// Immutable coding coordinates admitted by the authenticated task executor.
+/// User identity is supplied separately by Identity and never accepted from this body.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionAttempt {
+    pub task_id: String,
+    pub attempt_id: String,
+    pub agent_id: String,
+    pub delegation_id: Option<String>,
+    pub workspace_session_id: String,
+    pub agentide_session_id: String,
+    pub input: serde_json::Value,
+}
+
+/// Result of an idempotent downward attempt lifecycle operation.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionAttemptState {
+    pub attempt_id: String,
+    pub active: bool,
+}
+
 /// Coordinates used by Agent Platform to request the current server-derived agent view.
 ///
-/// The request contains no actor identity. Workspace resolves the durable task through Agent
-/// Platform under the current human session and derives the agent, attempt and delegation from
-/// that task.
+/// The request contains no actor identity. Workspace requires a fresh executor proof, an open
+/// downward attempt registration and current Identity/AgentIDE authority. It never calls its consumer.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CodingActorViewRequest {

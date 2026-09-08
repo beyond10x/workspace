@@ -132,6 +132,32 @@ sample review data; only the terminal transport is real. The production Workspac
 enables this path and still requires authenticated session binding and an exact
 `interactive_terminal` grant.
 
+## Downward task authority
+
+Project chat and review workflows are orchestrated by Devcenter. Workspace stores the existing
+projects, personal threads, project-agent references, message-task links and workflow checkpoints;
+none of these rows move into Devcenter. The authenticated coordinator uses `POST /v1/project-tasks`
+for context and bookkeeping, and the workflow admission route for idempotent run creation. Task
+event streaming and workflow definitions are product routes. New message-task associations carry
+a durable completion marker and a single-assignment result link; old completed conversations are
+preserved without inventing task-to-message attribution.
+
+Configure `WORKSPACE_EXECUTOR_PUBLIC_KEY_FILE` and `WORKSPACE_COORDINATOR_PUBLIC_KEY_FILE` with the
+separate Ed25519 public keys of the execution host and product coordinator. Identity authenticates
+the current user on every call. A host request proof additionally binds that session, HTTP method,
+path and exact JSON bytes for ten seconds. Workspace durably consumes its nonce before admission.
+Executor calls require an immutable, owned task/attempt/session registration and current AgentIDE
+grants; a close is terminal, including when it arrives before a delayed open. Workspace makes no
+task-authority callback. Host private keys and user credentials never enter these database records.
+
+Upgrade the composed hosts together with these public keys and their corresponding private-key
+mounts. The former Workspace task submission and event proxy routes have moved to the product;
+there is no permissive fallback for an unconfigured host proof. Existing in-flight workflow links
+resume under a fresh product session. After an executor crash, previously issued proofs expire
+within ten seconds; a live executor confirms closure, or drains that bound, before reporting its
+attempt terminal. Domain effects already admitted before closure retain their normal execution
+and operation-idempotency semantics.
+
 ## First contract
 
 - discover all GitLab projects visible through the subject's current Connections;
@@ -145,12 +171,12 @@ enables this path and still requires authenticated session binding and an exact
   file contracts, and resolve its diff only against the immutable base materialization;
 - open, reconnect to, detach from, and explicitly terminate profile-bound Substrate PTYs only under
   a current human `interactive_terminal` grant;
-- provision one project agent and dispatch typed conversation turns containing the prior personal
-  thread and a bounded exact-commit context pack;
+- expose bounded exact-commit context and durable, owner-scoped task links to the authenticated
+  product coordinator;
 - query the official central AEP authority for entities whose indexed `space` is the canonical
   Workspace project, forwarding only the transient Identity session for fresh verification;
-- admit the code review, security review, and reverse AEP + ESS workflow identities against an
-  exact branch and commit.
+- retain exact-commit workflow admissions and monotonic results; the product owns workflow
+  definitions, task submission and result observation.
 
 Source bytes and execution remain delegated to Substrate, while Connector tree/file operations are
 the governed forge bridge. Workspace composes those existing authorities without asking Substrate

@@ -1,0 +1,48 @@
+domain: workspace.authority
+
+# Credential-free records. Identity supplies tenant and subject; the verified executor
+# supplies immutable task coordinates. A recorded state is not a general state-write API.
+entities:
+  - name: workspace.authority.ExecutionAttempt
+    identity:
+      name: attempt_id
+      type: String
+    fields:
+      - name: tenant_id
+        type: String
+      - name: subject
+        type: String
+      - name: task_id
+        type: String
+      - name: agent_id
+        type: String
+      - name: workspace_session_id
+        type: String
+      - name: agentide_session_id
+        type: String
+      - name: context_json
+        type: String
+      - name: state
+        type: String
+    lifecycle:
+      initial: Recorded
+      states: [Recorded]
+      terminal: [Recorded]
+
+  - name: workspace.authority.RequestReceipt
+    identity:
+      name: nonce
+      type: String
+    fields:
+      - name: issuer
+        type: String
+      - name: request_digest
+        type: String
+      - name: session_digest
+        type: String
+      - name: expires_at
+        type: Integer
+    lifecycle:
+      initial: Recorded
+      states: [Recorded]
+      terminal: [Recorded]

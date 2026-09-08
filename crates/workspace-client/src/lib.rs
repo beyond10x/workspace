@@ -2,6 +2,9 @@
 
 //! Bounded official HTTP client for Workspace's user-facing contract.
 
+pub mod attestation;
+
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::{Method, StatusCode};
@@ -12,7 +15,7 @@ use workspace_core::{
     CodingTreeProjection, CreateCodingSession, CreateMessage, CreateTerminal, CreateThread,
     DiffProjection, EngineeringArtifactPage, FileConflict, FileProjection, Message, OpenProject,
     Project, RepositoryCandidate, RepositoryEntry, ResolveDiff, SelectBranch, StartWorkflow,
-    TerminalProfile, TerminalSession, Thread, WorkflowDefinition, WorkflowRun, WriteFile,
+    TerminalProfile, TerminalSession, Thread, WorkflowRun, WriteFile,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -39,6 +42,7 @@ pub enum ClientError {
 pub struct WorkspaceClient {
     base: Url,
     http: reqwest::Client,
+    signer: Option<Arc<attestation::RequestSigner>>,
 }
 
 impl WorkspaceClient {
@@ -62,7 +66,18 @@ impl WorkspaceClient {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| ClientError::Configuration)?;
-        Ok(Self { base, http })
+        Ok(Self {
+            base,
+            http,
+            signer: None,
+        })
+    }
+
+    /// Attach the trusted host's request signer. The key stays outside request bodies and models.
+    #[must_use]
+    pub fn with_request_signer(mut self, signer: attestation::RequestSigner) -> Self {
+        self.signer = Some(Arc::new(signer));
+        self
     }
 
     /// List repositories visible under current authority.
@@ -204,6 +219,57 @@ impl WorkspaceClient {
             &format!("v1/sessions/{session_id}"),
             authorization,
             Option::<&()>::None,
+        )
+        .await
+    }
+
+    /// Use the separately authenticated coordinator bookkeeping surface.
+    pub async fn project_task(
+        &self,
+        authorization: &str,
+        request: &workspace_core::ProjectTaskRequest,
+    ) -> Result<workspace_core::ProjectTaskReply, ClientError> {
+        self.exchange(
+            Method::POST,
+            "v1/project-tasks",
+            authorization,
+            Some(request),
+        )
+        .await
+    }
+
+    /// Register immutable attempt context before making any executor request.
+    pub async fn open_execution_attempt(
+        &self,
+        authorization: &str,
+        input: &workspace_core::ExecutionAttempt,
+    ) -> Result<workspace_core::ExecutionAttemptState, ClientError> {
+        self.exchange(
+            Method::POST,
+            &format!(
+                "v1/sessions/{}/execution-attempts",
+                input.workspace_session_id
+            ),
+            authorization,
+            Some(input),
+        )
+        .await
+    }
+
+    /// Close the attempt permanently, including when a close races its first registration.
+    pub async fn close_execution_attempt(
+        &self,
+        authorization: &str,
+        input: &workspace_core::ExecutionAttempt,
+    ) -> Result<workspace_core::ExecutionAttemptState, ClientError> {
+        self.exchange(
+            Method::POST,
+            &format!(
+                "v1/sessions/{}/execution-attempts/close",
+                input.workspace_session_id
+            ),
+            authorization,
+            Some(input),
         )
         .await
     }
@@ -551,47 +617,6 @@ impl WorkspaceClient {
         .await
     }
 
-    /// Stream ordered Agent Platform events for one owned user turn without buffering them.
-    pub async fn message_events(
-        &self,
-        authorization: &str,
-        thread_id: &str,
-        message_sequence: u64,
-    ) -> Result<reqwest::Response, ClientError> {
-        let endpoint = self
-            .base
-            .join(&format!(
-                "v1/threads/{thread_id}/messages/{message_sequence}/events"
-            ))
-            .map_err(|_| ClientError::Configuration)?;
-        let response = self
-            .http
-            .get(endpoint)
-            .header("authorization", authorization)
-            .send()
-            .await
-            .map_err(|_| ClientError::Transport)?;
-        if !response.status().is_success() {
-            return Err(ClientError::Refused(response.status().as_u16()));
-        }
-        Ok(response)
-    }
-
-    /// List the pre-built workflow definitions.
-    pub async fn workflows(
-        &self,
-        authorization: &str,
-        project_id: &str,
-    ) -> Result<Vec<WorkflowDefinition>, ClientError> {
-        self.exchange(
-            Method::GET,
-            &format!("v1/projects/{project_id}/workflows"),
-            authorization,
-            Option::<&()>::None,
-        )
-        .await
-    }
-
     /// Start one exact-commit workflow run.
     pub async fn start_workflow(
         &self,
@@ -649,12 +674,34 @@ impl WorkspaceClient {
             .base
             .join(path)
             .map_err(|_| ClientError::Configuration)?;
+        let bytes = body
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|_| ClientError::Transport)?;
+        let proof = self
+            .signer
+            .as_ref()
+            .map(|signer| {
+                signer.sign(
+                    authorization,
+                    method.as_str(),
+                    endpoint.path(),
+                    bytes.as_deref().unwrap_or_default(),
+                )
+            })
+            .transpose()
+            .map_err(|_| ClientError::Configuration)?;
         let mut request = self
             .http
             .request(method, endpoint)
             .header("authorization", authorization);
-        if let Some(body) = body {
-            request = request.json(body);
+        if let Some(proof) = proof {
+            request = request.header(attestation::PROOF_HEADER, proof.as_str());
+        }
+        if let Some(bytes) = bytes {
+            request = request
+                .header("content-type", "application/json")
+                .body(bytes);
         }
         let response = request
             .timeout(REQUEST_TIMEOUT)

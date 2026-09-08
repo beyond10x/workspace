@@ -158,15 +158,14 @@ impl Fixture {
                 "{origin}/api/connectors/v1"
             ))
             .expect("Connector client"),
-            agent_platform: None,
-            project_agent_model: None,
+            execution_verifier: None,
+            coordination_verifier: None,
             aep: None,
             substrate: None,
             terminal_profiles: super::TerminalProfiles::load(None).expect("terminal profiles"),
             terminal_brokers: super::TerminalBrokers::default(),
             terminal_replay: super::TerminalReplayHub::default(),
             materialization_workers: super::MaterializationWorkers::default(),
-            workflow_observers: super::WorkflowObservers::default(),
             store,
         };
         let app = router(state.clone());
