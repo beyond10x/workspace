@@ -53,13 +53,19 @@ Identity access credential for audience `urn:b10x:substrate` on each SDK request
 browsing, or changing a project snapshot then also proves that authenticated Substrate seam.
 
 Coding sessions extend the existing `/v1/projects` authority instead of introducing another file
-store. Workspace recursively reads the project's exact pinned GitLab commit through Connectors,
-then creates two confined Substrate workspaces: an immutable-by-policy base used as the comparison
-and publication authority, and a writable working materialization used by editors and processes.
-Workspace persists only opaque Substrate references and the complete source-manifest digest; file
-bytes remain in Substrate and forge credentials remain in Connectors. A session becomes `ready`
-only after both complete materializations exist. Refusal cleans up both, while an uncertain cleanup
-is explicit as `unknown` and never exposes partial references.
+store. Workspace obtains a depth-bounded Git fetch grant for the project's exact pinned GitLab
+commit through Connectors, then creates exactly one confined Substrate workspace from that grant:
+a writable Git materialization labelled `materialization.role = git-workspace`, carrying the
+session id and the pinned revision as its two other labels, and bounded by the session's total
+byte and inode limits. That single materialization is both the working tree used by editors and
+processes and the comparison authority: diffs and base file reads resolve against its own Git
+checkout at the pinned commit, and a checkout observed at any other commit is refused instead of
+compared. Workspace persists only the opaque Substrate reference and the complete source-manifest
+digest; file bytes remain in Substrate and forge credentials remain in Connectors. A session
+becomes `ready` only once that one materialization exists, its labels have been verified on the
+created workspace, its reference is recorded, and the manifest digest is stored. Refusal destroys
+the materialization it created, while an uncertain cleanup is explicit as `unknown` and never
+exposes partial references.
 
 The intended development ceilings are 10,000 files, 256 MiB total and 4 MiB per file; effective
 bounds are always the lowest limit of Workspace and its dependencies. The current effective bounds
@@ -68,12 +74,12 @@ are 1,000 files (Substrate's recursive-tree ceiling), 256 MiB total, and 180 KiB
 rather than returning truncated content.
 
 Ready coding sessions expose the same Workspace API to Devcenter, AgentIDE, and other clients:
-bounded searchable trees, complete UTF-8 file reads, exact-state Save/create, and canonical
-immutable-base-versus-working diffs. A tree says when content was truncated and whether the omitted
-count is known. File reads return complete-content SHA-256, size, language hint, and base-relative
-modification state; binary files are explicit read-only projections. Save carries either `absent` or
-the digest originally loaded by the editor. A stale save returns HTTP 409 with both base and latest
-Workspace projections, and no blind-overwrite operation exists.
+bounded searchable trees, complete UTF-8 file reads, exact-state Save/create, and canonical diffs
+of the working tree against its pinned Git baseline. A tree says when content was truncated and
+whether the omitted count is known. File reads return complete-content SHA-256, size, language
+hint, and base-relative modification state; binary files are explicit read-only projections. Save
+carries either `absent` or the digest originally loaded by the editor. A stale save returns
+HTTP 409 with both base and latest Workspace projections, and no blind-overwrite operation exists.
 
 `POST /v1/sessions/{session_id}/diff` is the authoritative diff resolver. Patch, stat, and
 files-only modes are projections of the same server calculation and carry one digest, exact old/new
@@ -167,8 +173,9 @@ and operation-idempotency semantics.
 - list the pinned root tree and project root files through exact-commit, read-only Connector
   operations;
 - create/list/resume exact-revision coding sessions through the same project API used by Devcenter;
-- browse and edit the session's Substrate working materialization through exact, bounded Workspace
-  file contracts, and resolve its diff only against the immutable base materialization;
+- browse and edit the session's single Substrate Git materialization through exact, bounded
+  Workspace file contracts, and resolve its diff only against that materialization's own Git
+  checkout at the pinned commit;
 - open, reconnect to, detach from, and explicitly terminate profile-bound Substrate PTYs only under
   a current human `interactive_terminal` grant;
 - expose bounded exact-commit context and durable, owner-scoped task links to the authenticated
