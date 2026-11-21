@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.25 - 2026-11-22
+
 - Move project chat and workflow orchestration to the product while preserving Workspace-owned
   conversations, task links and recoverable checkpoints. Persist message completion once.
 - Authenticate downward executor and coordinator calls with separate, short-lived request proofs,
