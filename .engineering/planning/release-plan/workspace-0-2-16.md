@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: release-plan:workspace-0-2-16
 kind: release-plan
 status: active
@@ -8,6 +8,8 @@ summary: Publish bounded and recoverable coding-session startup.
 relations:
 - delivers: story:bounded-coding-session-materialization
 revision: 2
+transitions:
+- {from: "draft", to: "active", at: "2026-09-04T17:03:57Z", actor: "human:timo", revision: 2, imported: true}
 ---
 ## Outcome
 

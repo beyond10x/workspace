@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-06T20:51:52Z",
+  "actor": "human:timo",
+  "artifact": "story:normalize-terminal-context-directory",
+  "kind": "story",
+  "revision": 7,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Actual terminal projection ContextPack red/green; full task check: 70 Workspace tests and 20 publication tests plus fmt and Clippy",
+    "reference": "sha256:4cef1bd244d9b9e79bd8e7f805f36f9e7f1af9b5ce3e04758c3ad0257d8c7fd8"
+  }
+}

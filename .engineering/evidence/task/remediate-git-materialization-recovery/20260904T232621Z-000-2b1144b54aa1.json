@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-04T23:26:21Z",
+  "actor": "human:timo",
+  "artifact": "task:remediate-git-materialization-recovery",
+  "kind": "task",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "task check",
+    "reference": "local:single-git-materialization"
+  }
+}

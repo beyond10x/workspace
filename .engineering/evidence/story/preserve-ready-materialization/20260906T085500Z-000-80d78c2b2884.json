@@ -1,0 +1,12 @@
+{
+  "at": "2026-09-06T08:55:00Z",
+  "actor": "human:timo",
+  "artifact": "story:preserve-ready-materialization",
+  "kind": "story",
+  "revision": 7,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "task check: 59 Rust and 20 publication tests, formatting and Clippy passed"
+  }
+}

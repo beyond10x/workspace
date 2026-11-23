@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-06T21:14:58Z",
+  "actor": "human:timo",
+  "artifact": "story:normalize-terminal-context-directory",
+  "kind": "story",
+  "revision": 9,
+  "change": {
+    "change": "evidence",
+    "kind": "approval",
+    "source": "Independent final deployed context-directory acceptance: approve with no findings; both Agent replies remain separately failed on credential availability",
+    "reference": "sha256:f923b5d019de63b9e7cc5a8527baf7aa7b32de89b08aee7c5b4f546169cc578e"
+  }
+}

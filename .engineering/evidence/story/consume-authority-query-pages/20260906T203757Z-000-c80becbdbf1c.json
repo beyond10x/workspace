@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-06T20:37:57Z",
+  "actor": "human:timo",
+  "artifact": "story:consume-authority-query-pages",
+  "kind": "story",
+  "revision": 9,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Headless deployed Files and real terminal command output, termination, post-terminal Ready/tree and owned Workspace plus coordination cleanup passed",
+    "reference": "sha256:a4e043cf44172cc36c4e5af73b3c5e2ab9d5d46fa929b6158dab92bc9a099a59"
+  }
+}

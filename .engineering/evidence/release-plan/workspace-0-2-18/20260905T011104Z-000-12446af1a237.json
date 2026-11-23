@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-05T01:11:04Z",
+  "actor": "human:timo",
+  "artifact": "release-plan:workspace-0-2-18",
+  "kind": "release-plan",
+  "revision": 2,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Bootstrap correction ceb79d6: coordinator reviewed exact image/source attestation, live GHCR DENIED probe, and reran5 policy+15 adversarial tests exit0 with required TMPDIR; implementor full62 gates green",
+    "reference": "ceb79d6"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-06T10:36:26Z",
+  "actor": "human:timo",
+  "artifact": "story:serve-workspace-root-tree",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Published 0.2.22; successful downstream validation/deployment/verification; authenticated headless root/read/edit/save/exact-restore and both normal close states",
+    "reference": "https://github.com/beyond10x/workspace/releases/tag/0.2.22"
+  }
+}

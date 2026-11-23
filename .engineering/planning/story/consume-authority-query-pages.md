@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: story:consume-authority-query-pages
 kind: story
 status: implemented
@@ -20,6 +20,10 @@ scope:
 - confidence: cited
   path: crates/workspace-service/src/repository_search_tests.rs
 revision: 11
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-06T19:50:06Z", actor: "human:timo", revision: 3, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-06T19:50:06Z", actor: "human:timo", revision: 4, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-06T20:49:44Z", actor: "human:timo", revision: 11, decided_on: {"recorded":{"test_result":3,"approval":2}}, imported: true}
 ---
 ## Outcome
 

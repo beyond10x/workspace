@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-06T20:18:52Z",
+  "actor": "human:timo",
+  "artifact": "story:consume-authority-query-pages",
+  "kind": "story",
+  "revision": 7,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Release 0.2.23: both architecture builds and exact keyless workflow signature verification",
+    "reference": "https://github.com/beyond10x/workspace/actions/runs/34057012414"
+  }
+}

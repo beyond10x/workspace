@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: story:bounded-coding-session-materialization
 kind: story
 status: implemented
@@ -23,6 +23,10 @@ scope:
 - confidence: cited
   path: system.yaml
 revision: 6
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-04T16:45:10Z", actor: "human:timo", revision: 3, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-04T16:45:10Z", actor: "human:timo", revision: 4, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-04T22:38:32Z", actor: "human:timo", revision: 5, decided_on: {"recorded":{"test_result":2}}, imported: true}
 ---
 # Story: Bound coding-session materialization
 

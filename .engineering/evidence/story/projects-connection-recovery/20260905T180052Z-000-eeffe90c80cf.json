@@ -1,0 +1,14 @@
+{
+  "at": "2026-09-05T18:00:52Z",
+  "actor": "human:timo",
+  "artifact": "story:projects-connection-recovery",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "review_outcome",
+    "source": "review-result:projects-recovery-pass-1",
+    "review": "review-result:projects-recovery-pass-1",
+    "outcome": "no-op"
+  }
+}

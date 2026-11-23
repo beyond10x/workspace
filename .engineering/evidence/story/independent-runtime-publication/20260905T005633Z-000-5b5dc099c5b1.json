@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-05T00:56:33Z",
+  "actor": "human:timo",
+  "artifact": "story:independent-runtime-publication",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Final gate: 42 runtime and 17 release tests; fmt, clippy, policy compiles all exit 0",
+    "reference": "git:9f644b7"
+  }
+}

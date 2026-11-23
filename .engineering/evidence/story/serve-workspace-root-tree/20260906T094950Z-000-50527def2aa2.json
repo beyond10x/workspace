@@ -1,0 +1,12 @@
+{
+  "at": "2026-09-06T09:49:50Z",
+  "actor": "human:timo",
+  "artifact": "story:serve-workspace-root-tree",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "task check: 61 Rust and 20 publication cases, formatting and Clippy passed"
+  }
+}

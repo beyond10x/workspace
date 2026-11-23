@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-04T13:09:07Z",
+  "actor": "human:timo",
+  "artifact": "release-plan:workspace-0-2-15",
+  "kind": "release-plan",
+  "revision": 2,
+  "change": {
+    "change": "evidence",
+    "kind": "artifact",
+    "source": "Workspace 0.2.15 release manifest",
+    "reference": "https://github.com/beyond10x/workspace/releases/download/0.2.15/release-manifest.json"
+  }
+}
