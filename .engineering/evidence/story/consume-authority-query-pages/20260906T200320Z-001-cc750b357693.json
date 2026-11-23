@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-06T20:03:20Z",
+  "actor": "human:timo",
+  "artifact": "story:consume-authority-query-pages",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "approval",
+    "source": "Independent final source review authority-pagination-pass-1: approve with no findings",
+    "reference": "review-result:authority-pagination-pass-1"
+  }
+}

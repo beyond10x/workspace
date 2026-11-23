@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-06T21:08:22Z",
+  "actor": "human:timo",
+  "artifact": "story:normalize-terminal-context-directory",
+  "kind": "story",
+  "revision": 9,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Final headless Files/terminal/cleanup passed; post-terminal coding request reaches model_credential_unavailable instead of workspace_actor_view_unavailable; both model replies remain failed",
+    "reference": "sha256:970d7d8fe951a1f13204e67aef25766d4d063e146607df133ed943285b62aa8c"
+  }
+}

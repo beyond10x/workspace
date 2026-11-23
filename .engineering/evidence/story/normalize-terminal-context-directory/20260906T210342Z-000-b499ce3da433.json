@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-06T21:03:42Z",
+  "actor": "human:timo",
+  "artifact": "story:normalize-terminal-context-directory",
+  "kind": "story",
+  "revision": 8,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Release 0.2.24: both native image builds and smokes, signing, and exact workflow-certificate verification passed",
+    "reference": "https://github.com/beyond10x/workspace/actions/runs/34059345894"
+  }
+}

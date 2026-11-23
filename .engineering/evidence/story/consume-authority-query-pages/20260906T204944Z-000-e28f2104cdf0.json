@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-06T20:49:44Z",
+  "actor": "human:timo",
+  "artifact": "story:consume-authority-query-pages",
+  "kind": "story",
+  "revision": 10,
+  "change": {
+    "change": "evidence",
+    "kind": "approval",
+    "source": "Independent deployed Files and terminal acceptance review: approve with no findings; Agent failures remain separate",
+    "reference": "sha256:3272582eb5f35b9bafe70704b647ece3d59771f391de2cda10fb60e811caa050"
+  }
+}

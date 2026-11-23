@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: story:serve-workspace-root-tree
 kind: story
 status: implemented
@@ -16,6 +16,10 @@ scope:
 - confidence: cited
   path: crates/workspace-service/src/main.rs
 revision: 7
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-06T09:44:54Z", actor: "human:timo", revision: 3, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-06T09:44:54Z", actor: "human:timo", revision: 4, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-06T10:36:27Z", actor: "human:timo", revision: 7, decided_on: {"recorded":{"test_result":2}}, imported: true}
 ---
 ## Outcome
 

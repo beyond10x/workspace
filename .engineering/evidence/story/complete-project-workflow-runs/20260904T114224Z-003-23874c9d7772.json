@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-04T11:42:24Z",
+  "actor": "human:timo",
+  "artifact": "story:complete-project-workflow-runs",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Workspace focused workflow recovery suite: 9 passed; full workspace suite: 33 passed",
+    "reference": "local:workspace-workflow-recovery-2026-09-04"
+  }
+}

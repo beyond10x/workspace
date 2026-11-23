@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: release-plan:workspace-0-2-15
 kind: release-plan
 status: implemented
@@ -8,6 +8,9 @@ summary: Publish durable project Workflow-run recovery.
 relations:
 - delivers: story:complete-project-workflow-runs
 revision: 3
+transitions:
+- {from: "draft", to: "active", at: "2026-09-04T12:50:33Z", actor: "human:timo", revision: 2, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-04T13:09:07Z", actor: "human:timo", revision: 3, decided_on: {"recorded":{"test_result":2,"artifact":1}}, imported: true}
 ---
 ## Outcome
 

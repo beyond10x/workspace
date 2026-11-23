@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-06T20:51:52Z",
+  "actor": "human:timo",
+  "artifact": "story:normalize-terminal-context-directory",
+  "kind": "story",
+  "revision": 7,
+  "change": {
+    "change": "evidence",
+    "kind": "approval",
+    "source": "Independent terminal context directory source review: approve with no findings",
+    "reference": "review-result:terminal-context-directory-pass-1"
+  }
+}

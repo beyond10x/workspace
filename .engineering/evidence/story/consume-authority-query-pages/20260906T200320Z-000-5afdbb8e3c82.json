@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-06T20:03:20Z",
+  "actor": "human:timo",
+  "artifact": "story:consume-authority-query-pages",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Real Connector HTTP predecessor fails403; corrected six-case suite and complete gate pass67 Rust plus20 publication tests, formatting and Clippy",
+    "reference": "sha256:ec1213c8dc40854a60b5000bbe3b15d62acb8ecd6401da7428eec304c50a52ab"
+  }
+}

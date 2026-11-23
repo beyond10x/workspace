@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: task:remediate-git-materialization-recovery
 kind: task
 status: implemented
@@ -8,6 +8,10 @@ summary: Close the race, restart, credential, refusal, test, and ESS gaps found 
 relations:
 - derived_from: story:bounded-coding-session-materialization
 revision: 4
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-04T22:47:17Z", actor: "human:timo", revision: 2, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-04T22:47:17Z", actor: "human:timo", revision: 3, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-04T23:26:21Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":1}}, imported: true}
 ---
 # Task: Remediate Git materialization recovery
 

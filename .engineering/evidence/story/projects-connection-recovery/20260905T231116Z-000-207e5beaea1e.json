@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-05T23:11:16Z",
+  "actor": "human:timo",
+  "artifact": "story:projects-connection-recovery",
+  "kind": "story",
+  "revision": 8,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Published runtime source and release checks succeeded",
+    "reference": "https://github.com/beyond10x/workspace/actions/runs/33982973953"
+  }
+}

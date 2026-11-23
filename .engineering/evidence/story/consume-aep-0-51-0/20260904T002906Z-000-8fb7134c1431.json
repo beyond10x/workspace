@@ -1,0 +1,12 @@
+{
+  "at": "2026-09-04T00:29:06Z",
+  "actor": "human:timo",
+  "artifact": "story:consume-aep-0-51-0",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "task check in worktree wt-dfaccfd3b4be on 7e0ca31: exit 0, 25 tests; cargo metadata aep-client/aep-contract/aep-domain 0.51.0"
+  }
+}

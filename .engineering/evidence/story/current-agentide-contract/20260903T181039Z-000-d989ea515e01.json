@@ -1,0 +1,12 @@
+{
+  "at": "2026-09-03T18:10:39Z",
+  "actor": "human:timo",
+  "artifact": "story:current-agentide-contract",
+  "kind": "story",
+  "revision": 5,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "task check (format, Clippy -D warnings, 23 unit tests, doc tests)"
+  }
+}

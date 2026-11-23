@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-04T17:02:00Z",
+  "actor": "human:timo",
+  "artifact": "story:bounded-coding-session-materialization",
+  "kind": "story",
+  "revision": 4,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "cargo fmt --all --check; cargo clippy --workspace --all-targets --locked -- -D warnings; cargo test --workspace --locked",
+    "reference": "crates/workspace-service/src/main.rs"
+  }
+}

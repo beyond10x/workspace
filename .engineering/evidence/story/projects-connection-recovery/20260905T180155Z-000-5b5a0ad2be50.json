@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-05T18:01:55Z",
+  "actor": "human:timo",
+  "artifact": "story:projects-connection-recovery",
+  "kind": "story",
+  "revision": 7,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "task check: 79 executed, zero failures",
+    "reference": "https://github.com/beyond10x/workspace/commit/1f225640586ecb61ffc9c7cb4ed905398b0242a4"
+  }
+}

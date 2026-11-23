@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-05T01:32:54Z",
+  "actor": "human:timo",
+  "artifact": "release-plan:workspace-0-2-18",
+  "kind": "release-plan",
+  "revision": 3,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "Same-source completed release retry succeeded; images and publish jobs skipped",
+    "reference": "https://github.com/beyond10x/workspace/actions/runs/33936402567"
+  }
+}

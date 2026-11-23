@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: story:normalize-terminal-context-directory
 kind: story
 status: implemented
@@ -20,6 +20,10 @@ scope:
 - confidence: cited
   path: crates/workspace-service/src/terminal_context_tests.rs
 revision: 10
+transitions:
+- {from: "draft", to: "proposed", at: "2026-09-06T20:40:30Z", actor: "human:timo", revision: 4, imported: true}
+- {from: "proposed", to: "active", at: "2026-09-06T20:40:31Z", actor: "human:timo", revision: 5, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-06T21:14:58Z", actor: "human:timo", revision: 10, decided_on: {"recorded":{"test_result":3,"approval":2}}, imported: true}
 ---
 ## Outcome
 

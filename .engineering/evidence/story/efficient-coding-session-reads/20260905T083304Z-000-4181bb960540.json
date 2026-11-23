@@ -1,0 +1,13 @@
+{
+  "at": "2026-09-05T08:33:04Z",
+  "actor": "human:timo",
+  "artifact": "story:efficient-coding-session-reads",
+  "kind": "story",
+  "revision": 6,
+  "change": {
+    "change": "evidence",
+    "kind": "test_result",
+    "source": "task check; exit 0 with final published SDK and Connectors pins",
+    "reference": "Taskfile.yml"
+  }
+}

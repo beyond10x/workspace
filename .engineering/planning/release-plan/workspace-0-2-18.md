@@ -1,5 +1,5 @@
 ---
-format: aep.planning-md/1
+format: aep.planning-md/3
 id: release-plan:workspace-0-2-18
 kind: release-plan
 status: implemented
@@ -7,6 +7,9 @@ title: Release Workspace 0.2.18 independently
 relations:
 - delivers: story:independent-runtime-publication
 revision: 4
+transitions:
+- {from: "draft", to: "active", at: "2026-09-05T00:56:33Z", actor: "human:timo", revision: 2, imported: true}
+- {from: "active", to: "implemented", at: "2026-09-05T01:32:54Z", actor: "human:timo", revision: 4, decided_on: {"recorded":{"test_result":6}}, imported: true}
 ---
 ## Outcome
 
